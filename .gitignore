@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+zig-out-clean-dyn/
+zig-out-clean-macos-dyn/
+zig-out-clean-win-dyn/
+zig-out-clean/
+webui/

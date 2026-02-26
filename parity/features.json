@@ -1,0 +1,52 @@
+{
+  "baseline": "local-webui-folder",
+  "features": [
+    { "id": "window.lifecycle.show", "domain": "window_lifecycle", "description": "Show HTML/file/URL content and keep window lifecycle stable." },
+    { "id": "window.lifecycle.close_shutdown", "domain": "window_lifecycle", "description": "Close/shutdown flow and app run loop semantics." },
+    { "id": "window.lifecycle.startup_readiness", "domain": "window_lifecycle", "description": "Server readiness guarantees before browser launch." },
+
+    { "id": "window.native.style", "domain": "native_window", "description": "Apply style options and warn/fallback deterministically." },
+    { "id": "window.native.control", "domain": "native_window", "description": "Min/max/restore/hide/show/close control surface." },
+    { "id": "window.native.capability_report", "domain": "native_window", "description": "Report runtime-backed capabilities per platform/backend." },
+    { "id": "window.visual.transparency", "domain": "native_window", "description": "Transparent visual behavior parity where supported." },
+    { "id": "window.visual.frameless", "domain": "native_window", "description": "Frameless/chrome-less window behavior parity." },
+    { "id": "window.visual.corner_radius", "domain": "native_window", "description": "Rounded corners behavior parity where supported." },
+
+    { "id": "browser.discovery.catalog", "domain": "browser_management", "description": "Cross-platform browser catalog and search-path coverage." },
+    { "id": "browser.discovery.env_precedence", "domain": "browser_management", "description": "Deterministic WEBUI_BROWSER_PATH/WEBUI_BROWSER/BROWSER precedence." },
+    { "id": "browser.launch.fallback", "domain": "browser_management", "description": "System fallback launch behavior when direct launch fails." },
+    { "id": "browser.launch.prompt_quiet_defaults", "domain": "browser_management", "description": "Default quiet/suppression policy for background prompts." },
+    { "id": "browser.launch.prompt_opt_in", "domain": "browser_management", "description": "Allow opting back into browser-default prompt behavior." },
+    { "id": "browser.launch.browser_specific_flags", "domain": "browser_management", "description": "Edge/Chrome/Brave specific suppression flags." },
+
+    { "id": "server.http.local_routes", "domain": "file_serving", "description": "Serve local routes, lifecycle endpoints, and control/style routes." },
+    { "id": "server.vfs_support", "domain": "file_serving", "description": "Virtual file system generation and serving behavior." },
+    { "id": "server.public_private_modes", "domain": "network", "description": "Public/private network access semantics parity." },
+    { "id": "server.port_management", "domain": "network", "description": "Deterministic port binding and free-port handling." },
+    { "id": "server.proxy_support", "domain": "network", "description": "Proxy configuration behavior parity." },
+    { "id": "server.tls_toggle", "domain": "network", "description": "TLS-enabled runtime mode behavior parity." },
+
+    { "id": "event.lifecycle_callbacks", "domain": "event_model", "description": "Connected/disconnected/navigation lifecycle events." },
+    { "id": "event.raw_channel", "domain": "event_model", "description": "Raw send/onRaw payload handling." },
+    { "id": "event.client_context", "domain": "event_model", "description": "Client/session-aware event metadata and routing." },
+
+    { "id": "rpc.typed_registration", "domain": "rpc_bridge", "description": "Typed RPC registration from Zig struct methods." },
+    { "id": "rpc.dispatch.sync_threaded_custom", "domain": "rpc_bridge", "description": "Sync/threaded/custom dispatcher behavior." },
+    { "id": "rpc.dispatch.pipeline_poll_worker", "domain": "rpc_bridge", "description": "Polling + worker-thread request pipeline." },
+    { "id": "rpc.generated_js_runtime", "domain": "rpc_bridge", "description": "Runtime-served generated JS bridge." },
+    { "id": "rpc.generated_js_build_output", "domain": "rpc_bridge", "description": "Build-time JS bridge artifact generation." },
+    { "id": "rpc.generated_ts_declarations", "domain": "rpc_bridge", "description": "TypeScript declaration generation parity." },
+    { "id": "rpc.generated_comptime_strings", "domain": "rpc_bridge", "description": "Comptime bridge/declaration generation as strings." },
+
+    { "id": "build.no_c_no_libc", "domain": "build_policy", "description": "No C source compile path, no @cImport, no libc linkage." },
+    { "id": "build.static_guards", "domain": "build_policy", "description": "Static guard enforcement in parity build target." },
+    { "id": "ci.parity_report_gate", "domain": "ci_release", "description": "Parity report execution as a CI gate." },
+    { "id": "ci.examples_and_tests", "domain": "ci_release", "description": "Examples/tests gating in CI matrix." },
+    { "id": "docs.manual_gui_matrix", "domain": "ci_release", "description": "Manual GUI matrix validation checklist for non-headless parity." },
+
+    { "id": "examples.coverage", "domain": "examples_tests", "description": "All local upstream C/C++ examples have Zig counterparts and builds." },
+    { "id": "tests.integration.window_control_style", "domain": "examples_tests", "description": "Window control/style integration test coverage." },
+    { "id": "tests.integration.browser_policy", "domain": "examples_tests", "description": "Browser policy and launch argument regression tests." },
+    { "id": "tests.integration.connection_refused", "domain": "examples_tests", "description": "Startup race regression tests for connection refusal." }
+  ]
+}

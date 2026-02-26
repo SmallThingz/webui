@@ -1,0 +1,51 @@
+{
+  "features": [
+    { "id": "window.lifecycle.show", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
+    { "id": "window.lifecycle.close_shutdown", "status": "implemented", "tests": ["root.test.close handler can veto and then allow close"] },
+    { "id": "window.lifecycle.startup_readiness", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
+
+    { "id": "window.native.style", "status": "implemented", "tests": ["root.test.native backend unavailability returns warnings and falls back to emulation"] },
+    { "id": "window.native.control", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },
+    { "id": "window.native.capability_report", "status": "implemented", "tests": ["root.test.window capability reporting follows fallback policy"] },
+    { "id": "window.visual.transparency", "status": "partial", "tests": ["docs.manual_gui_checklist"] },
+    { "id": "window.visual.frameless", "status": "partial", "tests": ["docs.manual_gui_checklist"] },
+    { "id": "window.visual.corner_radius", "status": "partial", "tests": ["docs.manual_gui_checklist"] },
+
+    { "id": "browser.discovery.catalog", "status": "implemented", "tests": ["browser_discovery.test.catalog includes browser_driver and webui browser families"] },
+    { "id": "browser.discovery.env_precedence", "status": "implemented", "tests": ["browser_discovery.test.required browser matrix coverage is present across all os specs"] },
+    { "id": "browser.launch.fallback", "status": "implemented", "tests": ["root.test.lifecycle config enables heartbeat without tracked child browser"] },
+    { "id": "browser.launch.prompt_quiet_defaults", "status": "implemented", "tests": ["ported.webui.test.quiet prompt policy injects suppression flags for chromium family"] },
+    { "id": "browser.launch.prompt_opt_in", "status": "implemented", "tests": ["ported.webui.test.browser default preset disables quiet flags unless explicitly re-enabled"] },
+    { "id": "browser.launch.browser_specific_flags", "status": "implemented", "tests": ["ported.webui.test.edge and brave receive browser-specific quiet flags"] },
+
+    { "id": "server.http.local_routes", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },
+    { "id": "server.vfs_support", "status": "implemented", "tests": ["build step vfs-gen"] },
+    { "id": "server.public_private_modes", "status": "partial", "tests": ["webui/examples/C/public_network_access/main.zig"] },
+    { "id": "server.port_management", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
+    { "id": "server.proxy_support", "status": "partial", "tests": ["manual validation required"] },
+    { "id": "server.tls_toggle", "status": "partial", "tests": ["docs.manual_gui_checklist"] },
+
+    { "id": "event.lifecycle_callbacks", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
+    { "id": "event.raw_channel", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },
+    { "id": "event.client_context", "status": "partial", "tests": ["manual validation required"] },
+
+    { "id": "rpc.typed_registration", "status": "implemented", "tests": ["root.test.typed rpc registration, invocation, and bridge generation"] },
+    { "id": "rpc.dispatch.sync_threaded_custom", "status": "implemented", "tests": ["root.test.threaded dispatcher executes rpc on worker queue", "root.test.custom dispatcher can wrap default invoker"] },
+    { "id": "rpc.dispatch.pipeline_poll_worker", "status": "implemented", "tests": ["root.test.threaded dispatcher executes rpc on worker queue"] },
+    { "id": "rpc.generated_js_runtime", "status": "implemented", "tests": ["root.test.typed rpc registration, invocation, and bridge generation"] },
+    { "id": "rpc.generated_js_build_output", "status": "implemented", "tests": ["build step bridge"] },
+    { "id": "rpc.generated_ts_declarations", "status": "implemented", "tests": ["root.test.comptime bridge generation"] },
+    { "id": "rpc.generated_comptime_strings", "status": "implemented", "tests": ["root.test.friendly service api with compile-time rpc_methods constant"] },
+
+    { "id": "build.no_c_no_libc", "status": "implemented", "tests": ["build step parity-local static guards"] },
+    { "id": "build.static_guards", "status": "implemented", "tests": ["build step parity-local static guards"] },
+    { "id": "ci.parity_report_gate", "status": "implemented", "tests": ["build step parity-report"] },
+    { "id": "ci.examples_and_tests", "status": "implemented", "tests": ["github workflow ci.yml"] },
+    { "id": "docs.manual_gui_matrix", "status": "implemented", "tests": ["docs/manual_gui_checklist.md"] },
+
+    { "id": "examples.coverage", "status": "implemented", "tests": ["build step examples"] },
+    { "id": "tests.integration.window_control_style", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },
+    { "id": "tests.integration.browser_policy", "status": "implemented", "tests": ["ported.webui browser policy tests"] },
+    { "id": "tests.integration.connection_refused", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] }
+  ]
+}
