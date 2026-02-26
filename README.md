@@ -48,11 +48,12 @@ Run a specific example:
 zig build run -Dexample=fancy_window
 ```
 
-Force runtime mode for examples:
+Force launch order for examples:
 
 ```bash
 zig build run -Dexample=fancy_window -Drun-mode=webview
 zig build run -Dexample=fancy_window -Drun-mode=browser
+zig build run -Dexample=fancy_window -Drun-mode=webview,browser,web-url
 ```
 
 List steps and options:
@@ -106,28 +107,32 @@ flowchart LR
 `AppOptions` now uses a single deterministic policy object:
 
 ```zig
+pub const LaunchSurface = enum {
+    native_webview, // native desktop webview window
+    browser_window, // runtime launches an external browser window/tab
+    web_url,        // runtime serves URL only; app/user opens it manually
+};
+
 pub const LaunchPolicy = struct {
-    preferred_transport: enum { native_webview, browser } = .native_webview,
-    fallback_transport: enum { none, browser } = .browser,
-    browser_open_mode: enum { never, on_browser_transport, always } = .on_browser_transport,
+    first: LaunchSurface = .native_webview,
+    second: ?LaunchSurface = .browser_window,
+    third: ?LaunchSurface = .web_url,
     allow_dual_surface: bool = false,
-    app_mode_required: bool = false,
+    app_mode_required: bool = true,
 };
 ```
 
-Decision summary:
+Resolution rules:
+- Launch surfaces are attempted in order: `first -> second -> third`.
+- First successful surface becomes active (`RuntimeRenderState.active_surface`).
+- `browser_window` launch failures continue to the next configured surface.
+- `web_url` is explicit URL-only fallback (no browser auto-launch).
+- `allow_dual_surface=true` allows opening browser alongside native webview when `browser_window` exists in the policy.
 
-| `preferred_transport` | Native backend available | `fallback_transport` | Active transport |
-|---|---|---|---|
-| `native_webview` | yes | any | `native_webview` |
-| `native_webview` | no | `browser` | `browser_fallback` |
-| `native_webview` | no | `none` | `native_webview` (error if render required) |
-| `browser` | any | any | `browser_fallback` |
-
-Browser opening summary:
-- `never`: never auto-launch browser.
-- `on_browser_transport`: launch browser only when active transport resolves to browser.
-- `always`: always launch browser; combine with `allow_dual_surface=true` for explicit dual-surface behavior.
+Common presets:
+- `LaunchPolicy.webviewFirst()` -> `native_webview -> browser_window -> web_url`
+- `LaunchPolicy.browserFirst()` -> `browser_window -> web_url -> native_webview`
+- `LaunchPolicy.webUrlOnly()` -> `web_url` only
 
 ## API At A Glance
 
@@ -154,9 +159,9 @@ pub fn main() !void {
     var service = try webui.Service.init(gpa.allocator(), rpc_methods, .{
         .app = .{
             .launch_policy = .{
-                .preferred_transport = .native_webview,
-                .fallback_transport = .browser,
-                .browser_open_mode = .on_browser_transport,
+                .first = .native_webview,
+                .second = .browser_window,
+                .third = .web_url,
             },
         },
         .window = .{ .title = "WebUI Zig" },
@@ -307,7 +312,7 @@ On Linux this reports helper/runtime expectations such as:
 | `-Dminify-embedded-js=true` | `true` | Minifies the embedded runtime helper JS asset at build time. |
 | `-Dminify-written-js=true` | `false` | Minifies the written runtime helper JS output artifact. |
 | `-Dexample=<name>` | `all` | Selects which demo `zig build run` executes. |
-| `-Drun-mode=webview|browser` | `webview` | Chooses native-webview vs browser-mode path in examples. |
+| `-Drun-mode=<launch-order>` | `webview,browser,web-url` | Example launch order. Supports presets (`webview`, `browser`, `web-url`) or explicit order (`webview,browser,web-url`, `browser,webview`, `web-url`). |
 | `-Dtarget=<triple>` | host | Cross-compiles the library/examples for another target. |
 
 Exported compile-time values:
@@ -341,7 +346,7 @@ zig build run
 Run one demo:
 
 ```bash
-zig build run -Dexample=translucent_rounded -Drun-mode=webview
+zig build run -Dexample=translucent_rounded -Drun-mode=webview,browser,web-url
 ```
 
 All demos share the same runtime harness but now expose scenario-specific controls/flows (for example `call_js_from_zig` performs a backend-driven script update, while data-centric demos expose `word_count` and `save_note` actions).

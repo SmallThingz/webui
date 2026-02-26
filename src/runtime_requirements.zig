@@ -9,8 +9,9 @@ pub const RuntimeRequirement = struct {
 };
 
 pub const ListOptions = struct {
-    preferred_transport_native: bool,
-    fallback_transport_browser: bool,
+    uses_native_webview: bool,
+    uses_managed_browser: bool,
+    uses_web_url: bool,
     app_mode_required: bool,
     native_backend_available: bool,
 };
@@ -21,7 +22,7 @@ pub fn list(allocator: std.mem.Allocator, options: ListOptions) ![]RuntimeRequir
 
     try out.append(.{
         .name = "native_webview_backend",
-        .required = options.preferred_transport_native,
+        .required = options.uses_native_webview,
         .available = options.native_backend_available,
         .details = if (!options.native_backend_available) "Native backend unavailable on this target/runtime" else null,
     });
@@ -46,14 +47,14 @@ pub fn list(allocator: std.mem.Allocator, options: ListOptions) ![]RuntimeRequir
 
         try out.append(.{
             .name = "webui_linux_webview_host",
-            .required = options.preferred_transport_native and options.app_mode_required,
+            .required = options.uses_native_webview and options.app_mode_required,
             .available = webview_helper_available,
             .details = if (!webview_helper_available) "Expected beside executable" else null,
         });
 
         try out.append(.{
             .name = "webui_linux_browser_host",
-            .required = options.fallback_transport_browser,
+            .required = options.uses_managed_browser or options.uses_web_url,
             .available = browser_helper_available,
             .details = if (!browser_helper_available) "Expected beside executable" else null,
         });

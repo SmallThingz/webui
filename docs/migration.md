@@ -1,4 +1,4 @@
-# Migration Guide: Launch Policy + Async RPC Jobs
+# Migration Guide: Launch Order + Async RPC Jobs
 
 This guide covers the hard API replacement in `AppOptions` and the new async RPC job APIs.
 
@@ -13,12 +13,18 @@ Replacement:
 - `launch_policy: LaunchPolicy`
 
 ```zig
+pub const LaunchSurface = enum {
+    native_webview,
+    browser_window,
+    web_url,
+};
+
 pub const LaunchPolicy = struct {
-    preferred_transport: enum { native_webview, browser } = .native_webview,
-    fallback_transport: enum { none, browser } = .browser,
-    browser_open_mode: enum { never, on_browser_transport, always } = .on_browser_transport,
+    first: LaunchSurface = .native_webview,
+    second: ?LaunchSurface = .browser_window,
+    third: ?LaunchSurface = .web_url,
     allow_dual_surface: bool = false,
-    app_mode_required: bool = false,
+    app_mode_required: bool = true,
 };
 ```
 
@@ -41,9 +47,9 @@ After:
 ```zig
 .app = .{
     .launch_policy = .{
-        .preferred_transport = .native_webview,
-        .fallback_transport = .browser,
-        .browser_open_mode = .on_browser_transport,
+        .first = .native_webview,
+        .second = .browser_window,
+        .third = .web_url,
     },
 }
 ```
@@ -64,21 +70,35 @@ After:
 ```zig
 .app = .{
     .launch_policy = .{
-        .preferred_transport = .browser,
-        .fallback_transport = .browser,
-        .browser_open_mode = .on_browser_transport,
+        .first = .browser_window,
+        .second = null,
+        .third = null,
+        .app_mode_required = false,
     },
 }
 ```
 
-### Native-only required mode (no browser fallback)
+### URL-only mode (no auto browser launch)
 
 ```zig
 .app = .{
     .launch_policy = .{
-        .preferred_transport = .native_webview,
-        .fallback_transport = .none,
-        .browser_open_mode = .never,
+        .first = .web_url,
+        .second = null,
+        .third = null,
+        .app_mode_required = false,
+    },
+}
+```
+
+### Native-only required mode
+
+```zig
+.app = .{
+    .launch_policy = .{
+        .first = .native_webview,
+        .second = null,
+        .third = null,
         .app_mode_required = true,
     },
 }

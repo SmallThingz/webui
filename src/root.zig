@@ -50,16 +50,44 @@ pub const TransportMode = enum {
     native_webview,
 };
 
-pub const LaunchPolicy = struct {
-    pub const PreferredTransport = enum { native_webview, browser };
-    pub const FallbackTransport = enum { none, browser };
-    pub const BrowserOpenMode = enum { never, on_browser_transport, always };
+pub const LaunchSurface = enum {
+    native_webview,
+    browser_window,
+    web_url,
+};
 
-    preferred_transport: PreferredTransport = .native_webview,
-    fallback_transport: FallbackTransport = .browser,
-    browser_open_mode: BrowserOpenMode = .on_browser_transport,
+pub const LaunchPolicy = struct {
+    first: LaunchSurface = .native_webview,
+    second: ?LaunchSurface = .browser_window,
+    third: ?LaunchSurface = .web_url,
     app_mode_required: bool = true,
     allow_dual_surface: bool = false,
+
+    pub fn webviewFirst() LaunchPolicy {
+        return .{
+            .first = .native_webview,
+            .second = .browser_window,
+            .third = .web_url,
+        };
+    }
+
+    pub fn browserFirst() LaunchPolicy {
+        return .{
+            .first = .browser_window,
+            .second = .web_url,
+            .third = .native_webview,
+            .app_mode_required = false,
+        };
+    }
+
+    pub fn webUrlOnly() LaunchPolicy {
+        return .{
+            .first = .web_url,
+            .second = null,
+            .third = null,
+            .app_mode_required = false,
+        };
+    }
 };
 
 pub const FallbackReason = enum {
@@ -71,6 +99,7 @@ pub const FallbackReason = enum {
 
 pub const RuntimeRenderState = struct {
     active_transport: TransportMode = .browser_fallback,
+    active_surface: LaunchSurface = .web_url,
     fallback_applied: bool = false,
     fallback_reason: ?FallbackReason = null,
     launch_policy: LaunchPolicy = .{},
@@ -241,6 +270,7 @@ pub const RuntimeRequirement = runtime_requirements.RuntimeRequirement;
 
 pub const EffectiveCapabilities = struct {
     transport_if_shown: TransportMode,
+    surface_if_shown: LaunchSurface,
     supports_native_window_controls: bool,
     supports_transparency: bool,
     supports_frameless: bool,
@@ -252,6 +282,57 @@ pub const ServiceOptions = struct {
     window: WindowOptions = .{},
     rpc: RpcOptions = .{},
 };
+
+fn launchPolicyOrder(policy: LaunchPolicy) [3]?LaunchSurface {
+    var out: [3]?LaunchSurface = .{ null, null, null };
+    var write_idx: usize = 0;
+    const input = [_]?LaunchSurface{ policy.first, policy.second, policy.third };
+    for (input) |candidate| {
+        if (candidate == null) continue;
+
+        var duplicate = false;
+        for (out) |existing| {
+            if (existing != null and existing.? == candidate.?) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        out[write_idx] = candidate.?;
+        write_idx += 1;
+        if (write_idx >= out.len) break;
+    }
+
+    if (out[0] == null) out[0] = .web_url;
+    return out;
+}
+
+fn launchPolicyContains(policy: LaunchPolicy, surface: LaunchSurface) bool {
+    const ordered = launchPolicyOrder(policy);
+    for (ordered) |candidate| {
+        if (candidate == null) continue;
+        if (candidate.? == surface) return true;
+    }
+    return false;
+}
+
+fn launchPolicyHasBrowserTransport(policy: LaunchPolicy) bool {
+    return launchPolicyContains(policy, .browser_window) or launchPolicyContains(policy, .web_url);
+}
+
+fn launchPolicyNextAfter(policy: LaunchPolicy, current: LaunchSurface) ?LaunchSurface {
+    const ordered = launchPolicyOrder(policy);
+    var found = false;
+    for (ordered) |candidate| {
+        if (candidate == null) continue;
+        if (!found) {
+            if (candidate.? == current) found = true;
+            continue;
+        }
+        return candidate.?;
+    }
+    return null;
+}
 
 const EventCallbackState = struct {
     handler: ?EventHandler = null,
@@ -1080,6 +1161,7 @@ const WindowState = struct {
             .launch_policy = app_options.launch_policy,
             .runtime_render_state = .{
                 .active_transport = .browser_fallback,
+                .active_surface = .web_url,
                 .fallback_applied = false,
                 .fallback_reason = null,
                 .launch_policy = app_options.launch_policy,
@@ -1087,7 +1169,7 @@ const WindowState = struct {
                 .browser_process = null,
             },
             .window_fallback_emulation = app_options.window_fallback_emulation,
-            .server_port = core_runtime.nextFallbackPort(id),
+            .server_port = 0,
             .server_bind_public = app_options.public_network,
             .last_html = null,
             .last_file = null,
@@ -1098,7 +1180,7 @@ const WindowState = struct {
             .raw_callback = .{},
             .close_callback = .{},
             .rpc_state = RpcRegistryState.init(allocator, app_options.enable_webui_log),
-            .backend = webview_backend.NativeBackend.init(app_options.launch_policy.preferred_transport == .native_webview),
+            .backend = webview_backend.NativeBackend.init(launchPolicyContains(app_options.launch_policy, .native_webview)),
             .native_capabilities = &.{},
             .current_style = .{},
             .style_icon_bytes = null,
@@ -1137,10 +1219,16 @@ const WindowState = struct {
         try state.setStyleOwned(allocator, options.style);
         if (state.isNativeWindowActive()) {
             state.backend.createWindow(state.id, state.title, state.current_style) catch |err| {
-                if (err == error.NativeBackendUnavailable and state.launch_policy.fallback_transport == .browser) {
-                    state.runtime_render_state.fallback_applied = true;
-                    state.runtime_render_state.fallback_reason = .native_backend_unavailable;
-                    state.runtime_render_state.active_transport = .browser_fallback;
+                if (err == error.NativeBackendUnavailable) {
+                    if (launchPolicyNextAfter(state.launch_policy, .native_webview)) |next_surface| {
+                        state.runtime_render_state.fallback_applied = true;
+                        state.runtime_render_state.fallback_reason = .native_backend_unavailable;
+                        state.runtime_render_state.active_surface = next_surface;
+                        state.runtime_render_state.active_transport = switch (next_surface) {
+                            .native_webview => .native_webview,
+                            .browser_window, .web_url => .browser_fallback,
+                        };
+                    }
                 }
                 if (state.rpc_state.log_enabled) {
                     if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
@@ -1163,28 +1251,39 @@ const WindowState = struct {
         self.runtime_render_state.launch_policy = self.launch_policy;
         self.runtime_render_state.using_system_fallback_launcher = false;
 
-        switch (self.launch_policy.preferred_transport) {
-            .browser => {
-                self.runtime_render_state.active_transport = .browser_fallback;
-                self.runtime_render_state.fallback_applied = false;
-                self.runtime_render_state.fallback_reason = null;
-            },
-            .native_webview => {
-                if (self.backend.isNative()) {
-                    self.runtime_render_state.active_transport = .native_webview;
-                    self.runtime_render_state.fallback_applied = false;
-                    self.runtime_render_state.fallback_reason = null;
-                } else if (self.launch_policy.fallback_transport == .browser) {
-                    self.runtime_render_state.active_transport = .browser_fallback;
-                    self.runtime_render_state.fallback_applied = true;
-                    self.runtime_render_state.fallback_reason = .native_backend_unavailable;
-                } else {
-                    self.runtime_render_state.active_transport = .native_webview;
-                    self.runtime_render_state.fallback_applied = true;
-                    self.runtime_render_state.fallback_reason = .native_backend_unavailable;
-                }
-            },
+        const ordered = launchPolicyOrder(self.launch_policy);
+        var selected: ?LaunchSurface = null;
+        var selected_index: usize = 0;
+        var last_fallback_reason: ?FallbackReason = null;
+
+        for (ordered, 0..) |candidate, idx| {
+            if (candidate == null) continue;
+            switch (candidate.?) {
+                .native_webview => {
+                    if (!self.backend.isNative()) {
+                        last_fallback_reason = .native_backend_unavailable;
+                        continue;
+                    }
+                    selected = .native_webview;
+                    selected_index = idx;
+                    break;
+                },
+                .browser_window, .web_url => {
+                    selected = candidate.?;
+                    selected_index = idx;
+                    break;
+                },
+            }
         }
+
+        const active_surface = selected orelse .web_url;
+        self.runtime_render_state.active_surface = active_surface;
+        self.runtime_render_state.active_transport = switch (active_surface) {
+            .native_webview => .native_webview,
+            .browser_window, .web_url => .browser_fallback,
+        };
+        self.runtime_render_state.fallback_applied = selected == null or selected_index != 0;
+        self.runtime_render_state.fallback_reason = if (self.runtime_render_state.fallback_applied) last_fallback_reason else null;
     }
 
     fn setStyleOwned(self: *WindowState, allocator: std.mem.Allocator, style: WindowStyle) !void {
@@ -1374,9 +1473,8 @@ const WindowState = struct {
     }
 
     fn shouldServeBrowser(self: *const WindowState) bool {
-        if (self.runtime_render_state.active_transport == .browser_fallback) return true;
-        if (self.launch_policy.fallback_transport == .browser) return true;
-        if (self.launch_policy.browser_open_mode == .always and self.launch_policy.allow_dual_surface) return true;
+        if (self.runtime_render_state.active_surface != .native_webview) return true;
+        if (self.launch_policy.allow_dual_surface and launchPolicyHasBrowserTransport(self.launch_policy)) return true;
         return false;
     }
 
@@ -1442,6 +1540,13 @@ const WindowState = struct {
         }
     }
 
+    fn releaseBrowserProfileDirWithoutDelete(self: *WindowState, allocator: std.mem.Allocator) void {
+        if (self.launched_browser_profile_dir) |dir| {
+            allocator.free(dir);
+            self.launched_browser_profile_dir = null;
+        }
+    }
+
     fn clearTrackedBrowserState(self: *WindowState, allocator: std.mem.Allocator) void {
         self.launched_browser_pid = null;
         self.launched_browser_kind = null;
@@ -1452,6 +1557,24 @@ const WindowState = struct {
         self.native_capabilities = self.backend.capabilities();
         self.runtime_render_state.browser_process = null;
         self.runtime_render_state.using_system_fallback_launcher = false;
+    }
+
+    fn clearTrackedBrowserStateWithoutDelete(self: *WindowState, allocator: std.mem.Allocator) void {
+        self.launched_browser_pid = null;
+        self.launched_browser_kind = null;
+        self.launched_browser_is_child = false;
+        self.launched_browser_lifecycle_linked = false;
+        self.releaseBrowserProfileDirWithoutDelete(allocator);
+        self.backend.attachBrowserProcess(null, null, false);
+        self.native_capabilities = self.backend.capabilities();
+        self.runtime_render_state.browser_process = null;
+        self.runtime_render_state.using_system_fallback_launcher = false;
+    }
+
+    fn shouldTerminateTrackedBrowserProcess(self: *const WindowState) bool {
+        // Browser/web-first runs should close the browser tab via lifecycle signal,
+        // not force-kill the whole browser process.
+        return self.launch_policy.first == .native_webview;
     }
 
     fn markClosedFromTrackedBrowserExit(self: *WindowState, allocator: std.mem.Allocator, event_name: []const u8) void {
@@ -1489,13 +1612,25 @@ const WindowState = struct {
     }
 
     fn terminateLaunchedBrowser(self: *WindowState, allocator: std.mem.Allocator) void {
+        const should_terminate = self.shouldTerminateTrackedBrowserProcess();
         if (self.launched_browser_pid) |pid| {
-            if (self.rpc_state.log_enabled) {
-                std.debug.print("[webui.browser] terminating tracked browser pid={d}\n", .{pid});
+            if (should_terminate) {
+                if (self.rpc_state.log_enabled) {
+                    std.debug.print("[webui.browser] terminating tracked browser pid={d}\n", .{pid});
+                }
+                core_runtime.terminateBrowserProcess(allocator, pid);
+            } else if (self.rpc_state.log_enabled) {
+                std.debug.print(
+                    "[webui.browser] leaving tracked browser pid={d} alive (browser/web mode shutdown)\n",
+                    .{pid},
+                );
             }
-            core_runtime.terminateBrowserProcess(allocator, pid);
         }
-        self.clearTrackedBrowserState(allocator);
+        if (should_terminate) {
+            self.clearTrackedBrowserState(allocator);
+        } else {
+            self.clearTrackedBrowserStateWithoutDelete(allocator);
+        }
     }
 
     fn localRenderUrl(self: *const WindowState, allocator: std.mem.Allocator) ![]u8 {
@@ -1503,11 +1638,22 @@ const WindowState = struct {
     }
 
     fn shouldOpenBrowser(self: *const WindowState) bool {
-        return switch (self.launch_policy.browser_open_mode) {
-            .never => false,
-            .on_browser_transport => self.runtime_render_state.active_transport == .browser_fallback,
-            .always => self.launch_policy.allow_dual_surface or self.runtime_render_state.active_transport == .browser_fallback,
+        if (self.runtime_render_state.active_surface == .browser_window) return true;
+        if (!self.launch_policy.allow_dual_surface) return false;
+        if (self.runtime_render_state.active_surface != .native_webview) return false;
+        return launchPolicyContains(self.launch_policy, .browser_window);
+    }
+
+    fn resolveAfterBrowserLaunchFailure(self: *WindowState) bool {
+        const next_surface = launchPolicyNextAfter(self.launch_policy, .browser_window) orelse return false;
+        self.runtime_render_state.fallback_applied = true;
+        self.runtime_render_state.fallback_reason = .launch_failed;
+        self.runtime_render_state.active_surface = next_surface;
+        self.runtime_render_state.active_transport = switch (next_surface) {
+            .native_webview => .native_webview,
+            .browser_window, .web_url => .browser_fallback,
         };
+        return true;
     }
 
     fn ensureBrowserRenderState(self: *WindowState, allocator: std.mem.Allocator, app_options: AppOptions) !void {
@@ -1523,11 +1669,11 @@ const WindowState = struct {
             if (core_runtime.openInBrowser(allocator, url, self.current_style, app_options.browser_launch)) |launch| {
                 self.setLaunchedBrowserLaunch(allocator, launch);
             } else |err| {
-                self.runtime_render_state.fallback_applied = true;
-                self.runtime_render_state.fallback_reason = .launch_failed;
+                _ = self.resolveAfterBrowserLaunchFailure();
                 if (self.rpc_state.log_enabled) {
                     std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 }
+                if (self.runtime_render_state.active_surface != .browser_window) return;
                 if (self.launch_policy.app_mode_required) return err;
             }
         }
@@ -2062,6 +2208,7 @@ const WindowState = struct {
         defer server.deinit();
 
         self.server_ready_mutex.lock();
+        self.server_port = server.listen_address.getPort();
         self.server_listen_ok = true;
         self.server_ready = true;
         self.server_ready_cond.broadcast();
@@ -2430,12 +2577,11 @@ pub const Window = struct {
             if (core_runtime.openInBrowser(self.app.allocator, url, win_state.current_style, self.app.options.browser_launch)) |launch| {
                 win_state.setLaunchedBrowserLaunch(self.app.allocator, launch);
             } else |err| {
-                win_state.runtime_render_state.fallback_applied = true;
-                win_state.runtime_render_state.fallback_reason = .launch_failed;
+                _ = win_state.resolveAfterBrowserLaunchFailure();
                 if (win_state.rpc_state.log_enabled) {
                     std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 }
-                if (win_state.launch_policy.app_mode_required) return err;
+                if (win_state.runtime_render_state.active_surface == .browser_window and win_state.launch_policy.app_mode_required) return err;
             }
         }
 
@@ -2666,22 +2812,42 @@ pub const Window = struct {
         win_state.state_mutex.lock();
         defer win_state.state_mutex.unlock();
 
-        const predicted_transport: TransportMode = if (win_state.launch_policy.preferred_transport == .browser)
-            .browser_fallback
-        else if (win_state.backend.isNative())
-            .native_webview
-        else if (win_state.launch_policy.fallback_transport == .browser)
-            .browser_fallback
-        else
-            .native_webview;
+        const ordered = launchPolicyOrder(win_state.launch_policy);
+        var predicted_surface: LaunchSurface = .web_url;
+        var selected_index: usize = 0;
+        var found = false;
+        for (ordered, 0..) |candidate, idx| {
+            if (candidate == null) continue;
+            switch (candidate.?) {
+                .native_webview => {
+                    if (!win_state.backend.isNative()) continue;
+                    predicted_surface = .native_webview;
+                    selected_index = idx;
+                    found = true;
+                    break;
+                },
+                .browser_window, .web_url => {
+                    predicted_surface = candidate.?;
+                    selected_index = idx;
+                    found = true;
+                    break;
+                },
+            }
+        }
+
+        const predicted_transport: TransportMode = switch (predicted_surface) {
+            .native_webview => .native_webview,
+            .browser_window, .web_url => .browser_fallback,
+        };
 
         const caps = win_state.capabilities();
         return .{
             .transport_if_shown = predicted_transport,
+            .surface_if_shown = predicted_surface,
             .supports_native_window_controls = window_style_types.hasCapability(.native_minmax, caps),
             .supports_transparency = window_style_types.hasCapability(.native_transparency, caps),
             .supports_frameless = window_style_types.hasCapability(.native_frameless, caps),
-            .fallback_expected = win_state.launch_policy.preferred_transport == .native_webview and predicted_transport == .browser_fallback,
+            .fallback_expected = !found or selected_index != 0,
         };
     }
 
@@ -2902,8 +3068,9 @@ pub const Service = struct {
         win_state.state_mutex.unlock();
 
         const reqs = try runtime_requirements.list(allocator, .{
-            .preferred_transport_native = policy.preferred_transport == .native_webview,
-            .fallback_transport_browser = policy.fallback_transport == .browser,
+            .uses_native_webview = launchPolicyContains(policy, .native_webview),
+            .uses_managed_browser = launchPolicyContains(policy, .browser_window),
+            .uses_web_url = launchPolicyContains(policy, .web_url),
             .app_mode_required = policy.app_mode_required,
             .native_backend_available = native_available,
         });
@@ -4146,17 +4313,30 @@ fn readAllFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, max_b
 
     var scratch: [4096]u8 = undefined;
     while (true) {
-        const n = std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(std.time.ns_per_ms);
-                continue;
-            },
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.SocketNotConnected,
-            => break,
-            else => return err,
-        };
+        const n = if (builtin.os.tag == .windows)
+            std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.Thread.sleep(std.time.ns_per_ms);
+                    continue;
+                },
+                error.ConnectionResetByPeer,
+                error.ConnectionTimedOut,
+                error.SocketNotConnected,
+                => break,
+                else => return err,
+            }
+        else
+            stream.read(&scratch) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.Thread.sleep(std.time.ns_per_ms);
+                    continue;
+                },
+                error.ConnectionResetByPeer,
+                error.ConnectionTimedOut,
+                error.SocketNotConnected,
+                => break,
+                else => return err,
+            };
         if (n == 0) break;
         if (out.items.len + n > max_bytes) return error.ResponseTooLarge;
         try out.appendSlice(scratch[0..n]);
@@ -4262,7 +4442,7 @@ test "browser fallback serves window html over local http" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4299,7 +4479,7 @@ test "browser fallback server is reachable across repeated connects" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4325,7 +4505,7 @@ test "public network mode binds server with public listen policy" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
         .public_network = true,
     });
     defer app.deinit();
@@ -4345,7 +4525,7 @@ test "websocket upgrade uses same http server port" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4403,7 +4583,7 @@ test "lifecycle route stays responsive during long running rpc" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4445,18 +4625,25 @@ test "lifecycle route stays responsive during long running rpc" {
     try std.testing.expect(std.mem.indexOf(u8, rpc_response, "\"value\":\"done\"") != null);
 }
 
-test "native_webview transport falls back to browser rendering by default" {
+test "native_webview launch order falls back to web_url when native backend is unavailable" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .native_webview, .second = .web_url, .third = null },
     });
     defer app.deinit();
 
     var win = try app.newWindow(.{ .title = "NativeFallback" });
     try win.showHtml("<html><body>native-fallback-ok</body></html>");
     try app.run();
+
+    const render_state = win.runtimeRenderState();
+    if (render_state.active_surface == .native_webview) {
+        try std.testing.expectError(error.TransportNotBrowserRenderable, win.browserUrl());
+        return;
+    }
+    try std.testing.expectEqual(@as(LaunchSurface, .web_url), render_state.active_surface);
 
     const local_url = try win.browserUrl();
     defer gpa.allocator().free(local_url);
@@ -4487,7 +4674,7 @@ test "native_webview browser fallback can be disabled" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .none, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .native_webview, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4502,7 +4689,7 @@ test "linked child exit requests close immediately" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .native_webview, .second = .web_url, .third = null },
     });
     defer app.deinit();
 
@@ -4539,6 +4726,87 @@ test "linked child exit requests close immediately" {
     try std.testing.expect(closed);
 }
 
+test "shutdown in web mode does not terminate tracked browser child process" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "ShutdownWebModeNoKill" });
+    try win.showHtml("<html><body>shutdown-web-mode</body></html>");
+    try app.run();
+
+    var child = std.process.Child.init(&.{ "sh", "-c", "sleep 5" }, gpa.allocator());
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    defer {
+        core_runtime.terminateBrowserProcess(gpa.allocator(), @as(i64, @intCast(child.id)));
+        _ = child.wait() catch {};
+    }
+
+    win.state().state_mutex.lock();
+    win.state().launched_browser_pid = @as(i64, @intCast(child.id));
+    win.state().launched_browser_is_child = true;
+    win.state().launched_browser_lifecycle_linked = true;
+    win.state().state_mutex.unlock();
+
+    app.shutdown();
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+
+    try std.testing.expect(core_runtime.isProcessAlive(@as(i64, @intCast(child.id))));
+}
+
+test "shutdown in webview mode terminates tracked browser child process" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .native_webview, .second = .web_url, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "ShutdownWebviewModeKill" });
+    try win.showHtml("<html><body>shutdown-webview-mode</body></html>");
+    try app.run();
+
+    var child = std.process.Child.init(&.{ "sh", "-c", "sleep 5" }, gpa.allocator());
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    defer {
+        core_runtime.terminateBrowserProcess(gpa.allocator(), @as(i64, @intCast(child.id)));
+        _ = child.wait() catch {};
+    }
+
+    const child_pid_i64: i64 = @as(i64, @intCast(child.id));
+    win.state().state_mutex.lock();
+    win.state().launched_browser_pid = child_pid_i64;
+    win.state().launched_browser_is_child = true;
+    win.state().launched_browser_lifecycle_linked = true;
+    win.state().state_mutex.unlock();
+
+    app.shutdown();
+
+    var alive = core_runtime.isProcessAlive(child_pid_i64);
+    var attempts: usize = 0;
+    while (alive and attempts < 100) : (attempts += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        alive = core_runtime.isProcessAlive(child_pid_i64);
+    }
+
+    try std.testing.expect(!alive);
+}
+
 test "window_closing lifecycle event is ignored while tracked browser pid is alive" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -4546,7 +4814,7 @@ test "window_closing lifecycle event is ignored while tracked browser pid is ali
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4594,7 +4862,7 @@ test "non-linked tracked browser pid death requests close" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4702,7 +4970,7 @@ test "close control remains backend-driven when emulation is disabled" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
         .window_fallback_emulation = false,
     });
     defer app.deinit();
@@ -4719,7 +4987,7 @@ test "native backend unavailability returns warnings and falls back to emulation
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .native_webview, .second = .web_url, .third = null },
         .window_fallback_emulation = true,
     });
     defer app.deinit();
@@ -4744,7 +5012,7 @@ test "window capability reporting follows fallback policy" {
     defer _ = gpa.deinit();
 
     var app_default = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
         .window_fallback_emulation = true,
     });
     defer app_default.deinit();
@@ -4754,7 +5022,7 @@ test "window capability reporting follows fallback policy" {
     try std.testing.expect(window_style_types.hasCapability(.native_frameless, caps_default));
 
     var app_disabled = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
         .window_fallback_emulation = false,
     });
     defer app_disabled.deinit();
@@ -4768,7 +5036,7 @@ test "window control and style routes roundtrip" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4875,7 +5143,7 @@ test "rpc event carries client and connection identifiers" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -4911,6 +5179,9 @@ test "friendly service api with compile-time rpc_methods constant" {
     defer _ = gpa.deinit();
 
     var service = try Service.init(gpa.allocator(), rpc_methods, .{
+        .app = .{
+            .launch_policy = .webUrlOnly(),
+        },
         .window = .{
             .title = "Friendly",
         },
@@ -5057,7 +5328,7 @@ test "evalScript times out when no client is polling" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -5081,7 +5352,7 @@ test "script response route completes queued eval task" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
     });
     defer app.deinit();
 
@@ -5133,9 +5404,9 @@ test "runtime render state and capability probe expose launch policy selection" 
 
     var app = try App.init(gpa.allocator(), .{
         .launch_policy = .{
-            .preferred_transport = .browser,
-            .fallback_transport = .browser,
-            .browser_open_mode = .never,
+            .first = .web_url,
+            .second = null,
+            .third = null,
         },
     });
     defer app.deinit();
@@ -5150,9 +5421,10 @@ test "runtime render state and capability probe expose launch policy selection" 
 
     const state = win.runtimeRenderState();
     try std.testing.expectEqual(@as(TransportMode, .browser_fallback), state.active_transport);
+    try std.testing.expectEqual(@as(LaunchSurface, .web_url), state.active_surface);
     try std.testing.expect(!state.fallback_applied);
     try std.testing.expect(state.fallback_reason == null);
-    try std.testing.expectEqual(@as(LaunchPolicy.PreferredTransport, .browser), state.launch_policy.preferred_transport);
+    try std.testing.expectEqual(@as(LaunchSurface, .web_url), state.launch_policy.first);
 }
 
 test "diagnostic callback emits typed transport diagnostics" {
@@ -5177,9 +5449,9 @@ test "diagnostic callback emits typed transport diagnostics" {
 
     var app = try App.init(gpa.allocator(), .{
         .launch_policy = .{
-            .preferred_transport = .browser,
-            .fallback_transport = .browser,
-            .browser_open_mode = .never,
+            .first = .web_url,
+            .second = null,
+            .third = null,
         },
     });
     defer app.deinit();
@@ -5211,9 +5483,9 @@ test "service init keeps diagnostic callback binding invariant stable" {
     var service = try Service.init(gpa.allocator(), rpc_methods, .{
         .app = .{
             .launch_policy = .{
-                .preferred_transport = .browser,
-                .fallback_transport = .browser,
-                .browser_open_mode = .never,
+                .first = .web_url,
+                .second = null,
+                .third = null,
             },
         },
     });
@@ -5243,9 +5515,9 @@ test "service move is detected by diagnostic callback binding invariant" {
     var service = try Service.init(gpa.allocator(), rpc_methods, .{
         .app = .{
             .launch_policy = .{
-                .preferred_transport = .browser,
-                .fallback_transport = .browser,
-                .browser_open_mode = .never,
+                .first = .web_url,
+                .second = null,
+                .third = null,
             },
         },
     });
@@ -5291,9 +5563,9 @@ test "service move guard emits typed diagnostic on mismatch" {
     var service = try Service.init(gpa.allocator(), rpc_methods, .{
         .app = .{
             .launch_policy = .{
-                .preferred_transport = .browser,
-                .fallback_transport = .browser,
-                .browser_open_mode = .never,
+                .first = .web_url,
+                .second = null,
+                .third = null,
             },
         },
     });
@@ -5332,9 +5604,9 @@ test "normal service flow does not emit pinned move diagnostics" {
     var service = try Service.init(gpa.allocator(), rpc_methods, .{
         .app = .{
             .launch_policy = .{
-                .preferred_transport = .browser,
-                .fallback_transport = .browser,
-                .browser_open_mode = .never,
+                .first = .web_url,
+                .second = null,
+                .third = null,
             },
         },
     });
@@ -5359,9 +5631,9 @@ test "service requirement listing and probe are available before show" {
     var service = try Service.init(gpa.allocator(), rpc_methods, .{
         .app = .{
             .launch_policy = .{
-                .preferred_transport = .browser,
-                .fallback_transport = .browser,
-                .browser_open_mode = .never,
+                .first = .web_url,
+                .second = null,
+                .third = null,
             },
         },
     });
@@ -5399,9 +5671,9 @@ test "async rpc jobs support poll and cancel" {
 
     var app = try App.init(gpa.allocator(), .{
         .launch_policy = .{
-            .preferred_transport = .browser,
-            .fallback_transport = .browser,
-            .browser_open_mode = .never,
+            .first = .web_url,
+            .second = null,
+            .third = null,
         },
     });
     defer app.deinit();
@@ -5466,9 +5738,9 @@ test "async rpc job routes roundtrip via http endpoints" {
 
     var app = try App.init(gpa.allocator(), .{
         .launch_policy = .{
-            .preferred_transport = .browser,
-            .fallback_transport = .browser,
-            .browser_open_mode = .never,
+            .first = .web_url,
+            .second = null,
+            .third = null,
         },
     });
     defer app.deinit();
@@ -5538,9 +5810,9 @@ test "threaded dispatcher stress handles concurrent http rpc requests" {
 
     var app = try App.init(gpa.allocator(), .{
         .launch_policy = .{
-            .preferred_transport = .browser,
-            .fallback_transport = .browser,
-            .browser_open_mode = .never,
+            .first = .web_url,
+            .second = null,
+            .third = null,
         },
     });
     defer app.deinit();

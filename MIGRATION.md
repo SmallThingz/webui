@@ -53,9 +53,9 @@ Browser fallback controls:
 ```zig
 var app = try webui.App.init(allocator, .{
     .launch_policy = .{
-        .preferred_transport = .native_webview,
-        .fallback_transport = .browser,
-        .browser_open_mode = .on_browser_transport,
+        .first = .native_webview,
+        .second = .browser_window,
+        .third = .web_url,
     },
 });
 ```

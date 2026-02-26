@@ -48,12 +48,6 @@ pub fn initializeRuntime(enable_tls: bool, enable_log: bool) void {
     _ = enable_log;
 }
 
-pub fn nextFallbackPort(window_id: usize) u16 {
-    const base: u16 = 30_000;
-    const span: u16 = 20_000;
-    return base + @as(u16, @intCast(window_id % span));
-}
-
 pub fn openInBrowser(
     allocator: std.mem.Allocator,
     url: []const u8,

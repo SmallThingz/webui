@@ -56,6 +56,72 @@ pub const rpc_methods = struct {
     }
 };
 
+fn parseSurfaceToken(token: []const u8) ?webui.LaunchSurface {
+    if (std.mem.eql(u8, token, "webview")) return .native_webview;
+    if (std.mem.eql(u8, token, "browser")) return .browser_window;
+    if (std.mem.eql(u8, token, "web-url")) return .web_url;
+    if (std.mem.eql(u8, token, "url")) return .web_url;
+    if (std.mem.eql(u8, token, "web")) return .web_url;
+    return null;
+}
+
+fn launchPolicyFromRunMode() webui.LaunchPolicy {
+    const mode = webui.BuildFlags.run_mode;
+
+    if (std.mem.eql(u8, mode, "webview")) return webui.LaunchPolicy.webviewFirst();
+    if (std.mem.eql(u8, mode, "browser")) return webui.LaunchPolicy.browserFirst();
+    if (std.mem.eql(u8, mode, "web-url") or std.mem.eql(u8, mode, "url") or std.mem.eql(u8, mode, "web")) {
+        return webui.LaunchPolicy.webUrlOnly();
+    }
+
+    var surfaces: [3]?webui.LaunchSurface = .{ null, null, null };
+    var count: usize = 0;
+
+    var it = std.mem.tokenizeAny(u8, mode, ",> ");
+    while (it.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, " \t\r\n");
+        if (token.len == 0) continue;
+        const parsed = parseSurfaceToken(token) orelse continue;
+
+        var exists = false;
+        for (surfaces) |candidate| {
+            if (candidate != null and candidate.? == parsed) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) continue;
+        if (count >= surfaces.len) break;
+        surfaces[count] = parsed;
+        count += 1;
+    }
+
+    if (count == 0) return webui.LaunchPolicy.webviewFirst();
+
+    var policy = webui.LaunchPolicy{
+        .first = surfaces[0].?,
+        .second = if (count > 1) surfaces[1].? else null,
+        .third = if (count > 2) surfaces[2].? else null,
+        .allow_dual_surface = false,
+        .app_mode_required = true,
+    };
+    const has_native = policy.first == .native_webview or
+        (policy.second != null and policy.second.? == .native_webview) or
+        (policy.third != null and policy.third.? == .native_webview);
+    if (!has_native) {
+        policy.app_mode_required = false;
+    }
+    return policy;
+}
+
+fn surfaceName(surface: webui.LaunchSurface) []const u8 {
+    return switch (surface) {
+        .native_webview => "native webview",
+        .browser_window => "browser window",
+        .web_url => "web-url only",
+    };
+}
+
 pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -99,8 +165,10 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
         );
     }
 
-    const browser_mode = std.mem.eql(u8, webui.BuildFlags.run_mode, "browser");
-    std.debug.print("[{s}] {s} mode active\n", .{ tagFor(kind), if (browser_mode) "browser" else "native webview" });
+    std.debug.print("[{s}] launch mode active: {s}\n", .{
+        tagFor(kind),
+        surfaceName(app_options.launch_policy.first),
+    });
 
     const exit_ms = parseExitMs();
     if (exit_ms) |_| {
@@ -175,32 +243,18 @@ fn tagFor(comptime kind: ExampleKind) []const u8 {
 }
 
 fn appOptionsFor(comptime kind: ExampleKind) webui.AppOptions {
-    const browser_mode = std.mem.eql(u8, webui.BuildFlags.run_mode, "browser");
+    const launch_policy = launchPolicyFromRunMode();
+    const native_first = launch_policy.first == .native_webview;
     return .{
-        .launch_policy = if (browser_mode)
-            .{
-                .preferred_transport = .browser,
-                .fallback_transport = .browser,
-                .browser_open_mode = .on_browser_transport,
-                .allow_dual_surface = false,
-                .app_mode_required = false,
-            }
-        else
-            .{
-                .preferred_transport = .native_webview,
-                .fallback_transport = .none,
-                .browser_open_mode = .on_browser_transport,
-                .allow_dual_surface = false,
-                .app_mode_required = true,
-            },
+        .launch_policy = launch_policy,
         .enable_tls = webui.BuildFlags.enable_tls,
         .enable_webui_log = true,
         .public_network = kind == .public_network,
         .browser_launch = .{
-            .require_app_mode_window = !browser_mode,
-            .allow_system_fallback = browser_mode,
+            .require_app_mode_window = native_first,
+            .allow_system_fallback = !native_first,
         },
-        .window_fallback_emulation = browser_mode,
+        .window_fallback_emulation = !native_first,
     };
 }
 

@@ -23,12 +23,7 @@ pub fn main() !void {
 
     var service = try webui.Service.init(allocator, rpc_methods, .{
         .app = .{
-            .launch_policy = .{
-                .preferred_transport = .native_webview,
-                .fallback_transport = .browser,
-                .browser_open_mode = .on_browser_transport,
-                .allow_dual_surface = false,
-            },
+            .launch_policy = webui.LaunchPolicy.webviewFirst(),
             .window_fallback_emulation = true,
         },
         .window = .{
