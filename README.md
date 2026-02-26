@@ -28,7 +28,7 @@ See `parity/status.json`, `docs/manual_gui_checklist.md`, and `docs/upstream_fil
 - **Pure Zig active build graph**: no `@cImport`, no `translate-c`, no runtime C/C++/ObjC compilation in the active library.
 - **Dev-friendly API**: `App`, `Window`, `Service`, `WindowStyle`, `WindowControl`, typed `Event`s.
 - **Comptime RPC surface**: define `pub const rpc_methods = struct { ... }` once, generate JS/TS bridge from it.
-- **Push transport for scripts**: WebSocket push channel with delayed bounded poll fallback.
+- **Push transport for scripts/jobs**: reconnecting WebSocket channel with WS-only wait/cancel/response flows.
 - **Aggressive browser discovery**: broad catalog + OS-specific search paths + env overrides.
 - **Tracked example tree**: active demos live under `examples/` (no untracked shadow example paths).
 - **Parity/test gates**: `zig build test`, `zig build examples`, `zig build parity-local`, `zig build os-matrix`.
@@ -296,12 +296,11 @@ Dispatch modes:
 - `threaded` (worker queue)
 - `custom` (hook dispatcher)
 
-Async jobs (push-first):
+Async jobs (WebSocket-driven):
 - Set `RpcOptions.execution_mode = .queued_async`.
 - `POST <rpc_route>` returns `{ job_id, state, poll_min_ms, poll_max_ms }`.
 - Completion is pushed over WebSocket as `rpc_job_update`.
-- JS bridge waits for push first, then activates bounded polling fallback (`GET /rpc/job?id=...`) only if push is unavailable/late.
-- Cancel route: `POST /rpc/job/cancel` with `{ "job_id": <id> }`.
+- JS bridge waits for a reconnecting WebSocket and requests status/cancel over WS only (`rpc_job_wait`, `rpc_job_cancel`).
 
 Typed APIs:
 - `Window.rpcPollJob(allocator, job_id) !RpcJobStatus`

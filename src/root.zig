@@ -1966,6 +1966,51 @@ const WindowState = struct {
         }
     }
 
+    fn sendRpcJobStatusPayloadLocked(
+        self: *WindowState,
+        connection_id: usize,
+        status: RpcJobStatus,
+    ) void {
+        const entry = self.findWsConnectionByIdLocked(connection_id) orelse return;
+        const payload = std.json.Stringify.valueAlloc(self.allocator, .{
+            .type = "rpc_job_status",
+            .job_id = status.id,
+            .state = @tagName(status.state),
+            .value_json = status.value_json,
+            .error_message = status.error_message,
+            .created_ms = status.created_ms,
+            .updated_ms = status.updated_ms,
+        }, .{}) catch return;
+        defer self.allocator.free(payload);
+
+        self.sendWsTextLocked(entry.stream, payload) catch {
+            self.closeWsConnectionLocked(entry.connection_id);
+        };
+    }
+
+    fn sendRpcJobErrorPayloadLocked(
+        self: *WindowState,
+        connection_id: usize,
+        job_id: RpcJobId,
+        err_name: []const u8,
+    ) void {
+        const entry = self.findWsConnectionByIdLocked(connection_id) orelse return;
+        const payload = std.json.Stringify.valueAlloc(self.allocator, .{
+            .type = "rpc_job_status",
+            .job_id = job_id,
+            .state = "failed",
+            .value_json = @as(?[]const u8, null),
+            .error_message = err_name,
+            .created_ms = @as(i64, 0),
+            .updated_ms = std.time.milliTimestamp(),
+        }, .{}) catch return;
+        defer self.allocator.free(payload);
+
+        self.sendWsTextLocked(entry.stream, payload) catch {
+            self.closeWsConnectionLocked(entry.connection_id);
+        };
+    }
+
     fn pushBackendCloseSignalLocked(self: *WindowState, reason: []const u8) !u64 {
         if (self.ws_connections.items.len == 0) return 0;
 
@@ -2094,7 +2139,7 @@ const WindowState = struct {
         task.mutex.unlock();
     }
 
-    fn handleWebSocketClientMessage(self: *WindowState, data: []const u8) !void {
+    fn handleWebSocketClientMessage(self: *WindowState, connection_id: usize, data: []const u8) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
         defer parsed.deinit();
 
@@ -2126,6 +2171,57 @@ const WindowState = struct {
 
             self.state_mutex.lock();
             self.requestLifecycleCloseFromFrontend();
+            self.state_mutex.unlock();
+            return;
+        }
+
+        if (std.mem.eql(u8, msg_type_value.string, "rpc_job_wait")) {
+            const id_value = parsed.value.object.get("job_id") orelse return;
+            const job_id: RpcJobId = switch (id_value) {
+                .integer => |v| @as(RpcJobId, @intCast(v)),
+                .float => |v| @as(RpcJobId, @intFromFloat(v)),
+                else => return,
+            };
+
+            const status = self.rpc_state.pollJob(self.allocator, job_id) catch |err| {
+                self.state_mutex.lock();
+                self.sendRpcJobErrorPayloadLocked(connection_id, job_id, @errorName(err));
+                self.state_mutex.unlock();
+                return;
+            };
+            defer {
+                if (status.value_json) |v| self.allocator.free(v);
+                if (status.error_message) |e| self.allocator.free(e);
+            }
+
+            self.state_mutex.lock();
+            self.sendRpcJobStatusPayloadLocked(connection_id, status);
+            self.state_mutex.unlock();
+            return;
+        }
+
+        if (std.mem.eql(u8, msg_type_value.string, "rpc_job_cancel")) {
+            const id_value = parsed.value.object.get("job_id") orelse return;
+            const job_id: RpcJobId = switch (id_value) {
+                .integer => |v| @as(RpcJobId, @intCast(v)),
+                .float => |v| @as(RpcJobId, @intFromFloat(v)),
+                else => return,
+            };
+
+            _ = self.rpc_state.cancelJob(job_id) catch false;
+            const status = self.rpc_state.pollJob(self.allocator, job_id) catch |err| {
+                self.state_mutex.lock();
+                self.sendRpcJobErrorPayloadLocked(connection_id, job_id, @errorName(err));
+                self.state_mutex.unlock();
+                return;
+            };
+            defer {
+                if (status.value_json) |v| self.allocator.free(v);
+                if (status.error_message) |e| self.allocator.free(e);
+            }
+
+            self.state_mutex.lock();
+            self.sendRpcJobStatusPayloadLocked(connection_id, status);
             self.state_mutex.unlock();
             return;
         }
@@ -3663,7 +3759,7 @@ fn wsConnectionThreadMain(state: *WindowState, stream: std.net.Stream, connectio
 
         switch (frame.kind) {
             .text, .binary => {
-                state.handleWebSocketClientMessage(frame.payload) catch |err| {
+                state.handleWebSocketClientMessage(connection_id, frame.payload) catch |err| {
                     if (state.rpc_state.log_enabled) {
                         std.debug.print("[webui.ws] message handling failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
                     }
@@ -3747,129 +3843,16 @@ fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: s
     const path_only = pathWithoutQuery(request.path);
     if (try handleWebSocketUpgradeRoute(state, stream, request, path_only)) return true;
 
+    // Keep lifecycle/script/job control on WS only. Do not re-introduce HTTP fallback
+    // routes for these flows, because they cause duplicate semantics and polling paths.
     if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return false;
     if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
-    if (try handleRpcJobRoute(state, allocator, stream, request.method, request.path, path_only)) return false;
-    if (try handleRpcJobCancelRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
-    if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
-    if (try handleScriptResponseRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
     if (try handleWindowControlRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
     if (try handleWindowStyleRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
     if (try handleWindowContentRoute(state, allocator, stream, request.method, path_only)) return false;
 
     try writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "not found");
     return false;
-}
-
-fn handleLifecycleRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-    headers: []const u8,
-    body: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "POST")) return false;
-    if (!std.mem.eql(u8, path_only, "/webui/lifecycle")) return false;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
-    const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
-    state.state_mutex.lock();
-    _ = state.findOrCreateClientSessionLocked(client_token) catch null;
-    state.state_mutex.unlock();
-    if (parsed) |*p| {
-        defer p.deinit();
-        if (p.value == .object) {
-            if (p.value.object.get("event")) |event_value| {
-                if (event_value == .string) {
-                    if (std.mem.eql(u8, event_value.string, "window_closing")) {
-                        state.state_mutex.lock();
-                        state.requestLifecycleCloseFromFrontend();
-                        state.state_mutex.unlock();
-                    }
-                }
-            }
-        }
-    }
-
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", "{\"ok\":true}");
-    return true;
-}
-
-fn handleScriptResponseRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-    body: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "POST")) return false;
-    if (!std.mem.eql(u8, path_only, "/webui/script/response")) return false;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_script_response\"}");
-        return true;
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_script_response\"}");
-        return true;
-    }
-
-    const id_value = parsed.value.object.get("id") orelse {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"missing_script_id\"}");
-        return true;
-    };
-
-    const task_id: u64 = switch (id_value) {
-        .integer => |v| @as(u64, @intCast(v)),
-        .float => |v| @as(u64, @intFromFloat(v)),
-        else => {
-            try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_script_id\"}");
-            return true;
-        },
-    };
-
-    const js_error = if (parsed.value.object.get("js_error")) |err_val|
-        switch (err_val) {
-            .bool => |b| b,
-            else => false,
-        }
-    else
-        false;
-
-    const value_json = if (parsed.value.object.get("value")) |value|
-        try std.json.Stringify.valueAlloc(allocator, value, .{})
-    else
-        null;
-    defer if (value_json) |buf| allocator.free(buf);
-
-    const error_message = if (parsed.value.object.get("error_message")) |err_msg|
-        switch (err_msg) {
-            .string => |msg| msg,
-            else => null,
-        }
-    else
-        null;
-
-    state.state_mutex.lock();
-    const completed = state.completeScriptTaskLocked(task_id, js_error, value_json, error_message) catch {
-        state.state_mutex.unlock();
-        try writeHttpResponse(stream, 500, "application/json; charset=utf-8", "{\"error\":\"script_completion_failed\"}");
-        return true;
-    };
-    state.state_mutex.unlock();
-
-    if (!completed) {
-        try writeHttpResponse(stream, 404, "application/json; charset=utf-8", "{\"error\":\"script_not_found\"}");
-        return true;
-    }
-
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", "{\"ok\":true}");
-    return true;
 }
 
 fn pathWithoutQuery(path: []const u8) []const u8 {
@@ -4003,86 +3986,6 @@ fn handleRpcRoute(
         handler(state.event_callback.context, &event);
     }
 
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-    return true;
-}
-
-fn rpcJobIdFromPath(path: []const u8) ?RpcJobId {
-    const q = std.mem.indexOfScalar(u8, path, '?') orelse return null;
-    var pair_it = std.mem.splitScalar(u8, path[q + 1 ..], '&');
-    while (pair_it.next()) |pair| {
-        if (pair.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (!std.mem.eql(u8, pair[0..eq], "id")) continue;
-        return std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch null;
-    }
-    return null;
-}
-
-fn handleRpcJobRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path: []const u8,
-    path_only: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "GET")) return false;
-    if (!std.mem.eql(u8, path_only, "/rpc/job")) return false;
-
-    const job_id = rpcJobIdFromPath(path) orelse {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"missing_job_id\"}");
-        return true;
-    };
-
-    const status = state.rpc_state.pollJob(allocator, job_id) catch |err| {
-        const payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-        defer allocator.free(payload);
-        try writeHttpResponse(stream, 404, "application/json; charset=utf-8", payload);
-        return true;
-    };
-    defer {
-        if (status.value_json) |v| allocator.free(v);
-        if (status.error_message) |e| allocator.free(e);
-    }
-
-    const payload = try std.json.Stringify.valueAlloc(allocator, .{
-        .job_id = status.id,
-        .state = @tagName(status.state),
-        .value = status.value_json,
-        .error_message = status.error_message,
-        .created_ms = status.created_ms,
-        .updated_ms = status.updated_ms,
-    }, .{});
-    defer allocator.free(payload);
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-    return true;
-}
-
-fn handleRpcJobCancelRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-    body: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "POST")) return false;
-    if (!std.mem.eql(u8, path_only, "/rpc/job/cancel")) return false;
-
-    const Req = struct { job_id: RpcJobId };
-    var parsed = std.json.parseFromSlice(Req, allocator, body, .{ .ignore_unknown_fields = true }) catch {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_cancel_request\"}");
-        return true;
-    };
-    defer parsed.deinit();
-
-    const canceled = state.rpc_state.cancelJob(parsed.value.job_id) catch false;
-    const payload = try std.json.Stringify.valueAlloc(allocator, .{
-        .job_id = parsed.value.job_id,
-        .canceled = canceled,
-    }, .{});
-    defer allocator.free(payload);
     try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
     return true;
 }
@@ -4621,7 +4524,7 @@ test "websocket upgrade uses same http server port" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
 }
 
-test "lifecycle route stays responsive during long running rpc" {
+test "window control route stays responsive during long running rpc" {
     const DemoRpc = struct {
         pub fn slow() []const u8 {
             std.Thread.sleep(900 * std.time.ns_per_ms);
@@ -4636,7 +4539,7 @@ test "lifecycle route stays responsive during long running rpc" {
         err: ?anyerror = null,
 
         fn run(ctx: *@This()) void {
-            const result = httpRoundTrip(ctx.allocator, ctx.port, "POST", "/rpc", "{\"name\":\"slow\",\"args\":[]}");
+            const result = httpRoundTrip(ctx.allocator, ctx.port, "POST", "/webui/rpc", "{\"name\":\"slow\",\"args\":[]}");
             if (result) |response| {
                 ctx.response = response;
             } else |err| {
@@ -4655,7 +4558,7 @@ test "lifecycle route stays responsive during long running rpc" {
 
     var win = try app.newWindow(.{ .title = "LifecycleResponsive" });
     try win.bindRpc(DemoRpc, .{
-        .bridge_options = .{ .rpc_route = "/rpc" },
+        .bridge_options = .{ .rpc_route = "/webui/rpc" },
     });
     try win.showHtml("<html><body>lifecycle-responsive</body></html>");
     try app.run();
@@ -4670,17 +4573,17 @@ test "lifecycle route stays responsive during long running rpc" {
     std.Thread.sleep(40 * std.time.ns_per_ms);
 
     const started_ns = std.time.nanoTimestamp();
-    const lifecycle_response = try httpRoundTrip(
+    const control_response = try httpRoundTrip(
         gpa.allocator(),
         win.state().server_port,
-        "POST",
-        "/webui/lifecycle",
-        "{\"event\":\"ping\"}",
+        "GET",
+        "/webui/window/control",
+        null,
     );
-    defer gpa.allocator().free(lifecycle_response);
+    defer gpa.allocator().free(control_response);
     const elapsed_ms = @as(i64, @intCast(@divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms)));
 
-    try std.testing.expect(std.mem.indexOf(u8, lifecycle_response, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, control_response, "HTTP/1.1 200 OK") != null);
     try std.testing.expect(elapsed_ms < 400);
 
     rpc_thread.join();
@@ -5082,7 +4985,7 @@ test "browser launch failure fallback advances from active launch surface" {
     try std.testing.expect(!win.state().resolveAfterBrowserLaunchFailure(.web_url));
 }
 
-test "window_closing lifecycle event is ignored while tracked browser pid is alive" {
+test "window_closing lifecycle message is ignored while tracked browser pid is alive" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -5113,16 +5016,9 @@ test "window_closing lifecycle event is ignored while tracked browser pid is ali
     win.state().launched_browser_lifecycle_linked = false;
     win.state().state_mutex.unlock();
 
-    const response = try httpRoundTrip(
-        gpa.allocator(),
-        win.state().server_port,
-        "POST",
-        "/webui/lifecycle",
-        "{\"event\":\"window_closing\"}",
-    );
-    defer gpa.allocator().free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") != null);
+    win.state().state_mutex.lock();
+    win.state().requestLifecycleCloseFromFrontend();
+    win.state().state_mutex.unlock();
 
     win.state().state_mutex.lock();
     const should_close = win.state().close_requested.load(.acquire);
@@ -5562,11 +5458,11 @@ test "comptime bridge generation" {
 
     const script = RpcRegistry.generatedClientScriptComptime(DemoRpc, .{
         .namespace = "demo",
-        .rpc_route = "/rpc",
+        .rpc_route = "/webui/rpc",
     });
     const dts = RpcRegistry.generatedTypeScriptDeclarationsComptime(DemoRpc, .{
         .namespace = "demo",
-        .rpc_route = "/rpc",
+        .rpc_route = "/webui/rpc",
     });
 
     try std.testing.expect(std.mem.indexOf(u8, script, "const demo") != null);
@@ -5629,7 +5525,7 @@ test "evalScript times out when no client is polling" {
     try std.testing.expect(result.value == null);
 }
 
-test "script response route completes queued eval task" {
+test "script response websocket message completes queued eval task" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -5650,24 +5546,13 @@ test "script response route completes queued eval task" {
     try state.script_inflight.append(task);
     state.state_mutex.unlock();
 
-    const completion_body = try std.fmt.allocPrint(
+    const completion_msg = try std.fmt.allocPrint(
         gpa.allocator(),
-        "{{\"id\":{d},\"js_error\":false,\"value\":42}}",
+        "{{\"type\":\"script_response\",\"id\":{d},\"js_error\":false,\"value\":42}}",
         .{task.id},
     );
-    defer gpa.allocator().free(completion_body);
-
-    const complete_response = try httpRoundTripWithHeaders(
-        gpa.allocator(),
-        state.server_port,
-        "POST",
-        "/webui/script/response",
-        completion_body,
-        &.{"x-webui-client-id: script-test-client"},
-    );
-    defer gpa.allocator().free(complete_response);
-    try std.testing.expect(std.mem.indexOf(u8, complete_response, "HTTP/1.1 200 OK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, complete_response, "{\"ok\":true}") != null);
+    defer gpa.allocator().free(completion_msg);
+    try state.handleWebSocketClientMessage(1, completion_msg);
 
     task.mutex.lock();
     const done = task.done;
@@ -5962,7 +5847,7 @@ test "async rpc jobs support poll and cancel" {
 
     var win = try app.newWindow(.{ .title = "AsyncJobs" });
     try win.bindRpc(DemoRpc, .{
-        .bridge_options = .{ .rpc_route = "/rpc" },
+        .bridge_options = .{ .rpc_route = "/webui/rpc" },
         .execution_mode = .queued_async,
         .job_poll_min_ms = 10,
         .job_poll_max_ms = 40,
@@ -6008,7 +5893,7 @@ test "async rpc jobs support poll and cancel" {
     try std.testing.expectEqual(@as(RpcJobState, .canceled), canceled_status.state);
 }
 
-test "async rpc job routes roundtrip via http endpoints" {
+test "async rpc job enqueue via http with status and cancel via API" {
     const DemoRpc = struct {
         pub fn ping() []const u8 {
             return "pong";
@@ -6029,13 +5914,13 @@ test "async rpc job routes roundtrip via http endpoints" {
 
     var win = try app.newWindow(.{ .title = "AsyncRouteRoundtrip" });
     try win.bindRpc(DemoRpc, .{
-        .bridge_options = .{ .rpc_route = "/rpc" },
+        .bridge_options = .{ .rpc_route = "/webui/rpc" },
         .execution_mode = .queued_async,
     });
     try win.showHtml("<html><body>async-route-roundtrip</body></html>");
     try app.run();
 
-    const enqueue_response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/rpc", "{\"name\":\"ping\",\"args\":[]}");
+    const enqueue_response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"ping\",\"args\":[]}");
     defer gpa.allocator().free(enqueue_response);
     try std.testing.expect(std.mem.indexOf(u8, enqueue_response, "\"job_id\":") != null);
 
@@ -6052,17 +5937,12 @@ test "async rpc job routes roundtrip via http endpoints" {
     var done = false;
     var attempts: usize = 0;
     while (attempts < 80) : (attempts += 1) {
-        const status_path = try std.fmt.allocPrint(gpa.allocator(), "/rpc/job?id={d}", .{job_id});
-        defer gpa.allocator().free(status_path);
-        const status_response = try httpRoundTrip(
-            gpa.allocator(),
-            win.state().server_port,
-            "GET",
-            status_path,
-            null,
-        );
-        defer gpa.allocator().free(status_response);
-        if (std.mem.indexOf(u8, status_response, "\"state\":\"completed\"") != null) {
+        const status = try win.rpcPollJob(gpa.allocator(), job_id);
+        defer {
+            if (status.value_json) |value| gpa.allocator().free(value);
+            if (status.error_message) |msg| gpa.allocator().free(msg);
+        }
+        if (status.state == .completed) {
             done = true;
             break;
         }
@@ -6070,11 +5950,7 @@ test "async rpc job routes roundtrip via http endpoints" {
     }
     try std.testing.expect(done);
 
-    const cancel_body = try std.fmt.allocPrint(gpa.allocator(), "{{\"job_id\":{d}}}", .{job_id});
-    defer gpa.allocator().free(cancel_body);
-    const cancel_response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/rpc/job/cancel", cancel_body);
-    defer gpa.allocator().free(cancel_response);
-    try std.testing.expect(std.mem.indexOf(u8, cancel_response, "\"canceled\":false") != null);
+    try std.testing.expect(!try win.rpcCancelJob(job_id));
 }
 
 test "threaded dispatcher stress handles concurrent http rpc requests" {
@@ -6102,7 +5978,7 @@ test "threaded dispatcher stress handles concurrent http rpc requests" {
     var win = try app.newWindow(.{ .title = "ThreadedStressHttp" });
     var registry = win.rpc();
     try registry.register(DemoRpc, .{
-        .bridge_options = .{ .rpc_route = "/rpc" },
+        .bridge_options = .{ .rpc_route = "/webui/rpc" },
         .dispatcher_mode = .threaded,
         .threaded_poll_interval_ns = std.time.ns_per_ms,
     });
@@ -6129,7 +6005,7 @@ test "threaded dispatcher stress handles concurrent http rpc requests" {
                 };
                 defer allocator.free(payload);
 
-                const response = httpRoundTrip(allocator, ctx.port, "POST", "/rpc", payload) catch {
+                const response = httpRoundTrip(allocator, ctx.port, "POST", "/webui/rpc", payload) catch {
                     ctx.shared.failed.store(true, .release);
                     return;
                 };

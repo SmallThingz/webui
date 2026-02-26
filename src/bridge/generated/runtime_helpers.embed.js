@@ -29,7 +29,7 @@ async function __webuiInvoke(endpoint, name, args) {
     const jobId = Math.trunc(Number(body.job_id));
     const pollMin = Number.isFinite(Number(body.poll_min_ms)) ? Math.max(50, Math.trunc(Number(body.poll_min_ms))) : 200;
     const pollMax = Number.isFinite(Number(body.poll_max_ms)) ? Math.max(pollMin, Math.trunc(Number(body.poll_max_ms))) : 1000;
-    return await __webuiAwaitRpcJob(endpoint, jobId, pollMin, pollMax);
+    return await __webuiAwaitRpcJob(jobId, pollMin, pollMax);
   }
   return body;
 }
@@ -65,26 +65,58 @@ function __webuiNormalizeResult(result) {
 }
 
 const __webuiRpcJobWaiters = new Map();
+const __webuiSocketConnectTimeoutMs = 10000;
+const __webuiRpcJobWaitTimeoutMs = 120000;
 
-function __webuiHasActivePushSocket() {
-  if (typeof globalThis === "undefined" || typeof globalThis.WebSocket !== "function") return false;
-  if (__webuiSocketStopped) return false;
-  if (__webuiSocketOpen) return true;
-  if (__webuiSocket && __webuiSocket.readyState === globalThis.WebSocket.CONNECTING) return true;
-  return false;
+function __webuiSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function __webuiFetchRpcJobStatus(endpoint, jobId) {
-  const url = new URL("/rpc/job", globalThis.location ? globalThis.location.href : endpoint);
-  url.searchParams.set("id", String(jobId));
-  return await __webuiJson(url.toString(), { method: "GET" });
+async function __webuiWaitForSocketReady(timeoutMs) {
+  const deadline = Date.now() + Math.max(50, timeoutMs || __webuiSocketConnectTimeoutMs);
+  while (Date.now() < deadline) {
+    if (__webuiSocketOpen && __webuiSocket && __webuiSocket.readyState === globalThis.WebSocket.OPEN) return;
+    if (__webuiSocketStopped) break;
+    __webuiConnectPushSocket();
+    await __webuiSleep(40);
+  }
+  throw new Error("WebSocket unavailable");
 }
 
-async function __webuiAwaitRpcJob(endpoint, jobId, pollMinMs, pollMaxMs) {
+async function __webuiSendObjectWithBackoff(message, timeoutMs, label) {
+  const totalTimeout = Math.max(200, timeoutMs || __webuiSocketConnectTimeoutMs);
+  const deadline = Date.now() + totalTimeout;
+  let delayMs = 40;
+
+  while (Date.now() < deadline) {
+    if (__webuiSocketOpen && __webuiSocketSendObject(message)) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    try {
+      await __webuiWaitForSocketReady(Math.min(remaining, 1200));
+    } catch (_) {}
+    if (__webuiSocketOpen && __webuiSocketSendObject(message)) return;
+    await __webuiSleep(Math.min(delayMs, Math.max(10, deadline - Date.now())));
+    delayMs = Math.min(500, Math.floor(delayMs * 1.7));
+  }
+
+  throw new Error(`${label || "socket send"} timed out`);
+}
+
+function __webuiDecodeJobValue(valueJson) {
+  if (typeof valueJson !== "string") return null;
+  try {
+    return JSON.parse(valueJson);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function __webuiAwaitRpcJob(jobId, pollMinMs, pollMaxMs) {
   let stopped = false;
   let timer = null;
   let currentDelay = pollMinMs;
-  let pollingStarted = false;
+  const deadline = Date.now() + __webuiRpcJobWaitTimeoutMs;
 
   return await new Promise((resolve, reject) => {
     const cleanup = () => {
@@ -101,77 +133,80 @@ async function __webuiAwaitRpcJob(endpoint, jobId, pollMinMs, pollMaxMs) {
       reject(new Error(message));
     };
 
-    const startPolling = () => {
-      if (stopped || pollingStarted) return;
-      pollingStarted = true;
-      currentDelay = pollMinMs;
-      void poll();
-    };
-
     const schedulePoll = () => {
-      if (stopped || !pollingStarted) return;
+      if (stopped) return;
       timer = setTimeout(() => {
-        void poll();
+        void requestStatus();
       }, currentDelay);
       currentDelay = Math.min(pollMaxMs, Math.max(pollMinMs, Math.floor(currentDelay * 1.6)));
     };
 
-    const poll = async () => {
+    const handleStatus = (status) => {
       if (stopped) return;
+      const state = status && typeof status.state === "string" ? status.state : "queued";
+      if (state === "completed") {
+        cleanup();
+        resolve({ value: __webuiDecodeJobValue(status.value_json) });
+        return;
+      }
+      if (state === "failed") {
+        cleanup();
+        failWithState(status, `RPC job ${jobId} failed`);
+        return;
+      }
+      if (state === "canceled") {
+        cleanup();
+        failWithState(status, `RPC job ${jobId} canceled`);
+        return;
+      }
+      if (state === "timed_out") {
+        cleanup();
+        failWithState(status, `RPC job ${jobId} timed out`);
+        return;
+      }
+    };
+
+    const requestStatus = async () => {
+      if (stopped) return;
+      if (Date.now() >= deadline) {
+        cleanup();
+        reject(new Error(`RPC job ${jobId} wait timed out`));
+        return;
+      }
       try {
-        const status = await __webuiFetchRpcJobStatus(endpoint, jobId);
-        const state = status && typeof status.state === "string" ? status.state : "queued";
-        if (state === "completed") {
+        await __webuiSendObjectWithBackoff(
+          {
+            type: "rpc_job_wait",
+            job_id: jobId,
+            client_id: __webuiClientId,
+          },
+          Math.min(__webuiSocketConnectTimeoutMs, Math.max(500, deadline - Date.now())),
+          `rpc job ${jobId} wait`
+        );
+      } catch (err) {
+        if (Date.now() >= deadline) {
           cleanup();
-          resolve({ value: "value" in status ? status.value : null });
+          reject(err);
           return;
         }
-        if (state === "failed") {
-          cleanup();
-          failWithState(status, `RPC job ${jobId} failed`);
-          return;
-        }
-        if (state === "canceled") {
-          cleanup();
-          failWithState(status, `RPC job ${jobId} canceled`);
-          return;
-        }
-        if (state === "timed_out") {
-          cleanup();
-          failWithState(status, `RPC job ${jobId} timed out`);
-          return;
-        }
-      } catch (_) {
-        // Keep bounded fallback polling on transient transport errors.
       }
       schedulePoll();
     };
 
     __webuiRpcJobWaiters.set(jobId, {
-      trigger() {
+      onUpdate() {
         if (stopped) return;
-        if (!pollingStarted) {
-          startPolling();
-          return;
-        }
         currentDelay = pollMinMs;
         if (timer) clearTimeout(timer);
         timer = null;
-        void poll();
+        void requestStatus();
       },
+      onStatus: handleStatus,
     });
 
-    // Push-first: when the WS channel is live/connecting, allow push to drive completion
-    // and only activate polling as a delayed fallback.
-    if (__webuiHasActivePushSocket()) {
-      const delayedFallbackMs = Math.max(400, Math.min(4000, pollMinMs * 8));
-      timer = setTimeout(() => {
-        timer = null;
-        startPolling();
-      }, delayedFallbackMs);
-    } else {
-      startPolling();
-    }
+    // WebSocket-only polling path: periodic rpc_job_wait messages over WS with
+    // immediate nudges when rpc_job_update notifications arrive.
+    void requestStatus();
   });
 }
 
@@ -332,10 +367,6 @@ let __webuiSocket = null;
 let __webuiSocketOpen = false;
 let __webuiSocketStopped = false;
 let __webuiSocketReconnectDelayMs = 120;
-let __webuiSocketQueue = [];
-let __webuiSocketEverOpened = false;
-let __webuiSocketFailedAttempts = 0;
-const __webuiSocketMaxFailedAttemptsBeforeStop = 8;
 
 function __webuiSocketUrl() {
   try {
@@ -366,25 +397,7 @@ function __webuiSocketSendObject(value) {
       return false;
     }
   }
-
-  if (__webuiSocketQueue.length < 256) {
-    __webuiSocketQueue.push(payload);
-  }
   return false;
-}
-
-function __webuiSocketFlushQueue() {
-  if (!__webuiSocketOpen || !__webuiSocket || typeof __webuiSocket.send !== "function") return;
-  while (__webuiSocketQueue.length > 0) {
-    const payload = __webuiSocketQueue.shift();
-    if (!payload) continue;
-    try {
-      __webuiSocket.send(payload);
-    } catch (_) {
-      __webuiSocketQueue.unshift(payload);
-      break;
-    }
-  }
 }
 
 function __webuiSendCloseAck(closeSignalId) {
@@ -432,7 +445,15 @@ function __webuiHandleSocketMessage(raw) {
     const id = Number(message.job_id);
     if (Number.isFinite(id)) {
       const waiter = __webuiRpcJobWaiters.get(Math.trunc(id));
-      if (waiter && typeof waiter.trigger === "function") waiter.trigger();
+      if (waiter && typeof waiter.onUpdate === "function") waiter.onUpdate();
+    }
+    return;
+  }
+  if (message.type === "rpc_job_status") {
+    const id = Number(message.job_id);
+    if (Number.isFinite(id)) {
+      const waiter = __webuiRpcJobWaiters.get(Math.trunc(id));
+      if (waiter && typeof waiter.onStatus === "function") waiter.onStatus(message);
     }
     return;
   }
@@ -445,10 +466,6 @@ function __webuiConnectPushSocket() {
   if (typeof globalThis === "undefined") return;
   if (__webuiSocketStopped) return;
   if (typeof globalThis.WebSocket !== "function") return;
-  if (!__webuiSocketEverOpened && __webuiSocketFailedAttempts >= __webuiSocketMaxFailedAttemptsBeforeStop) {
-    __webuiSocketStopped = true;
-    return;
-  }
   if (__webuiSocket && (__webuiSocket.readyState === globalThis.WebSocket.CONNECTING || __webuiSocket.readyState === globalThis.WebSocket.OPEN)) return;
 
   const url = __webuiSocketUrl();
@@ -465,10 +482,7 @@ function __webuiConnectPushSocket() {
   __webuiSocket = socket;
   socket.onopen = () => {
     __webuiSocketOpen = true;
-    __webuiSocketEverOpened = true;
-    __webuiSocketFailedAttempts = 0;
     __webuiSocketReconnectDelayMs = 120;
-    __webuiSocketFlushQueue();
   };
   socket.onmessage = (event) => {
     __webuiHandleSocketMessage(event);
@@ -478,12 +492,6 @@ function __webuiConnectPushSocket() {
     __webuiSocketOpen = false;
     __webuiSocket = null;
     if (__webuiSocketStopped) return;
-    __webuiSocketFailedAttempts += 1;
-    if (!__webuiSocketEverOpened && __webuiSocketFailedAttempts >= __webuiSocketMaxFailedAttemptsBeforeStop) {
-      __webuiSocketStopped = true;
-      __webuiSocketQueue = [];
-      return;
-    }
     const delay = Math.min(1500, __webuiSocketReconnectDelayMs);
     __webuiSocketReconnectDelayMs = Math.min(2500, __webuiSocketReconnectDelayMs * 2);
     setTimeout(__webuiConnectPushSocket, delay);
@@ -491,31 +499,12 @@ function __webuiConnectPushSocket() {
 }
 
 async function __webuiNotifyLifecycle(eventName) {
-  const message = {
+  // WS-only lifecycle signaling: no fetch/sendBeacon fallback.
+  await __webuiSendObjectWithBackoff({
     type: "lifecycle",
     event: eventName,
     client_id: __webuiClientId,
-  };
-
-  if (__webuiSocketSendObject(message)) return;
-
-  const payload = JSON.stringify({ event: eventName, client_id: __webuiClientId });
-  try {
-    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-      const blob = new Blob([payload], { type: "application/json" });
-      navigator.sendBeacon("/webui/lifecycle", blob);
-      return;
-    }
-  } catch (_) {}
-
-  try {
-    await fetch("/webui/lifecycle", {
-      method: "POST",
-      headers: __webuiRequestHeaders({ "content-type": "application/json" }),
-      body: payload,
-      keepalive: true,
-    });
-  } catch (_) {}
+  }, __webuiSocketConnectTimeoutMs, "lifecycle send");
 }
 
 async function __webuiExecuteScriptTask(task) {
@@ -542,19 +531,10 @@ async function __webuiExecuteScriptTask(task) {
     client_id: __webuiClientId,
     connection_id: task.connection_id,
   };
-  if (__webuiSocketSendObject(responsePayload)) return;
   try {
-    await __webuiJson("/webui/script/response", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        id: task.id,
-        js_error,
-        value,
-        error_message,
-      }),
-      keepalive: false,
-    });
+    // WS-only script response path. Backend dispatches tasks over WS and expects
+    // completion over WS using the same request id.
+    await __webuiSendObjectWithBackoff(responsePayload, __webuiSocketConnectTimeoutMs, `script response ${task.id}`);
   } catch (_) {}
 }
 

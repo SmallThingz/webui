@@ -182,7 +182,7 @@ Use these to avoid warning-string parsing:
 - `Service.listRuntimeRequirements(allocator)`
 - `App.onDiagnostic(...)` / `Service.onDiagnostic(...)`
 
-## Async RPC Jobs (Push-First + Poll Fallback)
+## Async RPC Jobs (WebSocket-Only)
 
 Enable async jobs:
 
@@ -199,9 +199,9 @@ try window.bindRpc(rpc_methods, .{
 Runtime behavior:
 - `POST <rpc_route>` returns `job_id` immediately.
 - Completion updates are pushed over `/webui/ws` as `rpc_job_update`.
-- If push is unavailable (or delayed), bridge falls back to bounded polling:
-  - `GET /rpc/job?id=<job_id>`
-  - `POST /rpc/job/cancel`
+- Bridge uses reconnecting WebSocket control messages for wait/cancel:
+  - `rpc_job_wait`
+  - `rpc_job_cancel`
 
 Typed control APIs:
 - `Window.rpcPollJob(allocator, job_id) !RpcJobStatus`
