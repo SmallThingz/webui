@@ -22,7 +22,7 @@ For each OS, validate at least:
 - Additional installed third-party browsers where available (Arc, Sidekick, Shift, DuckDuckGo, SigmaOS, Lightpanda)
 
 For each browser:
-- Launch example app and confirm browser opens automatically when `auto_open_browser=true`.
+- Launch example app and confirm browser opens when `launch_policy.browser_open_mode` allows browser transport.
 - Confirm app opens with explicit env override:
   - `WEBUI_BROWSER_PATH`
   - `WEBUI_BROWSER`

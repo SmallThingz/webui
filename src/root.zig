@@ -12,6 +12,7 @@ const websocket = @import("websocket");
 pub const process_signals = @import("process_signals.zig");
 const window_style_types = @import("window_style.zig");
 const webview_backend = @import("ported/webview/backend.zig");
+const runtime_requirements = @import("runtime_requirements.zig");
 
 pub const runtime = core_runtime;
 pub const http = civetweb;
@@ -47,6 +48,64 @@ pub const DispatcherMode = enum {
 pub const TransportMode = enum {
     browser_fallback,
     native_webview,
+};
+
+pub const LaunchPolicy = struct {
+    pub const PreferredTransport = enum { native_webview, browser };
+    pub const FallbackTransport = enum { none, browser };
+    pub const BrowserOpenMode = enum { never, on_browser_transport, always };
+
+    preferred_transport: PreferredTransport = .native_webview,
+    fallback_transport: FallbackTransport = .browser,
+    browser_open_mode: BrowserOpenMode = .on_browser_transport,
+    app_mode_required: bool = true,
+    allow_dual_surface: bool = false,
+};
+
+pub const FallbackReason = enum {
+    native_backend_unavailable,
+    unsupported_style,
+    launch_failed,
+    dependency_missing,
+};
+
+pub const RuntimeRenderState = struct {
+    active_transport: TransportMode = .browser_fallback,
+    fallback_applied: bool = false,
+    fallback_reason: ?FallbackReason = null,
+    launch_policy: LaunchPolicy = .{},
+    using_system_fallback_launcher: bool = false,
+    browser_process: ?struct {
+        pid: i64,
+        kind: ?browser_discovery.BrowserKind,
+        lifecycle_linked: bool,
+    } = null,
+};
+
+pub const DiagnosticCategory = enum {
+    transport,
+    browser_launch,
+    rpc,
+    websocket,
+    tls,
+    lifecycle,
+    runtime_requirements,
+};
+
+pub const DiagnosticSeverity = enum {
+    debug,
+    info,
+    warn,
+    err,
+};
+
+pub const Diagnostic = struct {
+    code: []const u8,
+    category: DiagnosticCategory,
+    severity: DiagnosticSeverity,
+    message: []const u8,
+    window_id: usize,
+    timestamp_ms: i64,
 };
 
 pub const EventKind = enum {
@@ -87,25 +146,32 @@ pub const CustomDispatcher = *const fn (
     args: []const std.json.Value,
 ) anyerror![]u8;
 
+pub const RpcJobNotifyFn = *const fn (context: ?*anyopaque, job_id: RpcJobId, state: RpcJobState) void;
+
 pub const RpcOptions = struct {
     dispatcher_mode: DispatcherMode = .sync,
     custom_dispatcher: ?CustomDispatcher = null,
     custom_context: ?*anyopaque = null,
     bridge_options: BridgeOptions = .{},
     threaded_poll_interval_ns: u64 = 2 * std.time.ns_per_ms,
+    execution_mode: RpcExecutionMode = .inline_sync,
+    job_queue_capacity: usize = 1024,
+    job_default_timeout_ms: ?u32 = null,
+    job_result_ttl_ms: u32 = 60_000,
+    job_poll_min_ms: u32 = 200,
+    job_poll_max_ms: u32 = 1_000,
+    push_job_updates: bool = true,
 };
 
 pub const AppOptions = struct {
-    transport_mode: TransportMode = .browser_fallback,
+    launch_policy: LaunchPolicy = .{},
     enable_tls: bool = build_options.enable_tls,
     tls: TlsOptions = .{
         .enabled = build_options.enable_tls,
     },
     enable_webui_log: bool = build_options.enable_webui_log,
     public_network: bool = false,
-    auto_open_browser: bool = false,
     browser_launch: BrowserLaunchOptions = .{},
-    browser_fallback_on_native_failure: bool = true,
     window_fallback_emulation: bool = true,
 };
 
@@ -146,6 +212,41 @@ pub const ScriptEvalResult = struct {
     error_message: ?[]u8,
 };
 
+pub const RpcExecutionMode = enum {
+    inline_sync,
+    queued_async,
+};
+
+pub const RpcJobId = u64;
+
+pub const RpcJobState = enum {
+    queued,
+    running,
+    completed,
+    failed,
+    canceled,
+    timed_out,
+};
+
+pub const RpcJobStatus = struct {
+    id: RpcJobId,
+    state: RpcJobState,
+    value_json: ?[]u8 = null,
+    error_message: ?[]u8 = null,
+    created_ms: i64,
+    updated_ms: i64,
+};
+
+pub const RuntimeRequirement = runtime_requirements.RuntimeRequirement;
+
+pub const EffectiveCapabilities = struct {
+    transport_if_shown: TransportMode,
+    supports_native_window_controls: bool,
+    supports_transparency: bool,
+    supports_frameless: bool,
+    fallback_expected: bool,
+};
+
 pub const ServiceOptions = struct {
     app: AppOptions = .{},
     window: WindowOptions = .{},
@@ -154,6 +255,13 @@ pub const ServiceOptions = struct {
 
 const EventCallbackState = struct {
     handler: ?EventHandler = null,
+    context: ?*anyopaque = null,
+};
+
+pub const DiagnosticHandler = *const fn (context: ?*anyopaque, diagnostic: *const Diagnostic) void;
+
+const DiagnosticCallbackState = struct {
+    handler: ?DiagnosticHandler = null,
     context: ?*anyopaque = null,
 };
 
@@ -229,6 +337,38 @@ const ClientSession = struct {
     last_seen_ms: i64,
 };
 
+const RpcJob = struct {
+    allocator: std.mem.Allocator,
+    id: RpcJobId,
+    payload_json: []u8,
+    state: RpcJobState = .queued,
+    value_json: ?[]u8 = null,
+    error_message: ?[]u8 = null,
+    cancel_requested: bool = false,
+    created_ms: i64,
+    updated_ms: i64,
+
+    fn init(allocator: std.mem.Allocator, id: RpcJobId, payload_json: []const u8) !*RpcJob {
+        const now_ms = std.time.milliTimestamp();
+        const job = try allocator.create(RpcJob);
+        job.* = .{
+            .allocator = allocator,
+            .id = id,
+            .payload_json = try allocator.dupe(u8, payload_json),
+            .created_ms = now_ms,
+            .updated_ms = now_ms,
+        };
+        return job;
+    }
+
+    fn deinit(self: *RpcJob) void {
+        self.allocator.free(self.payload_json);
+        if (self.value_json) |value| self.allocator.free(value);
+        if (self.error_message) |msg| self.allocator.free(msg);
+        self.allocator.destroy(self);
+    }
+};
+
 const ScriptTask = struct {
     allocator: std.mem.Allocator,
     id: u64,
@@ -285,7 +425,26 @@ const RpcRegistryState = struct {
     queue: std.array_list.Managed(*RpcTask),
     worker_thread: ?std.Thread,
     worker_stop: std.atomic.Value(bool),
+    worker_lifecycle_mutex: std.Thread.Mutex,
     log_enabled: bool,
+    execution_mode: RpcExecutionMode,
+    job_queue_capacity: usize,
+    job_default_timeout_ms: ?u32,
+    job_result_ttl_ms: u32,
+    job_poll_min_ms: u32,
+    job_poll_max_ms: u32,
+    push_job_updates: bool,
+
+    job_mutex: std.Thread.Mutex,
+    job_cond: std.Thread.Condition,
+    jobs_pending: std.array_list.Managed(*RpcJob),
+    jobs_all: std.array_list.Managed(*RpcJob),
+    next_job_id: RpcJobId,
+    job_worker_thread: ?std.Thread,
+    job_worker_stop: std.atomic.Value(bool),
+    job_worker_lifecycle_mutex: std.Thread.Mutex,
+    job_notify: ?RpcJobNotifyFn,
+    job_notify_context: ?*anyopaque,
 
     fn init(allocator: std.mem.Allocator, log_enabled: bool) RpcRegistryState {
         return .{
@@ -303,12 +462,31 @@ const RpcRegistryState = struct {
             .queue = std.array_list.Managed(*RpcTask).init(allocator),
             .worker_thread = null,
             .worker_stop = std.atomic.Value(bool).init(false),
+            .worker_lifecycle_mutex = .{},
             .log_enabled = log_enabled,
+            .execution_mode = .inline_sync,
+            .job_queue_capacity = 1024,
+            .job_default_timeout_ms = null,
+            .job_result_ttl_ms = 60_000,
+            .job_poll_min_ms = 200,
+            .job_poll_max_ms = 1_000,
+            .push_job_updates = true,
+            .job_mutex = .{},
+            .job_cond = .{},
+            .jobs_pending = std.array_list.Managed(*RpcJob).init(allocator),
+            .jobs_all = std.array_list.Managed(*RpcJob).init(allocator),
+            .next_job_id = 1,
+            .job_worker_thread = null,
+            .job_worker_stop = std.atomic.Value(bool).init(false),
+            .job_worker_lifecycle_mutex = .{},
+            .job_notify = null,
+            .job_notify_context = null,
         };
     }
 
     fn deinit(self: *RpcRegistryState, allocator: std.mem.Allocator) void {
         self.stopWorker();
+        self.stopJobWorker();
 
         self.queue_mutex.lock();
         while (self.queue.items.len > 0) {
@@ -318,6 +496,22 @@ const RpcRegistryState = struct {
         }
         self.queue_mutex.unlock();
         self.queue.deinit();
+
+        self.job_mutex.lock();
+        while (self.jobs_pending.items.len > 0) {
+            const job = self.jobs_pending.items[self.jobs_pending.items.len - 1];
+            _ = self.jobs_pending.pop();
+            _ = self.removeJobAllLocked(job.id);
+            job.deinit();
+        }
+        while (self.jobs_all.items.len > 0) {
+            const job = self.jobs_all.items[self.jobs_all.items.len - 1];
+            _ = self.jobs_all.pop();
+            job.deinit();
+        }
+        self.job_mutex.unlock();
+        self.jobs_pending.deinit();
+        self.jobs_all.deinit();
 
         for (self.handlers.items) |handler| {
             allocator.free(handler.name);
@@ -458,6 +652,9 @@ const RpcRegistryState = struct {
     }
 
     fn ensureWorkerStarted(self: *RpcRegistryState) !void {
+        self.worker_lifecycle_mutex.lock();
+        defer self.worker_lifecycle_mutex.unlock();
+
         if (self.dispatcher_mode != .threaded) return;
         if (self.worker_thread != null) return;
 
@@ -466,11 +663,154 @@ const RpcRegistryState = struct {
     }
 
     fn stopWorker(self: *RpcRegistryState) void {
+        self.worker_lifecycle_mutex.lock();
+        defer self.worker_lifecycle_mutex.unlock();
+
         self.worker_stop.store(true, .release);
         self.queue_cond.broadcast();
         if (self.worker_thread) |thread| {
             thread.join();
             self.worker_thread = null;
+        }
+    }
+
+    fn ensureJobWorkerStarted(self: *RpcRegistryState) !void {
+        self.job_worker_lifecycle_mutex.lock();
+        defer self.job_worker_lifecycle_mutex.unlock();
+
+        if (self.execution_mode != .queued_async) return;
+        if (self.job_worker_thread != null) return;
+
+        self.job_worker_stop.store(false, .release);
+        self.job_worker_thread = try std.Thread.spawn(.{}, rpcJobWorkerMain, .{self});
+    }
+
+    fn stopJobWorker(self: *RpcRegistryState) void {
+        self.job_worker_lifecycle_mutex.lock();
+        defer self.job_worker_lifecycle_mutex.unlock();
+
+        self.job_worker_stop.store(true, .release);
+        self.job_cond.broadcast();
+        if (self.job_worker_thread) |thread| {
+            thread.join();
+            self.job_worker_thread = null;
+        }
+    }
+
+    fn findJobLocked(self: *RpcRegistryState, id: RpcJobId) ?*RpcJob {
+        for (self.jobs_all.items) |job| {
+            if (job.id == id) return job;
+        }
+        return null;
+    }
+
+    fn removeJobAllLocked(self: *RpcRegistryState, id: RpcJobId) bool {
+        for (self.jobs_all.items, 0..) |job, idx| {
+            if (job.id != id) continue;
+            _ = self.jobs_all.orderedRemove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    fn removeJobPendingLocked(self: *RpcRegistryState, id: RpcJobId) bool {
+        for (self.jobs_pending.items, 0..) |job, idx| {
+            if (job.id != id) continue;
+            _ = self.jobs_pending.orderedRemove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    fn cleanupExpiredJobsLocked(self: *RpcRegistryState) void {
+        if (self.job_result_ttl_ms == 0) return;
+        const now_ms = std.time.milliTimestamp();
+        var idx: usize = 0;
+        while (idx < self.jobs_all.items.len) {
+            const job = self.jobs_all.items[idx];
+            switch (job.state) {
+                .completed, .failed, .canceled, .timed_out => {},
+                else => {
+                    idx += 1;
+                    continue;
+                },
+            }
+            if (now_ms - job.updated_ms < @as(i64, @intCast(self.job_result_ttl_ms))) {
+                idx += 1;
+                continue;
+            }
+            _ = self.jobs_all.orderedRemove(idx);
+            job.deinit();
+        }
+    }
+
+    fn enqueueJob(self: *RpcRegistryState, allocator: std.mem.Allocator, payload_json: []const u8) !RpcJobStatus {
+        try self.ensureJobWorkerStarted();
+
+        self.job_mutex.lock();
+        defer self.job_mutex.unlock();
+
+        self.cleanupExpiredJobsLocked();
+
+        if (self.jobs_pending.items.len >= self.job_queue_capacity) {
+            return error.RpcJobQueueFull;
+        }
+
+        const job = try RpcJob.init(allocator, self.next_job_id, payload_json);
+        self.next_job_id += 1;
+        try self.jobs_pending.append(job);
+        try self.jobs_all.append(job);
+        self.job_cond.signal();
+
+        return .{
+            .id = job.id,
+            .state = .queued,
+            .value_json = null,
+            .error_message = null,
+            .created_ms = job.created_ms,
+            .updated_ms = job.updated_ms,
+        };
+    }
+
+    fn pollJob(self: *RpcRegistryState, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
+        self.job_mutex.lock();
+        defer self.job_mutex.unlock();
+        self.cleanupExpiredJobsLocked();
+        const job = self.findJobLocked(job_id) orelse return error.UnknownRpcJob;
+        return .{
+            .id = job.id,
+            .state = job.state,
+            .value_json = if (job.value_json) |v| try allocator.dupe(u8, v) else null,
+            .error_message = if (job.error_message) |e| try allocator.dupe(u8, e) else null,
+            .created_ms = job.created_ms,
+            .updated_ms = job.updated_ms,
+        };
+    }
+
+    fn cancelJob(self: *RpcRegistryState, job_id: RpcJobId) !bool {
+        self.job_mutex.lock();
+        defer self.job_mutex.unlock();
+
+        const job = self.findJobLocked(job_id) orelse return false;
+        switch (job.state) {
+            .queued => {
+                _ = self.removeJobPendingLocked(job_id);
+                job.state = .canceled;
+                job.updated_ms = std.time.milliTimestamp();
+                return true;
+            },
+            .running => {
+                job.cancel_requested = true;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn notifyJobUpdate(self: *RpcRegistryState, job: *const RpcJob) void {
+        if (!self.push_job_updates) return;
+        if (self.job_notify) |hook| {
+            hook(self.job_notify_context, job.id, job.state);
         }
     }
 
@@ -490,19 +830,24 @@ const RpcRegistryState = struct {
         self.queue_mutex.unlock();
 
         task.mutex.lock();
-        defer task.mutex.unlock();
         const wait_ns = if (self.threaded_poll_interval_ns == 0) std.time.ns_per_ms else self.threaded_poll_interval_ns;
         while (!task.done) {
             task.cond.timedWait(&task.mutex, wait_ns) catch {};
         }
 
         if (task.err) |err| {
+            task.mutex.unlock();
             task.deinit();
             return err;
         }
 
-        const out = task.result_json orelse return error.InvalidRpcResult;
+        const out = task.result_json orelse {
+            task.mutex.unlock();
+            task.deinit();
+            return error.InvalidRpcResult;
+        };
         const result = try allocator.dupe(u8, out);
+        task.mutex.unlock();
         task.deinit();
         return result;
     }
@@ -577,6 +922,61 @@ const RpcRegistryState = struct {
             work.mutex.unlock();
         }
     }
+
+    fn rpcJobWorkerMain(self: *RpcRegistryState) void {
+        const poll_ns = if (self.threaded_poll_interval_ns == 0) std.time.ns_per_ms else self.threaded_poll_interval_ns;
+        while (!self.job_worker_stop.load(.acquire)) {
+            self.job_mutex.lock();
+            while (self.jobs_pending.items.len == 0 and !self.job_worker_stop.load(.acquire)) {
+                self.job_cond.timedWait(&self.job_mutex, poll_ns) catch {};
+            }
+            if (self.jobs_pending.items.len == 0) {
+                self.job_mutex.unlock();
+                continue;
+            }
+
+            const job = self.jobs_pending.orderedRemove(0);
+            job.state = .running;
+            job.updated_ms = std.time.milliTimestamp();
+            self.job_mutex.unlock();
+
+            const started_ms = std.time.milliTimestamp();
+            const result = self.invokeFromJsonPayloadSync(job.allocator, job.payload_json);
+
+            self.job_mutex.lock();
+            defer self.job_mutex.unlock();
+
+            if (job.cancel_requested) {
+                job.state = .canceled;
+                job.updated_ms = std.time.milliTimestamp();
+                self.notifyJobUpdate(job);
+                continue;
+            }
+
+            if (self.job_default_timeout_ms) |timeout_ms| {
+                const elapsed = std.time.milliTimestamp() - started_ms;
+                if (elapsed > @as(i64, @intCast(timeout_ms))) {
+                    job.state = .timed_out;
+                    job.updated_ms = std.time.milliTimestamp();
+                    self.notifyJobUpdate(job);
+                    continue;
+                }
+            }
+
+            if (result) |value| {
+                if (job.value_json) |prev| job.allocator.free(prev);
+                job.value_json = value;
+                job.state = .completed;
+                job.updated_ms = std.time.milliTimestamp();
+            } else |err| {
+                if (job.error_message) |prev| job.allocator.free(prev);
+                job.error_message = std.fmt.allocPrint(job.allocator, "{s}", .{@errorName(err)}) catch null;
+                job.state = .failed;
+                job.updated_ms = std.time.milliTimestamp();
+            }
+            self.notifyJobUpdate(job);
+        }
+    }
 };
 
 const default_client_token = "default-client";
@@ -590,7 +990,9 @@ const WindowState = struct {
     allocator: std.mem.Allocator,
     id: usize,
     title: []u8,
-    transport_mode: TransportMode,
+    diagnostic_callback: *DiagnosticCallbackState,
+    launch_policy: LaunchPolicy,
+    runtime_render_state: RuntimeRenderState,
     window_fallback_emulation: bool,
     server_port: u16,
     server_bind_public: bool,
@@ -645,12 +1047,27 @@ const WindowState = struct {
         .native_kiosk,
     };
 
-    fn init(allocator: std.mem.Allocator, id: usize, options: WindowOptions, app_options: AppOptions) !WindowState {
+    fn init(
+        allocator: std.mem.Allocator,
+        id: usize,
+        options: WindowOptions,
+        app_options: AppOptions,
+        diagnostic_callback: *DiagnosticCallbackState,
+    ) !WindowState {
         var state: WindowState = .{
             .allocator = allocator,
             .id = id,
             .title = try allocator.dupe(u8, options.title),
-            .transport_mode = app_options.transport_mode,
+            .diagnostic_callback = diagnostic_callback,
+            .launch_policy = app_options.launch_policy,
+            .runtime_render_state = .{
+                .active_transport = .browser_fallback,
+                .fallback_applied = false,
+                .fallback_reason = null,
+                .launch_policy = app_options.launch_policy,
+                .using_system_fallback_launcher = false,
+                .browser_process = null,
+            },
             .window_fallback_emulation = app_options.window_fallback_emulation,
             .server_port = core_runtime.nextFallbackPort(id),
             .server_bind_public = app_options.public_network,
@@ -663,7 +1080,7 @@ const WindowState = struct {
             .raw_callback = .{},
             .close_callback = .{},
             .rpc_state = RpcRegistryState.init(allocator, app_options.enable_webui_log),
-            .backend = webview_backend.NativeBackend.init(app_options.transport_mode == .native_webview),
+            .backend = webview_backend.NativeBackend.init(app_options.launch_policy.preferred_transport == .native_webview),
             .native_capabilities = &.{},
             .current_style = .{},
             .style_icon_bytes = null,
@@ -697,10 +1114,16 @@ const WindowState = struct {
             .close_requested = std.atomic.Value(bool).init(false),
         };
 
+        state.resolveActiveTransportLocked();
         state.native_capabilities = state.backend.capabilities();
         try state.setStyleOwned(allocator, options.style);
         if (state.isNativeWindowActive()) {
             state.backend.createWindow(state.id, state.title, state.current_style) catch |err| {
+                if (err == error.NativeBackendUnavailable and state.launch_policy.fallback_transport == .browser) {
+                    state.runtime_render_state.fallback_applied = true;
+                    state.runtime_render_state.fallback_reason = .native_backend_unavailable;
+                    state.runtime_render_state.active_transport = .browser_fallback;
+                }
                 if (state.rpc_state.log_enabled) {
                     if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
                         std.debug.print("[webui.warning] window={d} {s}\n", .{ state.id, warning });
@@ -716,6 +1139,34 @@ const WindowState = struct {
             };
         }
         return state;
+    }
+
+    fn resolveActiveTransportLocked(self: *WindowState) void {
+        self.runtime_render_state.launch_policy = self.launch_policy;
+        self.runtime_render_state.using_system_fallback_launcher = false;
+
+        switch (self.launch_policy.preferred_transport) {
+            .browser => {
+                self.runtime_render_state.active_transport = .browser_fallback;
+                self.runtime_render_state.fallback_applied = false;
+                self.runtime_render_state.fallback_reason = null;
+            },
+            .native_webview => {
+                if (self.backend.isNative()) {
+                    self.runtime_render_state.active_transport = .native_webview;
+                    self.runtime_render_state.fallback_applied = false;
+                    self.runtime_render_state.fallback_reason = null;
+                } else if (self.launch_policy.fallback_transport == .browser) {
+                    self.runtime_render_state.active_transport = .browser_fallback;
+                    self.runtime_render_state.fallback_applied = true;
+                    self.runtime_render_state.fallback_reason = .native_backend_unavailable;
+                } else {
+                    self.runtime_render_state.active_transport = .native_webview;
+                    self.runtime_render_state.fallback_applied = true;
+                    self.runtime_render_state.fallback_reason = .native_backend_unavailable;
+                }
+            },
+        }
     }
 
     fn setStyleOwned(self: *WindowState, allocator: std.mem.Allocator, style: WindowStyle) !void {
@@ -742,7 +1193,7 @@ const WindowState = struct {
     }
 
     fn isNativeWindowActive(self: *const WindowState) bool {
-        return self.transport_mode == .native_webview and self.backend.isNative();
+        return self.runtime_render_state.active_transport == .native_webview and self.backend.isNative();
     }
 
     fn capabilities(self: *const WindowState) []const WindowCapability {
@@ -883,11 +1334,32 @@ const WindowState = struct {
         };
     }
 
-    fn shouldServeBrowser(self: *const WindowState, app_options: AppOptions) bool {
-        if (self.transport_mode == .browser_fallback) return true;
-        if (self.transport_mode != .native_webview) return false;
-        if (app_options.auto_open_browser and app_options.browser_launch.require_app_mode_window) return true;
-        return app_options.browser_fallback_on_native_failure;
+    fn emitDiagnostic(
+        self: *WindowState,
+        code: []const u8,
+        category: DiagnosticCategory,
+        severity: DiagnosticSeverity,
+        message: []const u8,
+    ) void {
+        const callback = self.diagnostic_callback.*;
+        if (callback.handler) |handler| {
+            const diagnostic = Diagnostic{
+                .window_id = self.id,
+                .code = code,
+                .category = category,
+                .severity = severity,
+                .message = message,
+                .timestamp_ms = std.time.milliTimestamp(),
+            };
+            handler(callback.context, &diagnostic);
+        }
+    }
+
+    fn shouldServeBrowser(self: *const WindowState) bool {
+        if (self.runtime_render_state.active_transport == .browser_fallback) return true;
+        if (self.launch_policy.fallback_transport == .browser) return true;
+        if (self.launch_policy.browser_open_mode == .always and self.launch_policy.allow_dual_surface) return true;
+        return false;
     }
 
     fn setLaunchedBrowserLaunch(self: *WindowState, allocator: std.mem.Allocator, launch: core_runtime.BrowserLaunch) void {
@@ -922,6 +1394,15 @@ const WindowState = struct {
         self.launched_browser_is_child = launch.is_child_process;
         self.launched_browser_lifecycle_linked = launch.lifecycle_linked;
         self.launched_browser_profile_dir = launch.profile_dir;
+        self.runtime_render_state.using_system_fallback_launcher = launch.used_system_fallback;
+        self.runtime_render_state.browser_process = if (launch.pid) |pid|
+            .{
+                .pid = pid,
+                .kind = launch.kind,
+                .lifecycle_linked = launch.lifecycle_linked,
+            }
+        else
+            null;
 
         if (self.rpc_state.log_enabled and launch.used_system_fallback) {
             std.debug.print("[webui.browser] system fallback launcher was used (tab-style window may appear)\n", .{});
@@ -951,6 +1432,8 @@ const WindowState = struct {
         self.cleanupBrowserProfileDir(allocator);
         self.backend.attachBrowserProcess(null, null, false);
         self.native_capabilities = self.backend.capabilities();
+        self.runtime_render_state.browser_process = null;
+        self.runtime_render_state.using_system_fallback_launcher = false;
     }
 
     fn markClosedFromTrackedBrowserExit(self: *WindowState, allocator: std.mem.Allocator, event_name: []const u8) void {
@@ -1001,8 +1484,16 @@ const WindowState = struct {
         return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{self.server_port});
     }
 
+    fn shouldOpenBrowser(self: *const WindowState) bool {
+        return switch (self.launch_policy.browser_open_mode) {
+            .never => false,
+            .on_browser_transport => self.runtime_render_state.active_transport == .browser_fallback,
+            .always => self.launch_policy.allow_dual_surface or self.runtime_render_state.active_transport == .browser_fallback,
+        };
+    }
+
     fn ensureBrowserRenderState(self: *WindowState, allocator: std.mem.Allocator, app_options: AppOptions) !void {
-        if (!self.shouldServeBrowser(app_options)) return;
+        if (!self.shouldServeBrowser()) return;
         try self.ensureServerStarted();
         try self.ensureServerReachable();
 
@@ -1010,14 +1501,16 @@ const WindowState = struct {
         defer allocator.free(url);
         try replaceOwned(allocator, &self.last_url, url);
 
-        if (app_options.auto_open_browser) {
+        if (self.shouldOpenBrowser()) {
             if (core_runtime.openInBrowser(allocator, url, self.current_style, app_options.browser_launch)) |launch| {
                 self.setLaunchedBrowserLaunch(allocator, launch);
             } else |err| {
+                self.runtime_render_state.fallback_applied = true;
+                self.runtime_render_state.fallback_reason = .launch_failed;
                 if (self.rpc_state.log_enabled) {
                     std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 }
-                if (app_options.browser_launch.require_app_mode_window) return err;
+                if (self.launch_policy.app_mode_required) return err;
             }
         }
     }
@@ -1208,6 +1701,32 @@ const WindowState = struct {
                 task.mutex.unlock();
                 task.deinit();
             }
+        }
+    }
+
+    fn onRpcJobUpdated(context: ?*anyopaque, job_id: RpcJobId, state: RpcJobState) void {
+        const self = context orelse return;
+        const win_state: *WindowState = @ptrCast(@alignCast(self));
+
+        win_state.state_mutex.lock();
+        defer win_state.state_mutex.unlock();
+        if (win_state.ws_connections.items.len == 0) return;
+
+        const payload = std.json.Stringify.valueAlloc(win_state.allocator, .{
+            .type = "rpc_job_update",
+            .job_id = job_id,
+            .state = @tagName(state),
+        }, .{}) catch return;
+        defer win_state.allocator.free(payload);
+
+        var idx: usize = 0;
+        while (idx < win_state.ws_connections.items.len) {
+            const entry = win_state.ws_connections.items[idx];
+            win_state.sendWsTextLocked(entry.stream, payload) catch {
+                win_state.closeWsConnectionLocked(entry.connection_id);
+                continue;
+            };
+            idx += 1;
         }
     }
 
@@ -1595,6 +2114,7 @@ pub const App = struct {
     windows: std.array_list.Managed(WindowState),
     shutdown_requested: bool,
     next_window_id: usize,
+    diagnostic_callback: DiagnosticCallbackState,
 
     pub fn init(allocator: std.mem.Allocator, options: AppOptions) !App {
         var resolved_options = options;
@@ -1616,6 +2136,7 @@ pub const App = struct {
             .windows = std.array_list.Managed(WindowState).init(allocator),
             .shutdown_requested = false,
             .next_window_id = 1,
+            .diagnostic_callback = .{},
         };
     }
 
@@ -1641,6 +2162,34 @@ pub const App = struct {
         return self.tls_state.info();
     }
 
+    pub fn onDiagnostic(self: *App, handler: DiagnosticHandler, context: ?*anyopaque) void {
+        self.diagnostic_callback = .{
+            .handler = handler,
+            .context = context,
+        };
+    }
+
+    fn emitDiagnostic(
+        self: *App,
+        window_id: usize,
+        code: []const u8,
+        category: DiagnosticCategory,
+        severity: DiagnosticSeverity,
+        message: []const u8,
+    ) void {
+        if (self.diagnostic_callback.handler) |handler| {
+            const diag = Diagnostic{
+                .code = code,
+                .category = category,
+                .severity = severity,
+                .message = message,
+                .window_id = window_id,
+                .timestamp_ms = std.time.milliTimestamp(),
+            };
+            handler(self.diagnostic_callback.context, &diag);
+        }
+    }
+
     pub fn newWindow(self: *App, options: WindowOptions) !Window {
         const id = options.window_id orelse self.next_window_id;
         if (id == 0) return error.InvalidWindowId;
@@ -1653,11 +2202,17 @@ pub const App = struct {
             self.next_window_id += 1;
         }
 
-        try self.windows.append(try WindowState.init(self.allocator, id, options, self.options));
+        try self.windows.append(try WindowState.init(self.allocator, id, options, self.options, &self.diagnostic_callback));
+        for (self.windows.items, 0..) |*state, idx_iter| {
+            _ = idx_iter;
+            state.rpc_state.job_notify = WindowState.onRpcJobUpdated;
+            state.rpc_state.job_notify_context = state;
+        }
+        const idx = self.windows.items.len - 1;
 
         return .{
             .app = self,
-            .index = self.windows.items.len - 1,
+            .index = idx,
             .id = id,
         };
     }
@@ -1676,7 +2231,7 @@ pub const App = struct {
         for (self.windows.items) |*state| {
             if (!state.shown or state.connected_emitted) continue;
 
-            if (state.shouldServeBrowser(self.options) and (state.last_html != null or state.last_file != null)) {
+            if (state.last_html != null or state.last_file != null) {
                 try state.ensureServerStarted();
             }
 
@@ -1751,6 +2306,7 @@ pub const Window = struct {
             }
         }
 
+        self.emitRuntimeDiagnostics();
         self.emit(.navigation, "show-html", html);
     }
 
@@ -1786,6 +2342,7 @@ pub const Window = struct {
             }
         }
 
+        self.emitRuntimeDiagnostics();
         self.emit(.navigation, "show-file", path);
     }
 
@@ -1804,17 +2361,20 @@ pub const Window = struct {
             _ = win_state.backend.showContent(.{ .url = url }) catch {};
         }
 
-        if (self.app.options.auto_open_browser) {
+        if (win_state.shouldOpenBrowser()) {
             if (core_runtime.openInBrowser(self.app.allocator, url, win_state.current_style, self.app.options.browser_launch)) |launch| {
                 win_state.setLaunchedBrowserLaunch(self.app.allocator, launch);
             } else |err| {
+                win_state.runtime_render_state.fallback_applied = true;
+                win_state.runtime_render_state.fallback_reason = .launch_failed;
                 if (win_state.rpc_state.log_enabled) {
                     std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 }
-                if (self.app.options.browser_launch.require_app_mode_window) return err;
+                if (win_state.launch_policy.app_mode_required) return err;
             }
         }
 
+        self.emitRuntimeDiagnostics();
         self.emit(.navigation, "show-url", url);
     }
 
@@ -1940,7 +2500,7 @@ pub const Window = struct {
 
     pub fn browserUrl(self: *Window) ![]u8 {
         const win_state = self.state();
-        if (!win_state.shouldServeBrowser(self.app.options)) return error.TransportNotBrowserRenderable;
+        if (!win_state.shouldServeBrowser()) return error.TransportNotBrowserRenderable;
 
         win_state.state_mutex.lock();
         defer win_state.state_mutex.unlock();
@@ -1958,7 +2518,7 @@ pub const Window = struct {
         const win_state = self.state();
         win_state.state_mutex.lock();
         defer win_state.state_mutex.unlock();
-        if (!win_state.shouldServeBrowser(self.app.options)) return error.TransportNotBrowserRenderable;
+        if (!win_state.shouldServeBrowser()) return error.TransportNotBrowserRenderable;
 
         try win_state.ensureServerStarted();
         try win_state.ensureServerReachable();
@@ -1989,6 +2549,13 @@ pub const Window = struct {
         win_state.state_mutex.lock();
         defer win_state.state_mutex.unlock();
         return win_state.last_warning;
+    }
+
+    pub fn runtimeRenderState(self: *Window) RuntimeRenderState {
+        const win_state = self.state();
+        win_state.state_mutex.lock();
+        defer win_state.state_mutex.unlock();
+        return win_state.runtime_render_state;
     }
 
     pub fn clearWarning(self: *Window) void {
@@ -2026,6 +2593,38 @@ pub const Window = struct {
         return self.state().capabilities();
     }
 
+    pub fn probeCapabilities(self: *Window) EffectiveCapabilities {
+        const win_state = self.state();
+        win_state.state_mutex.lock();
+        defer win_state.state_mutex.unlock();
+
+        const predicted_transport: TransportMode = if (win_state.launch_policy.preferred_transport == .browser)
+            .browser_fallback
+        else if (win_state.backend.isNative())
+            .native_webview
+        else if (win_state.launch_policy.fallback_transport == .browser)
+            .browser_fallback
+        else
+            .native_webview;
+
+        const caps = win_state.capabilities();
+        return .{
+            .transport_if_shown = predicted_transport,
+            .supports_native_window_controls = window_style_types.hasCapability(.native_minmax, caps),
+            .supports_transparency = window_style_types.hasCapability(.native_transparency, caps),
+            .supports_frameless = window_style_types.hasCapability(.native_frameless, caps),
+            .fallback_expected = win_state.launch_policy.preferred_transport == .native_webview and predicted_transport == .browser_fallback,
+        };
+    }
+
+    pub fn rpcPollJob(self: *Window, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
+        return self.state().rpc_state.pollJob(allocator, job_id);
+    }
+
+    pub fn rpcCancelJob(self: *Window, job_id: RpcJobId) !bool {
+        return self.state().rpc_state.cancelJob(job_id);
+    }
+
     fn state(self: *Window) *WindowState {
         return &self.app.windows.items[self.index];
     }
@@ -2040,6 +2639,44 @@ pub const Window = struct {
                 .payload = payload,
             };
             handler(win_state.event_callback.context, &event);
+        }
+    }
+
+    fn emitRuntimeDiagnostics(self: *Window) void {
+        const win_state = self.state();
+        const render_state = win_state.runtime_render_state;
+
+        const transport_code, const transport_message = switch (render_state.active_transport) {
+            .native_webview => .{ "transport.active.native_webview", "Native webview transport selected" },
+            .browser_fallback => .{ "transport.active.browser_fallback", "Browser fallback transport selected" },
+        };
+        self.app.emitDiagnostic(self.id, transport_code, .transport, .info, transport_message);
+
+        if (render_state.fallback_applied) {
+            const reason = render_state.fallback_reason orelse .native_backend_unavailable;
+            const code = switch (reason) {
+                .native_backend_unavailable => "fallback.native_backend_unavailable",
+                .unsupported_style => "fallback.unsupported_style",
+                .launch_failed => "fallback.launch_failed",
+                .dependency_missing => "fallback.dependency_missing",
+            };
+            const message = switch (reason) {
+                .native_backend_unavailable => "Native backend unavailable; browser fallback applied",
+                .unsupported_style => "Requested style unsupported; browser fallback applied",
+                .launch_failed => "Browser launch failed while resolving launch policy",
+                .dependency_missing => "Runtime dependency missing; browser fallback applied",
+            };
+            self.app.emitDiagnostic(self.id, code, .transport, .warn, message);
+        }
+
+        if (render_state.using_system_fallback_launcher) {
+            self.app.emitDiagnostic(
+                self.id,
+                "browser.system_fallback_launcher",
+                .browser_launch,
+                .info,
+                "System fallback launcher was used",
+            );
         }
     }
 };
@@ -2109,6 +2746,10 @@ pub const Service = struct {
         return self.app.tlsInfo();
     }
 
+    pub fn onDiagnostic(self: *Service, handler: DiagnosticHandler, context: ?*anyopaque) void {
+        self.app.onDiagnostic(handler, context);
+    }
+
     pub fn show(self: *Service, content: WindowContent) !void {
         var win = self.window();
         try win.show(content);
@@ -2174,6 +2815,39 @@ pub const Service = struct {
         return win.capabilities();
     }
 
+    pub fn runtimeRenderState(self: *Service) RuntimeRenderState {
+        var win = self.window();
+        return win.runtimeRenderState();
+    }
+
+    pub fn probeCapabilities(self: *Service) EffectiveCapabilities {
+        var win = self.window();
+        return win.probeCapabilities();
+    }
+
+    pub fn listRuntimeRequirements(self: *Service, allocator: std.mem.Allocator) ![]RuntimeRequirement {
+        var win = self.window();
+        const win_state = win.state();
+        win_state.state_mutex.lock();
+        const native_available = win_state.backend.isNative();
+        const policy = self.app.options.launch_policy;
+        win_state.state_mutex.unlock();
+
+        const reqs = try runtime_requirements.list(allocator, .{
+            .preferred_transport_native = policy.preferred_transport == .native_webview,
+            .fallback_transport_browser = policy.fallback_transport == .browser,
+            .app_mode_required = policy.app_mode_required,
+            .native_backend_available = native_available,
+        });
+        for (reqs) |req| {
+            if (req.required and !req.available) {
+                const message = req.details orelse "required runtime dependency unavailable";
+                self.app.emitDiagnostic(self.window_id, req.name, .lifecycle, .warn, message);
+            }
+        }
+        return reqs;
+    }
+
     pub fn onEvent(self: *Service, handler: EventHandler, context: ?*anyopaque) void {
         var win = self.window();
         win.onEvent(handler, context);
@@ -2202,6 +2876,16 @@ pub const Service = struct {
     ) !ScriptEvalResult {
         var win = self.window();
         return win.evalScript(allocator, script, options);
+    }
+
+    pub fn rpcPollJob(self: *Service, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
+        var win = self.window();
+        return win.rpcPollJob(allocator, job_id);
+    }
+
+    pub fn rpcCancelJob(self: *Service, job_id: RpcJobId) !bool {
+        var win = self.window();
+        return win.rpcCancelJob(job_id);
     }
 
     pub fn browserUrl(self: *Service) ![]u8 {
@@ -2247,9 +2931,19 @@ pub const RpcRegistry = struct {
         self.state.custom_dispatcher = options.custom_dispatcher;
         self.state.custom_context = options.custom_context;
         self.state.threaded_poll_interval_ns = options.threaded_poll_interval_ns;
+        self.state.execution_mode = options.execution_mode;
+        self.state.job_queue_capacity = options.job_queue_capacity;
+        self.state.job_default_timeout_ms = options.job_default_timeout_ms;
+        self.state.job_result_ttl_ms = options.job_result_ttl_ms;
+        self.state.job_poll_min_ms = options.job_poll_min_ms;
+        self.state.job_poll_max_ms = options.job_poll_max_ms;
+        self.state.push_job_updates = options.push_job_updates;
 
         if (self.state.dispatcher_mode == .threaded) {
             try self.state.ensureWorkerStarted();
+        }
+        if (self.state.execution_mode == .queued_async) {
+            try self.state.ensureJobWorkerStarted();
         }
 
         var registered_count: usize = 0;
@@ -2626,6 +3320,7 @@ fn wsConnectionThreadMain(state: *WindowState, stream: std.net.Stream, connectio
         state.unregisterWsConnectionLocked(connection_id);
         state.state_mutex.unlock();
         stream.close();
+        state.emitDiagnostic("websocket.disconnected", .websocket, .info, "WebSocket client disconnected");
 
         if (state.rpc_state.log_enabled) {
             std.debug.print("[webui.ws] disconnected connection_id={d}\n", .{connection_id});
@@ -2636,6 +3331,9 @@ fn wsConnectionThreadMain(state: *WindowState, stream: std.net.Stream, connectio
         const frame = readWsInboundFrameAlloc(state.allocator, stream, 8 * 1024 * 1024) catch |err| {
             if (state.rpc_state.log_enabled and err != error.Closed) {
                 std.debug.print("[webui.ws] read failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
+            }
+            if (err != error.Closed) {
+                state.emitDiagnostic("websocket.read_error", .websocket, .warn, @errorName(err));
             }
             return;
         };
@@ -2713,6 +3411,7 @@ fn handleWebSocketUpgradeRoute(state: *WindowState, stream: std.net.Stream, requ
     if (state.rpc_state.log_enabled) {
         std.debug.print("[webui.ws] connected connection_id={d}\n", .{connection_id});
     }
+    state.emitDiagnostic("websocket.connected", .websocket, .info, "WebSocket client connected");
 
     const thread = try std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, stream, connection_id });
     thread.detach();
@@ -2728,6 +3427,8 @@ fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: s
 
     if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return false;
     if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
+    if (try handleRpcJobRoute(state, allocator, stream, request.method, request.path, path_only)) return false;
+    if (try handleRpcJobCancelRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
     if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
     if (try handleScriptPullRoute(state, allocator, stream, request.method, path_only, request.headers)) return false;
     if (try handleScriptResponseRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
@@ -2996,9 +3697,31 @@ fn handleRpcRoute(
     const client_ref = state.findOrCreateClientSessionLocked(client_token) catch null;
     state.state_mutex.unlock();
 
+    if (state.rpc_state.execution_mode == .queued_async) {
+        const job = state.rpc_state.enqueueJob(allocator, body) catch |err| {
+            state.emitDiagnostic("rpc.enqueue.error", .rpc, .warn, @errorName(err));
+            const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
+            defer allocator.free(err_body);
+            try writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_body);
+            return true;
+        };
+
+        const payload = try std.json.Stringify.valueAlloc(allocator, .{
+            .job_id = job.id,
+            .state = @tagName(job.state),
+            .poll_min_ms = state.rpc_state.job_poll_min_ms,
+            .poll_max_ms = state.rpc_state.job_poll_max_ms,
+        }, .{});
+        defer allocator.free(payload);
+
+        try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+        return true;
+    }
+
     state.rpc_state.invoke_mutex.lock();
     const payload = state.rpc_state.invokeFromJsonPayload(allocator, body) catch |err| {
         state.rpc_state.invoke_mutex.unlock();
+        state.emitDiagnostic("rpc.dispatch.error", .rpc, .warn, @errorName(err));
         const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
         defer allocator.free(err_body);
         if (state.rpc_state.log_enabled) {
@@ -3026,6 +3749,86 @@ fn handleRpcRoute(
         handler(state.event_callback.context, &event);
     }
 
+    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+    return true;
+}
+
+fn rpcJobIdFromPath(path: []const u8) ?RpcJobId {
+    const q = std.mem.indexOfScalar(u8, path, '?') orelse return null;
+    var pair_it = std.mem.splitScalar(u8, path[q + 1 ..], '&');
+    while (pair_it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], "id")) continue;
+        return std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch null;
+    }
+    return null;
+}
+
+fn handleRpcJobRoute(
+    state: *WindowState,
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    method: []const u8,
+    path: []const u8,
+    path_only: []const u8,
+) !bool {
+    if (!std.mem.eql(u8, method, "GET")) return false;
+    if (!std.mem.eql(u8, path_only, "/rpc/job")) return false;
+
+    const job_id = rpcJobIdFromPath(path) orelse {
+        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"missing_job_id\"}");
+        return true;
+    };
+
+    const status = state.rpc_state.pollJob(allocator, job_id) catch |err| {
+        const payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
+        defer allocator.free(payload);
+        try writeHttpResponse(stream, 404, "application/json; charset=utf-8", payload);
+        return true;
+    };
+    defer {
+        if (status.value_json) |v| allocator.free(v);
+        if (status.error_message) |e| allocator.free(e);
+    }
+
+    const payload = try std.json.Stringify.valueAlloc(allocator, .{
+        .job_id = status.id,
+        .state = @tagName(status.state),
+        .value = status.value_json,
+        .error_message = status.error_message,
+        .created_ms = status.created_ms,
+        .updated_ms = status.updated_ms,
+    }, .{});
+    defer allocator.free(payload);
+    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+    return true;
+}
+
+fn handleRpcJobCancelRoute(
+    state: *WindowState,
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    method: []const u8,
+    path_only: []const u8,
+    body: []const u8,
+) !bool {
+    if (!std.mem.eql(u8, method, "POST")) return false;
+    if (!std.mem.eql(u8, path_only, "/rpc/job/cancel")) return false;
+
+    const Req = struct { job_id: RpcJobId };
+    var parsed = std.json.parseFromSlice(Req, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_cancel_request\"}");
+        return true;
+    };
+    defer parsed.deinit();
+
+    const canceled = state.rpc_state.cancelJob(parsed.value.job_id) catch false;
+    const payload = try std.json.Stringify.valueAlloc(allocator, .{
+        .job_id = parsed.value.job_id,
+        .canceled = canceled,
+    }, .{});
+    defer allocator.free(payload);
     try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
     return true;
 }
@@ -3438,8 +4241,7 @@ test "browser fallback serves window html over local http" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3476,8 +4278,7 @@ test "browser fallback server is reachable across repeated connects" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3503,8 +4304,7 @@ test "public network mode binds server with public listen policy" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
         .public_network = true,
     });
     defer app.deinit();
@@ -3524,8 +4324,7 @@ test "websocket upgrade uses same http server port" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3583,8 +4382,7 @@ test "lifecycle route stays responsive during long running rpc" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3631,8 +4429,7 @@ test "native_webview transport falls back to browser rendering by default" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .native_webview,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3669,9 +4466,7 @@ test "native_webview browser fallback can be disabled" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .native_webview,
-        .browser_fallback_on_native_failure = false,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .none, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3686,8 +4481,7 @@ test "linked child exit requests close immediately" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .native_webview,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3731,8 +4525,7 @@ test "window_closing lifecycle event is ignored while tracked browser pid is ali
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3780,8 +4573,7 @@ test "non-linked tracked browser pid death requests close" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -3889,9 +4681,8 @@ test "close control remains backend-driven when emulation is disabled" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
         .window_fallback_emulation = false,
-        .auto_open_browser = false,
     });
     defer app.deinit();
 
@@ -3907,9 +4698,8 @@ test "native backend unavailability returns warnings and falls back to emulation
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .native_webview,
+        .launch_policy = .{ .preferred_transport = .native_webview, .fallback_transport = .browser, .browser_open_mode = .never },
         .window_fallback_emulation = true,
-        .auto_open_browser = false,
     });
     defer app.deinit();
 
@@ -3933,7 +4723,7 @@ test "window capability reporting follows fallback policy" {
     defer _ = gpa.deinit();
 
     var app_default = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
         .window_fallback_emulation = true,
     });
     defer app_default.deinit();
@@ -3943,7 +4733,7 @@ test "window capability reporting follows fallback policy" {
     try std.testing.expect(window_style_types.hasCapability(.native_frameless, caps_default));
 
     var app_disabled = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
         .window_fallback_emulation = false,
     });
     defer app_disabled.deinit();
@@ -3957,8 +4747,7 @@ test "window control and style routes roundtrip" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -4065,8 +4854,7 @@ test "rpc event carries client and connection identifiers" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -4248,8 +5036,7 @@ test "evalScript times out when no client is polling" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -4273,8 +5060,7 @@ test "script pull and response routes complete queued eval task" {
     defer _ = gpa.deinit();
 
     var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
+        .launch_policy = .{ .preferred_transport = .browser, .fallback_transport = .browser, .browser_open_mode = .never },
     });
     defer app.deinit();
 
@@ -4340,4 +5126,336 @@ test "script pull and response routes complete queued eval task" {
     try std.testing.expect(std.mem.eql(u8, value.?, "42"));
 
     task.deinit();
+}
+
+test "runtime render state and capability probe expose launch policy selection" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .preferred_transport = .browser,
+            .fallback_transport = .browser,
+            .browser_open_mode = .never,
+        },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "RenderStateProbe" });
+    const probe = win.probeCapabilities();
+    try std.testing.expectEqual(@as(TransportMode, .browser_fallback), probe.transport_if_shown);
+    try std.testing.expect(!probe.fallback_expected);
+
+    try win.showHtml("<html><body>render-state</body></html>");
+    try app.run();
+
+    const state = win.runtimeRenderState();
+    try std.testing.expectEqual(@as(TransportMode, .browser_fallback), state.active_transport);
+    try std.testing.expect(!state.fallback_applied);
+    try std.testing.expect(state.fallback_reason == null);
+    try std.testing.expectEqual(@as(LaunchPolicy.PreferredTransport, .browser), state.launch_policy.preferred_transport);
+}
+
+test "diagnostic callback emits typed transport diagnostics" {
+    const Capture = struct {
+        var count: usize = 0;
+        var saw_transport: bool = false;
+        var saw_fallback: bool = false;
+
+        fn onDiagnostic(_: ?*anyopaque, diagnostic: *const Diagnostic) void {
+            count += 1;
+            if (std.mem.startsWith(u8, diagnostic.code, "transport.active.")) saw_transport = true;
+            if (std.mem.startsWith(u8, diagnostic.code, "fallback.")) saw_fallback = true;
+        }
+    };
+
+    Capture.count = 0;
+    Capture.saw_transport = false;
+    Capture.saw_fallback = false;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .preferred_transport = .browser,
+            .fallback_transport = .browser,
+            .browser_open_mode = .never,
+        },
+    });
+    defer app.deinit();
+    app.onDiagnostic(Capture.onDiagnostic, null);
+
+    var win = try app.newWindow(.{ .title = "DiagnosticCapture" });
+    try win.showHtml("<html><body>diagnostic-capture</body></html>");
+    try app.run();
+
+    try std.testing.expect(Capture.count > 0);
+    try std.testing.expect(Capture.saw_transport);
+    try std.testing.expect(!Capture.saw_fallback);
+}
+
+test "service requirement listing and probe are available before show" {
+    const rpc_methods = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var service = try Service.init(gpa.allocator(), rpc_methods, .{
+        .app = .{
+            .launch_policy = .{
+                .preferred_transport = .browser,
+                .fallback_transport = .browser,
+                .browser_open_mode = .never,
+            },
+        },
+    });
+    defer service.deinit();
+
+    const probe = service.probeCapabilities();
+    try std.testing.expectEqual(@as(TransportMode, .browser_fallback), probe.transport_if_shown);
+
+    const reqs = try service.listRuntimeRequirements(gpa.allocator());
+    defer gpa.allocator().free(reqs);
+    try std.testing.expect(reqs.len > 0);
+
+    var found_native = false;
+    for (reqs) |req| {
+        if (std.mem.eql(u8, req.name, "native_webview_backend")) {
+            found_native = true;
+            try std.testing.expect(!req.required);
+            break;
+        }
+    }
+    try std.testing.expect(found_native);
+}
+
+test "async rpc jobs support poll and cancel" {
+    const DemoRpc = struct {
+        pub fn delayedAdd(a: i64, b: i64, delay_ms: i64) i64 {
+            const delay = if (delay_ms < 0) @as(u64, 0) else @as(u64, @intCast(delay_ms));
+            std.Thread.sleep(delay * std.time.ns_per_ms);
+            return a + b;
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .preferred_transport = .browser,
+            .fallback_transport = .browser,
+            .browser_open_mode = .never,
+        },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "AsyncJobs" });
+    try win.bindRpc(DemoRpc, .{
+        .bridge_options = .{ .rpc_route = "/rpc" },
+        .execution_mode = .queued_async,
+        .job_poll_min_ms = 10,
+        .job_poll_max_ms = 40,
+    });
+    try win.showHtml("<html><body>async-jobs</body></html>");
+    try app.run();
+
+    const first = try win.state().rpc_state.enqueueJob(gpa.allocator(), "{\"name\":\"delayedAdd\",\"args\":[20,22,40]}");
+    try std.testing.expectEqual(@as(RpcJobState, .queued), first.state);
+
+    var completed = false;
+    var attempts: usize = 0;
+    while (attempts < 120) : (attempts += 1) {
+        const status = try win.rpcPollJob(gpa.allocator(), first.id);
+        defer {
+            if (status.value_json) |value| gpa.allocator().free(value);
+            if (status.error_message) |msg| gpa.allocator().free(msg);
+        }
+
+        switch (status.state) {
+            .completed => {
+                completed = true;
+                try std.testing.expect(status.value_json != null);
+                try std.testing.expect(std.mem.indexOf(u8, status.value_json.?, "\"value\":42") != null);
+                break;
+            },
+            .failed, .timed_out, .canceled => return error.InvalidRpcResult,
+            else => std.Thread.sleep(5 * std.time.ns_per_ms),
+        }
+    }
+    try std.testing.expect(completed);
+
+    const blocker = try win.state().rpc_state.enqueueJob(gpa.allocator(), "{\"name\":\"delayedAdd\",\"args\":[1,1,220]}");
+    const queued = try win.state().rpc_state.enqueueJob(gpa.allocator(), "{\"name\":\"delayedAdd\",\"args\":[2,2,5]}");
+    _ = blocker;
+
+    try std.testing.expect(try win.rpcCancelJob(queued.id));
+    const canceled_status = try win.rpcPollJob(gpa.allocator(), queued.id);
+    defer {
+        if (canceled_status.value_json) |value| gpa.allocator().free(value);
+        if (canceled_status.error_message) |msg| gpa.allocator().free(msg);
+    }
+    try std.testing.expectEqual(@as(RpcJobState, .canceled), canceled_status.state);
+}
+
+test "async rpc job routes roundtrip via http endpoints" {
+    const DemoRpc = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .preferred_transport = .browser,
+            .fallback_transport = .browser,
+            .browser_open_mode = .never,
+        },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "AsyncRouteRoundtrip" });
+    try win.bindRpc(DemoRpc, .{
+        .bridge_options = .{ .rpc_route = "/rpc" },
+        .execution_mode = .queued_async,
+    });
+    try win.showHtml("<html><body>async-route-roundtrip</body></html>");
+    try app.run();
+
+    const enqueue_response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/rpc", "{\"name\":\"ping\",\"args\":[]}");
+    defer gpa.allocator().free(enqueue_response);
+    try std.testing.expect(std.mem.indexOf(u8, enqueue_response, "\"job_id\":") != null);
+
+    const body = httpResponseBody(enqueue_response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa.allocator(), body, .{});
+    defer parsed.deinit();
+    const job_id_value = parsed.value.object.get("job_id") orelse return error.InvalidHttpRequest;
+    const job_id: u64 = switch (job_id_value) {
+        .integer => |v| @as(u64, @intCast(v)),
+        .float => |v| @as(u64, @intFromFloat(v)),
+        else => return error.InvalidHttpRequest,
+    };
+
+    var done = false;
+    var attempts: usize = 0;
+    while (attempts < 80) : (attempts += 1) {
+        const status_path = try std.fmt.allocPrint(gpa.allocator(), "/rpc/job?id={d}", .{job_id});
+        defer gpa.allocator().free(status_path);
+        const status_response = try httpRoundTrip(
+            gpa.allocator(),
+            win.state().server_port,
+            "GET",
+            status_path,
+            null,
+        );
+        defer gpa.allocator().free(status_response);
+        if (std.mem.indexOf(u8, status_response, "\"state\":\"completed\"") != null) {
+            done = true;
+            break;
+        }
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(done);
+
+    const cancel_body = try std.fmt.allocPrint(gpa.allocator(), "{{\"job_id\":{d}}}", .{job_id});
+    defer gpa.allocator().free(cancel_body);
+    const cancel_response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/rpc/job/cancel", cancel_body);
+    defer gpa.allocator().free(cancel_response);
+    try std.testing.expect(std.mem.indexOf(u8, cancel_response, "\"canceled\":false") != null);
+}
+
+test "threaded dispatcher stress handles concurrent http rpc requests" {
+    const DemoRpc = struct {
+        pub fn mul(a: i64, b: i64) i64 {
+            std.Thread.sleep(std.time.ns_per_ms);
+            return a * b;
+        }
+    };
+
+    const Shared = struct { failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false) };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .preferred_transport = .browser,
+            .fallback_transport = .browser,
+            .browser_open_mode = .never,
+        },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "ThreadedStressHttp" });
+    var registry = win.rpc();
+    try registry.register(DemoRpc, .{
+        .bridge_options = .{ .rpc_route = "/rpc" },
+        .dispatcher_mode = .threaded,
+        .threaded_poll_interval_ns = std.time.ns_per_ms,
+    });
+    try win.showHtml("<html><body>threaded-stress-http</body></html>");
+    try app.run();
+
+    const Ctx = struct {
+        port: u16,
+        start: i64,
+        shared: *Shared,
+    };
+    const Worker = struct {
+        fn run(ctx: *Ctx) void {
+            var gpa_thread = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa_thread.deinit();
+            const allocator = gpa_thread.allocator();
+
+            var i: usize = 0;
+            while (i < 24) : (i += 1) {
+                const lhs: i64 = ctx.start + @as(i64, @intCast(i));
+                const payload = std.fmt.allocPrint(allocator, "{{\"name\":\"mul\",\"args\":[{d},3]}}", .{lhs}) catch {
+                    ctx.shared.failed.store(true, .release);
+                    return;
+                };
+                defer allocator.free(payload);
+
+                const response = httpRoundTrip(allocator, ctx.port, "POST", "/rpc", payload) catch {
+                    ctx.shared.failed.store(true, .release);
+                    return;
+                };
+                defer allocator.free(response);
+
+                const needle = std.fmt.allocPrint(allocator, "\"value\":{d}", .{lhs * 3}) catch {
+                    ctx.shared.failed.store(true, .release);
+                    return;
+                };
+                defer allocator.free(needle);
+
+                if (std.mem.indexOf(u8, response, needle) == null) {
+                    ctx.shared.failed.store(true, .release);
+                    return;
+                }
+            }
+        }
+    };
+
+    var shared = Shared{};
+    var contexts: [6]Ctx = undefined;
+    var threads: [6]std.Thread = undefined;
+    for (&contexts, 0..) |*ctx, idx| {
+        ctx.* = .{
+            .port = win.state().server_port,
+            .start = 100 + @as(i64, @intCast(idx * 32)),
+            .shared = &shared,
+        };
+        threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ctx});
+    }
+
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!shared.failed.load(.acquire));
 }

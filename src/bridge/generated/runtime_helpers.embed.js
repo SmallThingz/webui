@@ -24,7 +24,14 @@ async function __webuiInvoke(endpoint, name, args) {
     const text = await res.text();
     throw new Error(`RPC ${name} failed: ${res.status} ${text}`);
   }
-  return await res.json();
+  const body = await res.json();
+  if (body && typeof body === "object" && Number.isFinite(Number(body.job_id))) {
+    const jobId = Math.trunc(Number(body.job_id));
+    const pollMin = Number.isFinite(Number(body.poll_min_ms)) ? Math.max(50, Math.trunc(Number(body.poll_min_ms))) : 200;
+    const pollMax = Number.isFinite(Number(body.poll_max_ms)) ? Math.max(pollMin, Math.trunc(Number(body.poll_max_ms))) : 1000;
+    return await __webuiAwaitRpcJob(endpoint, jobId, pollMin, pollMax);
+  }
+  return body;
 }
 
 async function __webuiJson(endpoint, options) {
@@ -55,6 +62,88 @@ function __webuiNormalizeResult(result) {
     return result.value;
   }
   return result;
+}
+
+const __webuiRpcJobWaiters = new Map();
+
+async function __webuiFetchRpcJobStatus(endpoint, jobId) {
+  const url = new URL("/rpc/job", globalThis.location ? globalThis.location.href : endpoint);
+  url.searchParams.set("id", String(jobId));
+  return await __webuiJson(url.toString(), { method: "GET" });
+}
+
+async function __webuiAwaitRpcJob(endpoint, jobId, pollMinMs, pollMaxMs) {
+  let stopped = false;
+  let timer = null;
+  let currentDelay = pollMinMs;
+
+  return await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      __webuiRpcJobWaiters.delete(jobId);
+    };
+
+    const failWithState = (status, fallbackMessage) => {
+      const message = status && typeof status.error_message === "string" && status.error_message.length > 0
+        ? status.error_message
+        : fallbackMessage;
+      reject(new Error(message));
+    };
+
+    const schedulePoll = () => {
+      if (stopped) return;
+      timer = setTimeout(() => {
+        void poll();
+      }, currentDelay);
+      currentDelay = Math.min(pollMaxMs, Math.max(pollMinMs, Math.floor(currentDelay * 1.6)));
+    };
+
+    const poll = async () => {
+      if (stopped) return;
+      try {
+        const status = await __webuiFetchRpcJobStatus(endpoint, jobId);
+        const state = status && typeof status.state === "string" ? status.state : "queued";
+        if (state === "completed") {
+          cleanup();
+          resolve({ value: "value" in status ? status.value : null });
+          return;
+        }
+        if (state === "failed") {
+          cleanup();
+          failWithState(status, `RPC job ${jobId} failed`);
+          return;
+        }
+        if (state === "canceled") {
+          cleanup();
+          failWithState(status, `RPC job ${jobId} canceled`);
+          return;
+        }
+        if (state === "timed_out") {
+          cleanup();
+          failWithState(status, `RPC job ${jobId} timed out`);
+          return;
+        }
+      } catch (_) {
+        // Keep bounded fallback polling on transient transport errors.
+      }
+      schedulePoll();
+    };
+
+    __webuiRpcJobWaiters.set(jobId, {
+      trigger() {
+        if (stopped) return;
+        currentDelay = pollMinMs;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        void poll();
+      },
+    });
+
+    // Push-first: await server push, but always keep a bounded polling fallback.
+    schedulePoll();
+  });
 }
 
 let __webuiWindowRuntimeEmulationEnabled = true;
@@ -308,6 +397,14 @@ function __webuiHandleSocketMessage(raw) {
   if (!message || typeof message !== "object") return;
   if (message.type === "backend_close") {
     __webuiHandleBackendClose(message);
+    return;
+  }
+  if (message.type === "rpc_job_update") {
+    const id = Number(message.job_id);
+    if (Number.isFinite(id)) {
+      const waiter = __webuiRpcJobWaiters.get(Math.trunc(id));
+      if (waiter && typeof waiter.trigger === "function") waiter.trigger();
+    }
     return;
   }
   if (message.type !== "script_task") return;

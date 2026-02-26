@@ -360,6 +360,20 @@ pub fn build(b: *Build) void {
         test_step.dependOn(step);
     }
 
+    const dispatcher_stress_tests = b.addTest(.{
+        .root_module = webui_mod,
+        .filters = &.{"threaded dispatcher stress"},
+    });
+    dispatcher_stress_tests.step.dependOn(runtime_helpers_assets.prepare_step);
+    dispatcher_stress_tests.linkLibrary(webui_lib);
+
+    const dispatcher_stress_step = b.step("dispatcher-stress", "Stress threaded dispatcher concurrency/lifetime paths");
+    var stress_iter: usize = 0;
+    while (stress_iter < 8) : (stress_iter += 1) {
+        const run_stress = b.addRunArtifact(dispatcher_stress_tests);
+        dispatcher_stress_step.dependOn(&run_stress.step);
+    }
+
     const parity_report_tool = b.addExecutable(.{
         .name = "parity_report",
         .root_module = b.createModule(.{

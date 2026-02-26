@@ -94,6 +94,34 @@ flowchart LR
   F --> G["WebView window (OS)"]
 ```
 
+## Launch Policy (Deterministic)
+
+`AppOptions` now uses a single deterministic policy object:
+
+```zig
+pub const LaunchPolicy = struct {
+    preferred_transport: enum { native_webview, browser } = .native_webview,
+    fallback_transport: enum { none, browser } = .browser,
+    browser_open_mode: enum { never, on_browser_transport, always } = .on_browser_transport,
+    allow_dual_surface: bool = false,
+    app_mode_required: bool = false,
+};
+```
+
+Decision summary:
+
+| `preferred_transport` | Native backend available | `fallback_transport` | Active transport |
+|---|---|---|---|
+| `native_webview` | yes | any | `native_webview` |
+| `native_webview` | no | `browser` | `browser_fallback` |
+| `native_webview` | no | `none` | `native_webview` (error if render required) |
+| `browser` | any | any | `browser_fallback` |
+
+Browser opening summary:
+- `never`: never auto-launch browser.
+- `on_browser_transport`: launch browser only when active transport resolves to browser.
+- `always`: always launch browser; combine with `allow_dual_surface=true` for explicit dual-surface behavior.
+
 ## API At A Glance
 
 Core flow:
@@ -118,9 +146,11 @@ pub fn main() !void {
 
     var service = try webui.Service.init(gpa.allocator(), rpc_methods, .{
         .app = .{
-            .transport_mode = .native_webview,
-            .browser_fallback_on_native_failure = true,
-            .auto_open_browser = true,
+            .launch_policy = .{
+                .preferred_transport = .native_webview,
+                .fallback_transport = .browser,
+                .browser_open_mode = .on_browser_transport,
+            },
         },
         .window = .{ .title = "WebUI Zig" },
         .rpc = .{ .dispatcher_mode = .threaded },
@@ -167,6 +197,24 @@ Dispatch modes:
 - `threaded` (worker queue)
 - `custom` (hook dispatcher)
 
+Async jobs (push-first):
+- Set `RpcOptions.execution_mode = .queued_async`.
+- `POST <rpc_route>` returns `{ job_id, state, poll_min_ms, poll_max_ms }`.
+- Completion is pushed over WebSocket as `rpc_job_update`.
+- JS bridge waits for push first, then uses bounded polling fallback (`GET /rpc/job?id=...`).
+- Cancel route: `POST /rpc/job/cancel` with `{ "job_id": <id> }`.
+
+Typed APIs:
+- `Window.rpcPollJob(allocator, job_id) !RpcJobStatus`
+- `Window.rpcCancelJob(job_id) !bool`
+- `Service` mirrors both methods.
+
+Runtime introspection and diagnostics:
+- `Window.runtimeRenderState()` / `Service.runtimeRenderState()`
+- `Window.probeCapabilities()` / `Service.probeCapabilities()`
+- `Service.listRuntimeRequirements(allocator)`
+- `App.onDiagnostic(...)` / `Service.onDiagnostic(...)`
+
 ## Close Semantics (No Random Window Closes)
 
 Close is backend-authoritative:
@@ -197,6 +245,24 @@ Build outputs:
 - `zig-out/share/webui/runtime_helpers.embed.js`
 - `zig-out/share/webui/runtime_helpers.written.js`
 
+## Linux Runtime Requirements API
+
+You can query runtime packaging requirements before showing a window:
+
+```zig
+const reqs = try service.listRuntimeRequirements(allocator);
+defer allocator.free(reqs);
+for (reqs) |req| {
+    std.debug.print("{s}: required={any} available={any}\n", .{
+        req.name, req.required, req.available,
+    });
+}
+```
+
+On Linux this reports helper/runtime expectations such as:
+- `webui_linux_webview_host`
+- `webui_linux_browser_host`
+
 ## Build Flags
 
 | Flag | Default | What it does |
@@ -220,6 +286,7 @@ Exported compile-time values:
 
 - `zig build` (install)
 - `zig build test`
+- `zig build dispatcher-stress`
 - `zig build examples`
 - `zig build run`
 - `zig build bridge`
@@ -289,6 +356,6 @@ Manual GUI validation checklist: `docs/manual_gui_checklist.md`.
 
 ## Docs
 
-- `MIGRATION.md`
+- `docs/migration.md`
 - `CHANGELOG.md`
 - `docs/upstream_file_parity.md`
