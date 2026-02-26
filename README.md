@@ -54,6 +54,7 @@ Force launch order for examples:
 zig build run -Dexample=fancy_window -Drun-mode=webview
 zig build run -Dexample=fancy_window -Drun-mode=browser   # browser app-window
 zig build run -Dexample=fancy_window -Drun-mode=web-tab   # browser tab
+zig build run -Dexample=fancy_window -Drun-mode=web       # alias for web-tab
 zig build run -Dexample=fancy_window -Drun-mode=webview,browser,web-url
 ```
 
@@ -313,7 +314,7 @@ On Linux this reports helper/runtime expectations such as:
 | `-Dminify-embedded-js=true` | `true` | Minifies the embedded runtime helper JS asset at build time. |
 | `-Dminify-written-js=true` | `false` | Minifies the written runtime helper JS output artifact. |
 | `-Dexample=<name>` | `all` | Selects which demo `zig build run` executes. |
-| `-Drun-mode=<launch-order>` | `webview,browser,web-url` | Example launch order. Presets: `webview`, `browser` (app-window), `web-tab`, `web-url`. Also supports explicit order (`webview,browser,web-url`, `browser,webview`, `web-url`). |
+| `-Drun-mode=<launch-order>` | `webview,browser,web-url` | Example launch order. Presets: `webview`, `browser` (app-window), `web-tab`, `web` (alias for `web-tab`), `web-url`. Also supports explicit order (`webview,browser,web-url`, `browser,webview`, `web-url`). |
 | `-Dtarget=<triple>` | host | Cross-compiles the library/examples for another target. |
 
 Exported compile-time values:
