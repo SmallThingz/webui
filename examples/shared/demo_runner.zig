@@ -59,17 +59,17 @@ pub const rpc_methods = struct {
 fn parseSurfaceToken(token: []const u8) ?webui.LaunchSurface {
     if (std.mem.eql(u8, token, "webview")) return .native_webview;
     if (std.mem.eql(u8, token, "browser")) return .browser_window;
+    if (std.mem.eql(u8, token, "web-tab")) return .browser_window;
     if (std.mem.eql(u8, token, "web-url")) return .web_url;
     if (std.mem.eql(u8, token, "url")) return .web_url;
     if (std.mem.eql(u8, token, "web")) return .web_url;
     return null;
 }
 
-fn launchPolicyFromRunMode() webui.LaunchPolicy {
-    const mode = webui.BuildFlags.run_mode;
-
+fn launchPolicyFromRunModeValue(mode: []const u8) webui.LaunchPolicy {
     if (std.mem.eql(u8, mode, "webview")) return webui.LaunchPolicy.webviewFirst();
     if (std.mem.eql(u8, mode, "browser")) return webui.LaunchPolicy.browserFirst();
+    if (std.mem.eql(u8, mode, "web-tab")) return webui.LaunchPolicy.browserFirst();
     if (std.mem.eql(u8, mode, "web-url") or std.mem.eql(u8, mode, "url") or std.mem.eql(u8, mode, "web")) {
         return webui.LaunchPolicy.webUrlOnly();
     }
@@ -112,6 +112,30 @@ fn launchPolicyFromRunMode() webui.LaunchPolicy {
         policy.app_mode_required = false;
     }
     return policy;
+}
+
+fn launchPolicyFromRunMode() webui.LaunchPolicy {
+    return launchPolicyFromRunModeValue(webui.BuildFlags.run_mode);
+}
+
+const BrowserLaunchPreference = enum {
+    auto,
+    app_window,
+    web_tab,
+};
+
+fn browserLaunchPreferenceFromRunMode(mode: []const u8) BrowserLaunchPreference {
+    if (std.mem.eql(u8, mode, "browser")) return .app_window;
+    if (std.mem.eql(u8, mode, "web-tab")) return .web_tab;
+
+    var it = std.mem.tokenizeAny(u8, mode, ",> ");
+    while (it.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, " \t\r\n");
+        if (token.len == 0) continue;
+        if (std.mem.eql(u8, token, "browser")) return .app_window;
+        if (std.mem.eql(u8, token, "web-tab")) return .web_tab;
+    }
+    return .auto;
 }
 
 fn surfaceName(surface: webui.LaunchSurface) []const u8 {
@@ -243,19 +267,42 @@ fn tagFor(comptime kind: ExampleKind) []const u8 {
 }
 
 fn appOptionsFor(comptime kind: ExampleKind) webui.AppOptions {
-    const launch_policy = launchPolicyFromRunMode();
+    const run_mode = webui.BuildFlags.run_mode;
+    const launch_policy = launchPolicyFromRunModeValue(run_mode);
+    const launch_pref = browserLaunchPreferenceFromRunMode(run_mode);
     const native_first = launch_policy.first == .native_webview;
+    var require_app_window = native_first;
+    var allow_system_fallback = !native_first;
+    switch (launch_pref) {
+        .app_window => {
+            require_app_window = true;
+            allow_system_fallback = false;
+        },
+        .web_tab => {
+            require_app_window = false;
+            allow_system_fallback = true;
+        },
+        .auto => {},
+    }
+
     return .{
         .launch_policy = launch_policy,
         .enable_tls = webui.BuildFlags.enable_tls,
         .enable_webui_log = true,
         .public_network = kind == .public_network,
         .browser_launch = .{
-            .require_app_mode_window = native_first,
-            .allow_system_fallback = !native_first,
+            .require_app_mode_window = require_app_window,
+            .allow_system_fallback = allow_system_fallback,
         },
         .window_fallback_emulation = !native_first,
     };
+}
+
+test "run-mode browser launch preference parser supports web-tab" {
+    try std.testing.expectEqual(BrowserLaunchPreference.app_window, browserLaunchPreferenceFromRunMode("browser"));
+    try std.testing.expectEqual(BrowserLaunchPreference.web_tab, browserLaunchPreferenceFromRunMode("web-tab"));
+    try std.testing.expectEqual(BrowserLaunchPreference.web_tab, browserLaunchPreferenceFromRunMode("webview,web-tab,web-url"));
+    try std.testing.expectEqual(BrowserLaunchPreference.auto, browserLaunchPreferenceFromRunMode("web-url"));
 }
 
 fn styleFor(comptime kind: ExampleKind) webui.WindowStyle {

@@ -316,10 +316,6 @@ fn launchPolicyContains(policy: LaunchPolicy, surface: LaunchSurface) bool {
     return false;
 }
 
-fn launchPolicyHasBrowserTransport(policy: LaunchPolicy) bool {
-    return launchPolicyContains(policy, .browser_window) or launchPolicyContains(policy, .web_url);
-}
-
 fn launchPolicyNextAfter(policy: LaunchPolicy, current: LaunchSurface) ?LaunchSurface {
     const ordered = launchPolicyOrder(policy);
     var found = false;
@@ -1474,8 +1470,9 @@ const WindowState = struct {
 
     fn shouldServeBrowser(self: *const WindowState) bool {
         if (self.runtime_render_state.active_surface != .native_webview) return true;
-        if (self.launch_policy.allow_dual_surface and launchPolicyHasBrowserTransport(self.launch_policy)) return true;
-        return false;
+        // Native-webview mode still needs the local HTTP/WebSocket runtime so the
+        // host process can render and communicate with this window.
+        return true;
     }
 
     fn setLaunchedBrowserLaunch(self: *WindowState, allocator: std.mem.Allocator, launch: core_runtime.BrowserLaunch) void {
@@ -1639,13 +1636,34 @@ const WindowState = struct {
 
     fn shouldOpenBrowser(self: *const WindowState) bool {
         if (self.runtime_render_state.active_surface == .browser_window) return true;
-        if (!self.launch_policy.allow_dual_surface) return false;
-        if (self.runtime_render_state.active_surface != .native_webview) return false;
-        return launchPolicyContains(self.launch_policy, .browser_window);
+        if (self.runtime_render_state.active_surface == .native_webview) {
+            // Current native backends require a spawned host process to become ready.
+            // Bootstrap it on first render even without dual-surface mode.
+            if (!self.backend.isReady()) return true;
+            if (!self.launch_policy.allow_dual_surface) return false;
+            return launchPolicyContains(self.launch_policy, .browser_window);
+        }
+        return false;
     }
 
-    fn resolveAfterBrowserLaunchFailure(self: *WindowState) bool {
-        const next_surface = launchPolicyNextAfter(self.launch_policy, .browser_window) orelse return false;
+    fn shouldAttemptBrowserSpawnLocked(
+        self: *WindowState,
+        allocator: std.mem.Allocator,
+        local_render: bool,
+    ) bool {
+        if (!self.shouldOpenBrowser()) return false;
+
+        if (local_render) {
+            if (self.launched_browser_pid) |pid| {
+                if (core_runtime.isProcessAlive(pid)) return false;
+                self.clearTrackedBrowserState(allocator);
+            }
+        }
+        return true;
+    }
+
+    fn resolveAfterBrowserLaunchFailure(self: *WindowState, failed_surface: LaunchSurface) bool {
+        const next_surface = launchPolicyNextAfter(self.launch_policy, failed_surface) orelse return false;
         self.runtime_render_state.fallback_applied = true;
         self.runtime_render_state.fallback_reason = .launch_failed;
         self.runtime_render_state.active_surface = next_surface;
@@ -1665,11 +1683,11 @@ const WindowState = struct {
         defer allocator.free(url);
         try replaceOwned(allocator, &self.last_url, url);
 
-        if (self.shouldOpenBrowser()) {
+        if (self.shouldAttemptBrowserSpawnLocked(allocator, true)) {
             if (core_runtime.openInBrowser(allocator, url, self.current_style, app_options.browser_launch)) |launch| {
                 self.setLaunchedBrowserLaunch(allocator, launch);
             } else |err| {
-                _ = self.resolveAfterBrowserLaunchFailure();
+                _ = self.resolveAfterBrowserLaunchFailure(self.runtime_render_state.active_surface);
                 if (self.rpc_state.log_enabled) {
                     std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 }
@@ -2573,11 +2591,11 @@ pub const Window = struct {
             _ = win_state.backend.showContent(.{ .url = url }) catch {};
         }
 
-        if (win_state.shouldOpenBrowser()) {
+        if (win_state.shouldAttemptBrowserSpawnLocked(self.app.allocator, false)) {
             if (core_runtime.openInBrowser(self.app.allocator, url, win_state.current_style, self.app.options.browser_launch)) |launch| {
                 win_state.setLaunchedBrowserLaunch(self.app.allocator, launch);
             } else |err| {
-                _ = win_state.resolveAfterBrowserLaunchFailure();
+                _ = win_state.resolveAfterBrowserLaunchFailure(win_state.runtime_render_state.active_surface);
                 if (win_state.rpc_state.log_enabled) {
                     std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 }
@@ -4625,7 +4643,7 @@ test "lifecycle route stays responsive during long running rpc" {
     try std.testing.expect(std.mem.indexOf(u8, rpc_response, "\"value\":\"done\"") != null);
 }
 
-test "native_webview launch order falls back to web_url when native backend is unavailable" {
+test "native_webview launch order keeps local runtime reachable" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -4639,11 +4657,9 @@ test "native_webview launch order falls back to web_url when native backend is u
     try app.run();
 
     const render_state = win.runtimeRenderState();
-    if (render_state.active_surface == .native_webview) {
-        try std.testing.expectError(error.TransportNotBrowserRenderable, win.browserUrl());
-        return;
+    if (render_state.active_surface != .native_webview) {
+        try std.testing.expectEqual(@as(LaunchSurface, .web_url), render_state.active_surface);
     }
-    try std.testing.expectEqual(@as(LaunchSurface, .web_url), render_state.active_surface);
 
     const local_url = try win.browserUrl();
     defer gpa.allocator().free(local_url);
@@ -4669,7 +4685,7 @@ test "native_webview launch order falls back to web_url when native backend is u
     app.shutdown();
 }
 
-test "native_webview browser fallback can be disabled" {
+test "native_webview only mode still exposes local runtime url" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -4679,7 +4695,9 @@ test "native_webview browser fallback can be disabled" {
     defer app.deinit();
 
     var win = try app.newWindow(.{ .title = "NativeOnly" });
-    try std.testing.expectError(error.TransportNotBrowserRenderable, win.browserUrl());
+    const local_url = try win.browserUrl();
+    defer gpa.allocator().free(local_url);
+    try std.testing.expect(std.mem.startsWith(u8, local_url, "http://127.0.0.1:"));
 }
 
 test "linked child exit requests close immediately" {
@@ -4805,6 +4823,177 @@ test "shutdown in webview mode terminates tracked browser child process" {
     }
 
     try std.testing.expect(!alive);
+}
+
+test "browser spawn decision matrix across launch modes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app_web_url = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app_web_url.deinit();
+    var win_web_url = try app_web_url.newWindow(.{ .title = "SpawnMatrixWebUrl" });
+    win_web_url.state().state_mutex.lock();
+    const web_url_attempt = win_web_url.state().shouldAttemptBrowserSpawnLocked(gpa.allocator(), true);
+    win_web_url.state().state_mutex.unlock();
+    try std.testing.expect(!web_url_attempt);
+
+    var app_browser = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .browser_window, .second = .web_url, .third = null },
+    });
+    defer app_browser.deinit();
+    var win_browser = try app_browser.newWindow(.{ .title = "SpawnMatrixBrowser" });
+    win_browser.state().state_mutex.lock();
+    const browser_attempt = win_browser.state().shouldAttemptBrowserSpawnLocked(gpa.allocator(), true);
+    win_browser.state().state_mutex.unlock();
+    try std.testing.expect(browser_attempt);
+
+    var app_native_only = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .native_webview, .second = null, .third = null },
+    });
+    defer app_native_only.deinit();
+    var win_native_only = try app_native_only.newWindow(.{ .title = "SpawnMatrixNativeOnly" });
+    win_native_only.state().state_mutex.lock();
+    const native_only_attempt = win_native_only.state().shouldAttemptBrowserSpawnLocked(gpa.allocator(), true);
+    win_native_only.state().state_mutex.unlock();
+    try std.testing.expect(native_only_attempt);
+
+    var app_dual = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .first = .native_webview,
+            .second = .browser_window,
+            .third = .web_url,
+            .allow_dual_surface = true,
+        },
+    });
+    defer app_dual.deinit();
+    var win_dual = try app_dual.newWindow(.{ .title = "SpawnMatrixDual" });
+    win_dual.state().state_mutex.lock();
+    const dual_attempt = win_dual.state().shouldAttemptBrowserSpawnLocked(gpa.allocator(), true);
+    win_dual.state().state_mutex.unlock();
+    try std.testing.expect(dual_attempt);
+}
+
+test "local render spawn is skipped while tracked browser process is alive" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .browser_window, .second = .web_url, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "SpawnSkipAlivePid" });
+
+    var child = std.process.Child.init(&.{ "sh", "-c", "sleep 5" }, gpa.allocator());
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    defer {
+        core_runtime.terminateBrowserProcess(gpa.allocator(), @as(i64, @intCast(child.id)));
+        _ = child.wait() catch {};
+    }
+
+    const child_pid_i64: i64 = @as(i64, @intCast(child.id));
+    win.state().state_mutex.lock();
+    win.state().launched_browser_pid = child_pid_i64;
+    const attempt = win.state().shouldAttemptBrowserSpawnLocked(gpa.allocator(), true);
+    const tracked_after = win.state().launched_browser_pid;
+    win.state().state_mutex.unlock();
+
+    try std.testing.expect(!attempt);
+    try std.testing.expect(tracked_after != null);
+    try std.testing.expectEqual(child_pid_i64, tracked_after.?);
+    try std.testing.expect(core_runtime.isProcessAlive(child_pid_i64));
+}
+
+test "local render spawn clears stale tracked browser process before relaunch" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .browser_window, .second = .web_url, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "SpawnClearDeadPid" });
+
+    var child = std.process.Child.init(&.{ "sh", "-c", "exit 0" }, gpa.allocator());
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    _ = try child.wait();
+
+    const dead_pid_i64: i64 = @as(i64, @intCast(child.id));
+    win.state().state_mutex.lock();
+    win.state().launched_browser_pid = dead_pid_i64;
+    const attempt = win.state().shouldAttemptBrowserSpawnLocked(gpa.allocator(), true);
+    const tracked_after = win.state().launched_browser_pid;
+    win.state().state_mutex.unlock();
+
+    try std.testing.expect(attempt);
+    try std.testing.expect(tracked_after == null);
+}
+
+test "native webview mode bootstraps host process spawn when backend is not ready" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .native_webview, .second = .web_url, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "NativeBootstrapSpawn" });
+    win.state().state_mutex.lock();
+    const active_surface = win.state().runtime_render_state.active_surface;
+    const should_serve = win.state().shouldServeBrowser();
+    const should_spawn = win.state().shouldAttemptBrowserSpawnLocked(gpa.allocator(), true);
+    win.state().state_mutex.unlock();
+
+    if (active_surface == .native_webview) {
+        try std.testing.expect(should_serve);
+        try std.testing.expect(should_spawn);
+    } else {
+        try std.testing.expect(active_surface == .web_url or active_surface == .browser_window);
+    }
+}
+
+test "browser launch failure fallback advances from active launch surface" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .first = .native_webview,
+            .second = .browser_window,
+            .third = .web_url,
+        },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "LaunchFailureFallbackOrder" });
+    win.state().state_mutex.lock();
+    defer win.state().state_mutex.unlock();
+
+    win.state().runtime_render_state.active_surface = .native_webview;
+    win.state().runtime_render_state.active_transport = .native_webview;
+    try std.testing.expect(win.state().resolveAfterBrowserLaunchFailure(.native_webview));
+    try std.testing.expectEqual(@as(LaunchSurface, .browser_window), win.state().runtime_render_state.active_surface);
+    try std.testing.expectEqual(@as(TransportMode, .browser_fallback), win.state().runtime_render_state.active_transport);
+    try std.testing.expect(win.state().runtime_render_state.fallback_applied);
+    try std.testing.expectEqual(@as(?FallbackReason, .launch_failed), win.state().runtime_render_state.fallback_reason);
+
+    try std.testing.expect(win.state().resolveAfterBrowserLaunchFailure(.browser_window));
+    try std.testing.expectEqual(@as(LaunchSurface, .web_url), win.state().runtime_render_state.active_surface);
+    try std.testing.expect(!win.state().resolveAfterBrowserLaunchFailure(.web_url));
 }
 
 test "window_closing lifecycle event is ignored while tracked browser pid is alive" {
