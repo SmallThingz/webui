@@ -265,6 +265,24 @@ const DiagnosticCallbackState = struct {
     context: ?*anyopaque = null,
 };
 
+const PinnedStructOwner = enum {
+    app,
+    service,
+};
+
+const DiagnosticCallbackBindingMismatch = struct {
+    window_id: usize,
+    expected_ptr: usize,
+    actual_ptr: usize,
+};
+
+fn pinnedMoveGuardEnabled() bool {
+    return switch (builtin.mode) {
+        .Debug, .ReleaseSafe => true,
+        .ReleaseFast, .ReleaseSmall => false,
+    };
+}
+
 const RawCallbackState = struct {
     handler: ?RawHandler = null,
     context: ?*anyopaque = null,
@@ -2156,6 +2174,11 @@ pub const App = struct {
             .handler = handler,
             .context = context,
         };
+        for (self.windows.items) |*state| {
+            state.state_mutex.lock();
+            state.diagnostic_callback = &self.diagnostic_callback;
+            state.state_mutex.unlock();
+        }
     }
 
     fn emitDiagnostic(
@@ -2179,7 +2202,55 @@ pub const App = struct {
         }
     }
 
+    fn firstDiagnosticCallbackBindingMismatch(self: *const App) ?DiagnosticCallbackBindingMismatch {
+        const expected = @intFromPtr(&self.diagnostic_callback);
+        for (self.windows.items) |*state| {
+            const actual = @intFromPtr(state.diagnostic_callback);
+            if (actual != expected) {
+                return .{
+                    .window_id = state.id,
+                    .expected_ptr = expected,
+                    .actual_ptr = actual,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn hasStableDiagnosticCallbackBindings(self: *const App) bool {
+        return self.firstDiagnosticCallbackBindingMismatch() == null;
+    }
+
+    fn checkPinnedMoveInvariant(self: *App, owner: PinnedStructOwner, fail_fast: bool) bool {
+        if (comptime !pinnedMoveGuardEnabled()) return true;
+        if (self.diagnostic_callback.handler == null) return true;
+
+        const mismatch = self.firstDiagnosticCallbackBindingMismatch() orelse return true;
+        const code = switch (owner) {
+            .app => "lifecycle.pinned_struct_moved.app",
+            .service => "lifecycle.pinned_struct_moved.service",
+        };
+        const owner_label = switch (owner) {
+            .app => "App",
+            .service => "Service",
+        };
+        var message_buf: [320]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &message_buf,
+            "{s} was moved after window initialization. Keep initialized structs in final storage and pass pointers only (window_id={d}, expected=0x{x}, actual=0x{x}).",
+            .{ owner_label, mismatch.window_id, mismatch.expected_ptr, mismatch.actual_ptr },
+        ) catch "Pinned struct move detected. Keep initialized structs in final storage and pass pointers only.";
+        self.emitDiagnostic(mismatch.window_id, code, .lifecycle, .err, message);
+        if (fail_fast) std.debug.panic("{s}", .{message});
+        return false;
+    }
+
+    fn enforcePinnedMoveInvariant(self: *App, owner: PinnedStructOwner) void {
+        _ = self.checkPinnedMoveInvariant(owner, true);
+    }
+
     pub fn newWindow(self: *App, options: WindowOptions) !Window {
+        self.enforcePinnedMoveInvariant(.app);
         const id = options.window_id orelse self.next_window_id;
         if (id == 0) return error.InvalidWindowId;
 
@@ -2215,6 +2286,7 @@ pub const App = struct {
     }
 
     pub fn run(self: *App) !void {
+        self.enforcePinnedMoveInvariant(.app);
         if (self.shutdown_requested) return;
 
         for (self.windows.items) |*state| {
@@ -2246,6 +2318,7 @@ pub const App = struct {
     }
 
     pub fn shutdown(self: *App) void {
+        self.enforcePinnedMoveInvariant(.app);
         self.shutdown_requested = true;
 
         for (self.windows.items) |*state| {
@@ -2274,6 +2347,7 @@ pub const Window = struct {
     id: usize,
 
     pub fn showHtml(self: *Window, html: []const u8) !void {
+        self.app.enforcePinnedMoveInvariant(.app);
         if (html.len == 0) return error.EmptyHtml;
 
         const win_state = self.state();
@@ -2308,6 +2382,7 @@ pub const Window = struct {
     }
 
     pub fn showFile(self: *Window, path: []const u8) !void {
+        self.app.enforcePinnedMoveInvariant(.app);
         if (path.len == 0) return error.EmptyPath;
 
         _ = try std.fs.cwd().statFile(path);
@@ -2336,6 +2411,7 @@ pub const Window = struct {
     }
 
     pub fn showUrl(self: *Window, url: []const u8) !void {
+        self.app.enforcePinnedMoveInvariant(.app);
         if (!isLikelyUrl(url)) return error.InvalidUrl;
 
         const win_state = self.state();
@@ -2368,6 +2444,7 @@ pub const Window = struct {
     }
 
     pub fn navigate(self: *Window, url: []const u8) !void {
+        self.app.enforcePinnedMoveInvariant(.app);
         try self.showUrl(url);
         self.emit(.navigation, "navigate", url);
     }
@@ -2488,6 +2565,7 @@ pub const Window = struct {
     }
 
     pub fn browserUrl(self: *Window) ![]u8 {
+        self.app.enforcePinnedMoveInvariant(.app);
         const win_state = self.state();
         if (!win_state.shouldServeBrowser()) return error.TransportNotBrowserRenderable;
 
@@ -2504,6 +2582,7 @@ pub const Window = struct {
     }
 
     pub fn openInBrowserWithOptions(self: *Window, launch_options: BrowserLaunchOptions) !void {
+        self.app.enforcePinnedMoveInvariant(.app);
         const win_state = self.state();
         win_state.state_mutex.lock();
         defer win_state.state_mutex.unlock();
@@ -2675,18 +2754,17 @@ pub const Service = struct {
     window_index: usize,
     window_id: usize,
 
-    pub fn init(allocator: std.mem.Allocator, comptime rpc_methods: type, options: ServiceOptions) !Service {
-        var app = try App.init(allocator, options.app);
-        errdefer app.deinit();
+    pub inline fn init(allocator: std.mem.Allocator, comptime rpc_methods: type, options: ServiceOptions) !Service {
+        var service: Service = undefined;
+        service.app = try App.init(allocator, options.app);
+        errdefer service.app.deinit();
 
-        var main_window = try app.newWindow(options.window);
+        var main_window = try service.app.newWindow(options.window);
         try main_window.bindRpc(rpc_methods, options.rpc);
 
-        return .{
-            .app = app,
-            .window_index = main_window.index,
-            .window_id = main_window.id,
-        };
+        service.window_index = main_window.index;
+        service.window_id = main_window.id;
+        return service;
     }
 
     pub fn initDefault(allocator: std.mem.Allocator, comptime rpc_methods: type) !Service {
@@ -2698,6 +2776,7 @@ pub const Service = struct {
     }
 
     pub fn window(self: *Service) Window {
+        self.enforcePinnedMoveInvariant();
         return .{
             .app = &self.app,
             .index = self.window_index,
@@ -2706,10 +2785,12 @@ pub const Service = struct {
     }
 
     pub fn run(self: *Service) !void {
+        self.enforcePinnedMoveInvariant();
         try self.app.run();
     }
 
     pub fn shouldExit(self: *Service) bool {
+        self.enforcePinnedMoveInvariant();
         if (process_signals.stopRequested()) {
             self.app.shutdown();
             return true;
@@ -2724,6 +2805,7 @@ pub const Service = struct {
     }
 
     pub fn shutdown(self: *Service) void {
+        self.enforcePinnedMoveInvariant();
         self.app.shutdown();
     }
 
@@ -2815,6 +2897,7 @@ pub const Service = struct {
     }
 
     pub fn listRuntimeRequirements(self: *Service, allocator: std.mem.Allocator) ![]RuntimeRequirement {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         const win_state = win.state();
         win_state.state_mutex.lock();
@@ -2838,21 +2921,25 @@ pub const Service = struct {
     }
 
     pub fn onEvent(self: *Service, handler: EventHandler, context: ?*anyopaque) void {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         win.onEvent(handler, context);
     }
 
     pub fn onRaw(self: *Service, handler: RawHandler, context: ?*anyopaque) void {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         win.onRaw(handler, context);
     }
 
     pub fn sendRaw(self: *Service, bytes: []const u8) !void {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.sendRaw(bytes);
     }
 
     pub fn runScript(self: *Service, script: []const u8, options: ScriptOptions) !void {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.runScript(script, options);
     }
@@ -2863,41 +2950,49 @@ pub const Service = struct {
         script: []const u8,
         options: ScriptOptions,
     ) !ScriptEvalResult {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.evalScript(allocator, script, options);
     }
 
     pub fn rpcPollJob(self: *Service, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcPollJob(allocator, job_id);
     }
 
     pub fn rpcCancelJob(self: *Service, job_id: RpcJobId) !bool {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcCancelJob(job_id);
     }
 
     pub fn browserUrl(self: *Service) ![]u8 {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.browserUrl();
     }
 
     pub fn openInBrowser(self: *Service) !void {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.openInBrowser();
     }
 
     pub fn openInBrowserWithOptions(self: *Service, launch_options: BrowserLaunchOptions) !void {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.openInBrowserWithOptions(launch_options);
     }
 
     pub fn rpcClientScript(self: *Service, options: BridgeOptions) []const u8 {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcClientScript(options);
     }
 
     pub fn rpcTypeDeclarations(self: *Service, options: BridgeOptions) []const u8 {
+        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcTypeDeclarations(options);
     }
@@ -2908,6 +3003,18 @@ pub const Service = struct {
 
     pub fn generatedTypeScriptDeclarationsComptime(comptime rpc_methods: type, comptime options: BridgeOptions) []const u8 {
         return RpcRegistry.generatedTypeScriptDeclarationsComptime(rpc_methods, options);
+    }
+
+    fn hasStableDiagnosticCallbackBindings(self: *const Service) bool {
+        return self.app.hasStableDiagnosticCallbackBindings();
+    }
+
+    fn checkPinnedMoveInvariant(self: *Service, fail_fast: bool) bool {
+        return self.app.checkPinnedMoveInvariant(.service, fail_fast);
+    }
+
+    fn enforcePinnedMoveInvariant(self: *Service) void {
+        _ = self.checkPinnedMoveInvariant(true);
     }
 };
 
@@ -5101,6 +5208,158 @@ test "diagnostic callback emits typed transport diagnostics" {
     try std.testing.expect(Capture.count > 0);
     try std.testing.expect(Capture.saw_transport);
     try std.testing.expect(!Capture.saw_fallback);
+}
+
+test "service init keeps diagnostic callback binding invariant stable" {
+    const NoopDiagnostic = struct {
+        fn onDiagnostic(_: ?*anyopaque, _: *const Diagnostic) void {}
+    };
+
+    const rpc_methods = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var service = try Service.init(gpa.allocator(), rpc_methods, .{
+        .app = .{
+            .launch_policy = .{
+                .preferred_transport = .browser,
+                .fallback_transport = .browser,
+                .browser_open_mode = .never,
+            },
+        },
+    });
+    defer service.deinit();
+    service.onDiagnostic(NoopDiagnostic.onDiagnostic, null);
+
+    try std.testing.expect(service.hasStableDiagnosticCallbackBindings());
+    try std.testing.expect(service.checkPinnedMoveInvariant(false));
+}
+
+test "service move is detected by diagnostic callback binding invariant" {
+    if (!pinnedMoveGuardEnabled()) return;
+
+    const NoopDiagnostic = struct {
+        fn onDiagnostic(_: ?*anyopaque, _: *const Diagnostic) void {}
+    };
+
+    const rpc_methods = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var service = try Service.init(gpa.allocator(), rpc_methods, .{
+        .app = .{
+            .launch_policy = .{
+                .preferred_transport = .browser,
+                .fallback_transport = .browser,
+                .browser_open_mode = .never,
+            },
+        },
+    });
+    service.onDiagnostic(NoopDiagnostic.onDiagnostic, null);
+
+    var moved = service;
+    try std.testing.expect(!moved.hasStableDiagnosticCallbackBindings());
+    try std.testing.expect(!moved.checkPinnedMoveInvariant(false));
+    moved.deinit();
+}
+
+test "service move guard emits typed diagnostic on mismatch" {
+    if (!pinnedMoveGuardEnabled()) return;
+
+    const Capture = struct {
+        var count: usize = 0;
+        var saw_code: bool = false;
+        var saw_category: bool = false;
+        var saw_severity: bool = false;
+
+        fn onDiagnostic(_: ?*anyopaque, diagnostic: *const Diagnostic) void {
+            count += 1;
+            if (std.mem.eql(u8, diagnostic.code, "lifecycle.pinned_struct_moved.service")) saw_code = true;
+            if (diagnostic.category == .lifecycle) saw_category = true;
+            if (diagnostic.severity == .err) saw_severity = true;
+        }
+    };
+
+    Capture.count = 0;
+    Capture.saw_code = false;
+    Capture.saw_category = false;
+    Capture.saw_severity = false;
+
+    const rpc_methods = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var service = try Service.init(gpa.allocator(), rpc_methods, .{
+        .app = .{
+            .launch_policy = .{
+                .preferred_transport = .browser,
+                .fallback_transport = .browser,
+                .browser_open_mode = .never,
+            },
+        },
+    });
+    service.onDiagnostic(Capture.onDiagnostic, null);
+
+    var moved = service;
+
+    try std.testing.expect(!moved.checkPinnedMoveInvariant(false));
+    try std.testing.expect(Capture.count > 0);
+    try std.testing.expect(Capture.saw_code);
+    try std.testing.expect(Capture.saw_category);
+    try std.testing.expect(Capture.saw_severity);
+    moved.deinit();
+}
+
+test "normal service flow does not emit pinned move diagnostics" {
+    const Capture = struct {
+        var pinned_count: usize = 0;
+
+        fn onDiagnostic(_: ?*anyopaque, diagnostic: *const Diagnostic) void {
+            if (std.mem.startsWith(u8, diagnostic.code, "lifecycle.pinned_struct_moved.")) pinned_count += 1;
+        }
+    };
+
+    Capture.pinned_count = 0;
+
+    const rpc_methods = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var service = try Service.init(gpa.allocator(), rpc_methods, .{
+        .app = .{
+            .launch_policy = .{
+                .preferred_transport = .browser,
+                .fallback_transport = .browser,
+                .browser_open_mode = .never,
+            },
+        },
+    });
+    defer service.deinit();
+    service.onDiagnostic(Capture.onDiagnostic, null);
+
+    try service.showHtml("<html><body>move-safe</body></html>");
+    try service.run();
+    try std.testing.expectEqual(@as(usize, 0), Capture.pinned_count);
 }
 
 test "service requirement listing and probe are available before show" {

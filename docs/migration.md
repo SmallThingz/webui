@@ -122,3 +122,24 @@ Typed control APIs:
 
 - Existing warning log strings may still appear, but typed diagnostics are the authoritative integration surface.
 - For Linux packaging, validate helper/runtime presence through `listRuntimeRequirements`.
+
+## Pinned Struct Move Safety
+
+This release keeps the current architecture (no forced allocation pinning), so move-safety is explicit:
+
+- Do not move/copy an initialized `App` after it owns windows.
+- Do not move/copy an initialized `Service` after `Service.init`.
+
+Avoid:
+- By-value hops of initialized values between helper return values/temporaries.
+- Relocating containers that move initialized `Service`/`App` values.
+
+Prefer:
+- Initialize in final storage.
+- Pass pointers (`*Service`, `*App`) across function boundaries.
+
+Debug guard behavior:
+- With diagnostics enabled via `onDiagnostic(...)`, `Debug` and `ReleaseSafe` emit typed diagnostics then fail fast:
+  - `lifecycle.pinned_struct_moved.app`
+  - `lifecycle.pinned_struct_moved.service`
+- `ReleaseFast` and `ReleaseSmall` compile these checks out.

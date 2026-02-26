@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-02-26
+
+- Added debug-time pinned-struct move guards for callback binding invariants (`App`/`Service`).
+- Added typed lifecycle diagnostics for detected move violations:
+  - `lifecycle.pinned_struct_moved.app`
+  - `lifecycle.pinned_struct_moved.service`
+- Added deterministic invariant regression tests for stable path, moved path detection, diagnostic emission, and no-false-positive flow.
+- Added move/pinning safety guidance in `README.md`, `docs/migration.md`, and `MIGRATION.md`.
+- Preserved runtime architecture (no allocation-based pinning rewrite).
+
 ## 2026-02-24
 
 - Replaced active C-backed build/runtime path with Zig-only modules.

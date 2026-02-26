@@ -176,6 +176,33 @@ pub fn main() !void {
 }
 ```
 
+## Pinned Struct Move Safety
+
+`App` and `Service` are move-sensitive once windows are created.
+
+Rules:
+- Once an `App` owns windows, do not move/copy that initialized `App` by value.
+- Once a `Service` is initialized, do not move/copy that initialized `Service` by value.
+
+Unsafe patterns:
+- Returning/stashing an initialized `Service`/`App` through extra by-value copies.
+- Storing initialized `Service` values in relocating containers.
+- Assigning `var moved = service;` (or equivalent copies) after init.
+
+Safe patterns:
+- Initialize `App`/`Service` in its final storage location.
+- Pass pointers (`*App`, `*Service`) through helpers.
+- Keep initialized structs out of relocatable by-value containers.
+
+Debug behavior:
+- In `Debug`/`ReleaseSafe`, when diagnostics are enabled via `onDiagnostic(...)`, the runtime checks callback-binding invariants and emits typed diagnostics:
+  - `lifecycle.pinned_struct_moved.app`
+  - `lifecycle.pinned_struct_moved.service`
+- After emitting the diagnostic, it fails fast to avoid latent crashes.
+- In `ReleaseFast`/`ReleaseSmall`, this guard is compiled out.
+
+This project intentionally documents and guards move-safety instead of forcing allocation-based pinning.
+
 ## Typed RPC + Bridge Generation
 
 Everything starts with a comptime method set:

@@ -52,8 +52,33 @@ Browser fallback controls:
 
 ```zig
 var app = try webui.App.init(allocator, .{
-    .transport_mode = .native_webview,
-    .browser_fallback_on_native_failure = true,
-    .auto_open_browser = true,
+    .launch_policy = .{
+        .preferred_transport = .native_webview,
+        .fallback_transport = .browser,
+        .browser_open_mode = .on_browser_transport,
+    },
 });
 ```
+
+## Pinned Struct Move Safety
+
+The runtime currently enforces move safety by contract (not by forced heap pinning):
+
+- Do not move/copy an initialized `App` after it owns windows.
+- Do not move/copy an initialized `Service` after `Service.init`.
+
+Unsafe examples:
+- Extra by-value copies of initialized structs.
+- Relocating containers that move initialized `Service`/`App` entries.
+
+Safe examples:
+- Initialize in final storage.
+- Pass pointers (`*Service`, `*App`) across helpers.
+
+Debug guard behavior:
+- With diagnostics enabled via `onDiagnostic(...)`, `Debug`/`ReleaseSafe` emit typed diagnostics and fail fast:
+  - `lifecycle.pinned_struct_moved.app`
+  - `lifecycle.pinned_struct_moved.service`
+- `ReleaseFast`/`ReleaseSmall` compile these checks out.
+
+This is intentionally documented and guarded behavior, not an allocation-based pinning redesign.
