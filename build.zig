@@ -154,6 +154,15 @@ pub fn build(b: *Build) void {
     build_opts.addOption([]const u8, "runtime_helpers_embed_path", runtime_helpers_assets.embed_path);
     build_opts.addOption([]const u8, "runtime_helpers_written_path", runtime_helpers_assets.written_path);
 
+    const websocket_dep = b.dependency("websocket", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const websocket_mod = websocket_dep.module("websocket");
+    const websocket_build_opts = b.addOptions();
+    websocket_build_opts.addOption(bool, "websocket_blocking", false);
+    websocket_mod.addOptions("build", websocket_build_opts);
+
     const lib_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -161,6 +170,7 @@ pub fn build(b: *Build) void {
         .link_libc = false,
     });
     lib_module.addOptions("build_options", build_opts);
+    lib_module.addImport("websocket", websocket_mod);
 
     const webui_lib = b.addLibrary(.{
         .name = "webui",
@@ -177,16 +187,18 @@ pub fn build(b: *Build) void {
         .link_libc = false,
     });
     webui_mod.addOptions("build_options", build_opts);
+    webui_mod.addImport("websocket", websocket_mod);
 
-    const example_shared_mod = b.addModule("example_shared", .{
-        .root_source_file = b.path("webui/examples/shared/demo_runner.zig"),
+    const example_shared_source_path = "webui/examples/shared/demo_runner.zig";
+    const example_shared_mod: ?*Build.Module = if (pathExists(example_shared_source_path)) b.addModule("example_shared", .{
+        .root_source_file = b.path(example_shared_source_path),
         .target = target,
         .optimize = optimize,
         .link_libc = false,
         .imports = &.{
             .{ .name = "webui", .module = webui_mod },
         },
-    });
+    }) else null;
 
     const exe = b.addExecutable(.{
         .name = "webui-zig",
@@ -290,29 +302,43 @@ pub fn build(b: *Build) void {
     if (linux_browser_host_install_step) |host_install| {
         examples_step.dependOn(host_install);
     }
-    for (examples) |example| {
-        const built = addExample(b, example, webui_mod, example_shared_mod, webui_lib, target, optimize, runtime_helpers_assets.prepare_step);
-        examples_step.dependOn(built.install_step);
-        if (linux_webview_host_install_step) |host_install| {
-            built.install_step.dependOn(host_install);
-            built.run_step.dependOn(host_install);
-        }
-        if (linux_browser_host_install_step) |host_install| {
-            built.install_step.dependOn(host_install);
-            built.run_step.dependOn(host_install);
-        }
+    var selected_example_found = selected_example == .all;
+    if (example_shared_mod) |shared_mod| {
+        for (examples) |example| {
+            if (!pathExists(example.source_path)) continue;
 
-        if (selected_example == .all or selected_example == example.selector) {
-            if (selected_example == .all) {
-                built.run_cmd.setEnvironmentVariable("WEBUI_EXAMPLE_EXIT_MS", "1800");
+            const built = addExample(b, example, webui_mod, shared_mod, webui_lib, target, optimize, runtime_helpers_assets.prepare_step);
+            examples_step.dependOn(built.install_step);
+            if (linux_webview_host_install_step) |host_install| {
+                built.install_step.dependOn(host_install);
+                built.run_step.dependOn(host_install);
             }
-            run_step.dependOn(built.run_step);
-            if (selected_example != .all) {
-                if (b.args) |args| {
-                    built.run_cmd.addArgs(args);
+            if (linux_browser_host_install_step) |host_install| {
+                built.install_step.dependOn(host_install);
+                built.run_step.dependOn(host_install);
+            }
+
+            if (selected_example == .all or selected_example == example.selector) {
+                selected_example_found = true;
+                if (selected_example == .all) {
+                    built.run_cmd.setEnvironmentVariable("WEBUI_EXAMPLE_EXIT_MS", "1800");
+                }
+                run_step.dependOn(built.run_step);
+                if (selected_example != .all) {
+                    if (b.args) |args| {
+                        built.run_cmd.addArgs(args);
+                    }
                 }
             }
         }
+    }
+
+    if (!selected_example_found) {
+        const fail = b.addFail(b.fmt(
+            "selected example '{s}' is unavailable in this checkout",
+            .{@tagName(selected_example)},
+        ));
+        run_step.dependOn(&fail.step);
     }
 
     const mod_tests = b.addTest(.{ .root_module = webui_mod });
@@ -320,24 +346,31 @@ pub fn build(b: *Build) void {
     mod_tests.linkLibrary(webui_lib);
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const example_shared_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("webui/examples/shared/demo_runner.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = false,
-            .imports = &.{
-                .{ .name = "webui", .module = webui_mod },
-            },
-        }),
-    });
-    example_shared_tests.step.dependOn(runtime_helpers_assets.prepare_step);
-    example_shared_tests.linkLibrary(webui_lib);
-    const run_example_shared_tests = b.addRunArtifact(example_shared_tests);
+    var run_example_shared_tests_step: ?*Build.Step = null;
+    if (example_shared_mod) |shared_mod| {
+        const example_shared_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(example_shared_source_path),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = false,
+                .imports = &.{
+                    .{ .name = "webui", .module = webui_mod },
+                    .{ .name = "example_shared", .module = shared_mod },
+                },
+            }),
+        });
+        example_shared_tests.step.dependOn(runtime_helpers_assets.prepare_step);
+        example_shared_tests.linkLibrary(webui_lib);
+        const run_example_shared_tests = b.addRunArtifact(example_shared_tests);
+        run_example_shared_tests_step = &run_example_shared_tests.step;
+    }
 
     const test_step = b.step("test", "Run Zig tests");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_example_shared_tests.step);
+    if (run_example_shared_tests_step) |step| {
+        test_step.dependOn(step);
+    }
 
     const parity_report_tool = b.addExecutable(.{
         .name = "parity_report",
@@ -382,7 +415,9 @@ pub fn build(b: *Build) void {
 
     const parity_step = b.step("parity-local", "Run local parity checks (tests + examples + static guards)");
     parity_step.dependOn(&run_mod_tests.step);
-    parity_step.dependOn(&run_example_shared_tests.step);
+    if (run_example_shared_tests_step) |step| {
+        parity_step.dependOn(step);
+    }
     parity_step.dependOn(examples_step);
     parity_step.dependOn(parity_report_step);
     parity_step.dependOn(&guards.step);
@@ -517,4 +552,9 @@ fn prepareRuntimeHelpersAssets(
         .embed_path = embed_rel_path,
         .written_path = written_rel_path,
     };
+}
+
+fn pathExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
 }

@@ -127,11 +127,6 @@ async function __webuiRunControlEmulation(mode) {
 
   if (mode === "close_window") {
     await __webuiNotifyLifecycle("window_closing");
-    if (typeof globalThis.close === "function") {
-      try {
-        globalThis.close();
-      } catch (_) {}
-    }
   }
 }
 
@@ -150,15 +145,10 @@ async function __webuiWindowControl(cmd) {
       try {
         await __webuiNotifyLifecycle("window_closing");
       } catch (_) {}
-      if (typeof globalThis.close === "function") {
-        try {
-          globalThis.close();
-        } catch (_) {}
-      }
       return {
-        success: true,
-        emulation: "close_window",
-        closed: true,
+        success: false,
+        emulation: null,
+        closed: false,
         warning: "close control fallback: backend unreachable",
       };
     }
@@ -177,13 +167,6 @@ async function __webuiWindowControl(cmd) {
     } catch (_) {}
   }
 
-  if (result && result.closed === true) {
-    if (typeof globalThis.close === "function") {
-      try {
-        globalThis.close();
-      } catch (_) {}
-    }
-  }
   return result;
 }
 
@@ -227,7 +210,157 @@ async function __webuiGetWindowCapabilities() {
   return payload;
 }
 
+let __webuiSocket = null;
+let __webuiSocketOpen = false;
+let __webuiSocketStopped = false;
+let __webuiSocketReconnectDelayMs = 120;
+let __webuiSocketQueue = [];
+
+function __webuiSocketUrl() {
+  try {
+    if (typeof globalThis === "undefined" || !globalThis.location) return null;
+    const url = new URL(globalThis.location.href);
+    const currentPort = Number(url.port || "0");
+    if (!Number.isFinite(currentPort) || currentPort <= 0) return null;
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.port = String(currentPort + 10000);
+    url.pathname = "/webui/ws";
+    url.search = `client_id=${encodeURIComponent(__webuiClientId)}`;
+    return url.toString();
+  } catch (_) {
+    return null;
+  }
+}
+
+function __webuiSocketSendObject(value) {
+  let payload;
+  try {
+    payload = JSON.stringify(value);
+  } catch (_) {
+    return false;
+  }
+
+  if (__webuiSocketOpen && __webuiSocket && typeof __webuiSocket.send === "function") {
+    try {
+      __webuiSocket.send(payload);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  if (__webuiSocketQueue.length < 256) {
+    __webuiSocketQueue.push(payload);
+  }
+  return false;
+}
+
+function __webuiSocketFlushQueue() {
+  if (!__webuiSocketOpen || !__webuiSocket || typeof __webuiSocket.send !== "function") return;
+  while (__webuiSocketQueue.length > 0) {
+    const payload = __webuiSocketQueue.shift();
+    if (!payload) continue;
+    try {
+      __webuiSocket.send(payload);
+    } catch (_) {
+      __webuiSocketQueue.unshift(payload);
+      break;
+    }
+  }
+}
+
+function __webuiSendCloseAck(closeSignalId) {
+  const id = Number(closeSignalId);
+  if (!Number.isFinite(id) || id <= 0) return false;
+  return __webuiSocketSendObject({
+    type: "close_ack",
+    id: Math.trunc(id),
+    client_id: __webuiClientId,
+  });
+}
+
+function __webuiHandleBackendClose(message) {
+  __webuiSendCloseAck(message && message.id);
+  __webuiSocketStopped = true;
+  setTimeout(() => {
+    if (typeof globalThis.close === "function") {
+      try {
+        globalThis.close();
+      } catch (_) {}
+    }
+  }, 0);
+}
+
+function __webuiHandleSocketMessage(raw) {
+  let payload = raw;
+  if (payload && typeof payload !== "string" && typeof payload.data === "string") {
+    payload = payload.data;
+  }
+  if (typeof payload !== "string" || payload.length === 0) return;
+
+  let message;
+  try {
+    message = JSON.parse(payload);
+  } catch (_) {
+    return;
+  }
+
+  if (!message || typeof message !== "object") return;
+  if (message.type === "backend_close") {
+    __webuiHandleBackendClose(message);
+    return;
+  }
+  if (message.type !== "script_task") return;
+  if (typeof message.script !== "string") return;
+  void __webuiExecuteScriptTask(message);
+}
+
+function __webuiConnectPushSocket() {
+  if (typeof globalThis === "undefined") return;
+  if (__webuiSocketStopped) return;
+  if (typeof globalThis.WebSocket !== "function") return;
+  if (__webuiSocket && (__webuiSocket.readyState === globalThis.WebSocket.CONNECTING || __webuiSocket.readyState === globalThis.WebSocket.OPEN)) return;
+
+  const url = __webuiSocketUrl();
+  if (!url) return;
+
+  let socket;
+  try {
+    socket = new globalThis.WebSocket(url);
+  } catch (_) {
+    setTimeout(__webuiConnectPushSocket, Math.min(2000, __webuiSocketReconnectDelayMs * 2));
+    return;
+  }
+
+  __webuiSocket = socket;
+  socket.onopen = () => {
+    __webuiSocketOpen = true;
+    __webuiSocketReconnectDelayMs = 120;
+    __webuiSocketFlushQueue();
+  };
+  socket.onmessage = (event) => {
+    __webuiHandleSocketMessage(event);
+  };
+  socket.onerror = () => {};
+  socket.onclose = () => {
+    __webuiSocketOpen = false;
+    __webuiSocket = null;
+    if (__webuiSocketStopped) return;
+    const delay = Math.min(1500, __webuiSocketReconnectDelayMs);
+    __webuiSocketReconnectDelayMs = Math.min(2500, __webuiSocketReconnectDelayMs * 2);
+    setTimeout(__webuiConnectPushSocket, delay);
+  };
+}
+
 async function __webuiNotifyLifecycle(eventName) {
+  const message = {
+    type: "lifecycle",
+    event: eventName,
+    client_id: __webuiClientId,
+  };
+
+  if (__webuiSocketSendObject(message)) return;
+
   const payload = JSON.stringify({ event: eventName, client_id: __webuiClientId });
   try {
     if (typeof navigator !== "undefined" && navigator.sendBeacon) {
@@ -262,6 +395,16 @@ async function __webuiExecuteScriptTask(task) {
   }
 
   if (!task.expect_result) return;
+  const responsePayload = {
+    type: "script_response",
+    id: task.id,
+    js_error,
+    value,
+    error_message,
+    client_id: __webuiClientId,
+    connection_id: task.connection_id,
+  };
+  if (__webuiSocketSendObject(responsePayload)) return;
   try {
     await __webuiJson("/webui/script/response", {
       method: "POST",
@@ -277,141 +420,32 @@ async function __webuiExecuteScriptTask(task) {
   } catch (_) {}
 }
 
-(function __webuiInstallScriptLoop() {
+(function __webuiInstallPushChannel() {
   if (typeof globalThis === "undefined") return;
-  if (globalThis.__webuiScriptLoopInstalled) return;
-  globalThis.__webuiScriptLoopInstalled = true;
+  if (globalThis.__webuiPushInstalled) return;
+  globalThis.__webuiPushInstalled = true;
 
-  let stopped = false;
   if (typeof globalThis.addEventListener === "function") {
     globalThis.addEventListener("beforeunload", () => {
-      stopped = true;
+      __webuiSocketStopped = true;
+      __webuiSocketOpen = false;
+      if (__webuiSocket && typeof __webuiSocket.close === "function") {
+        try {
+          __webuiSocket.close();
+        } catch (_) {}
+      }
+      __webuiSocket = null;
     });
   }
-
-  async function loop() {
-    while (!stopped) {
-      try {
-        const res = await fetch("/webui/script/pull", {
-          method: "GET",
-          headers: __webuiRequestHeaders({}),
-          cache: "no-store",
-        });
-        if (res.status === 204) {
-          await new Promise((resolve) => setTimeout(resolve, 90));
-          continue;
-        }
-        if (!res.ok) {
-          await new Promise((resolve) => setTimeout(resolve, 180));
-          continue;
-        }
-        const task = await res.json();
-        if (task && typeof task === "object" && typeof task.script === "string") {
-          await __webuiExecuteScriptTask(task);
-          continue;
-        }
-      } catch (_) {}
-      await new Promise((resolve) => setTimeout(resolve, 90));
-    }
-  }
-
-  void loop();
+  __webuiConnectPushSocket();
 })();
 
 (function __webuiInstallLifecycleHooks() {
   if (typeof globalThis === "undefined" || typeof globalThis.addEventListener !== "function") return;
-
-  const DEFAULT_LIFECYCLE_CONFIG = Object.freeze({
-    enable_heartbeat: true,
-    heartbeat_interval_ms: 6000,
-    heartbeat_hidden_interval_ms: 30000,
-    heartbeat_timeout_ms: 1200,
-    heartbeat_failures_before_close: 3,
-    heartbeat_initial_delay_ms: 1000,
+  globalThis.addEventListener("beforeunload", () => {
+    // beforeunload also fires on reload/navigation, so do not signal hard-close here.
+    __webuiNotifyLifecycle("window_unloading");
   });
-
-  async function __webuiFetchLifecycleConfig() {
-    try {
-      const result = await __webuiJson("/webui/lifecycle/config");
-      if (!result || typeof result !== "object") return DEFAULT_LIFECYCLE_CONFIG;
-      return Object.assign({}, DEFAULT_LIFECYCLE_CONFIG, result);
-    } catch (_) {
-      return DEFAULT_LIFECYCLE_CONFIG;
-    }
-  }
-
-  async function __webuiStartLifecycle() {
-    let lifecycleConfig = await __webuiFetchLifecycleConfig();
-    let lifecycleFailures = 0;
-    let heartbeatTimer = null;
-    let heartbeatActive = false;
-
-    function heartbeatIntervalMs() {
-      if (typeof document !== "undefined" && document.hidden) {
-        return Math.max(1000, Number(lifecycleConfig.heartbeat_hidden_interval_ms) || 0);
-      }
-      return Math.max(1000, Number(lifecycleConfig.heartbeat_interval_ms) || 0);
-    }
-
-    function scheduleHeartbeat(delayMs) {
-      if (!lifecycleConfig.enable_heartbeat) return;
-      if (heartbeatTimer) clearTimeout(heartbeatTimer);
-      heartbeatTimer = setTimeout(() => { void heartbeat(); }, delayMs);
-    }
-
-    async function heartbeat() {
-      if (!lifecycleConfig.enable_heartbeat) return;
-      if (heartbeatActive) return;
-      heartbeatActive = true;
-
-      const timeoutMs = Math.max(250, Number(lifecycleConfig.heartbeat_timeout_ms) || 0);
-      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-      let timeoutHandle = null;
-      if (controller) {
-        timeoutHandle = setTimeout(() => {
-          try { controller.abort(); } catch (_) {}
-        }, timeoutMs);
-      }
-
-      try {
-        await fetch("/webui/lifecycle", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: "{\"event\":\"heartbeat\"}",
-          keepalive: false,
-          signal: controller ? controller.signal : undefined,
-        });
-        lifecycleFailures = 0;
-      } catch (_) {
-        lifecycleFailures += 1;
-        const maxFailures = Math.max(1, Number(lifecycleConfig.heartbeat_failures_before_close) || 0);
-        if (lifecycleFailures >= maxFailures && typeof globalThis.close === "function") {
-          try { globalThis.close(); } catch (_) {}
-        }
-      } finally {
-        heartbeatActive = false;
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-        scheduleHeartbeat(heartbeatIntervalMs());
-      }
-    }
-
-    globalThis.addEventListener("beforeunload", () => {
-      // beforeunload also fires on reload/navigation, so do not signal hard-close here.
-      __webuiNotifyLifecycle("window_unloading");
-    });
-
-    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
-      document.addEventListener("visibilitychange", () => {
-        if (!lifecycleConfig.enable_heartbeat) return;
-        scheduleHeartbeat(heartbeatIntervalMs());
-      });
-    }
-
-    if (lifecycleConfig.enable_heartbeat) {
-      const initialDelay = Math.max(0, Number(lifecycleConfig.heartbeat_initial_delay_ms) || 0);
-      scheduleHeartbeat(initialDelay);
-    }
-  }
 
   if (typeof globalThis !== "undefined") {
     globalThis.__webuiNotifyLifecycle = __webuiNotifyLifecycle;
@@ -421,7 +455,5 @@ async function __webuiExecuteScriptTask(task) {
     globalThis.__webuiGetWindowCapabilities = __webuiGetWindowCapabilities;
     setTimeout(() => { __webuiGetWindowStyle().catch(() => {}); }, 0);
   }
-
-  void __webuiStartLifecycle();
 })();
 

@@ -8,6 +8,7 @@ const core_runtime = @import("ported/webui.zig");
 const browser_discovery = @import("ported/browser_discovery.zig");
 const civetweb = @import("ported/civetweb/civetweb.zig");
 const tls_runtime = @import("network/tls_runtime.zig");
+const websocket = @import("websocket");
 pub const process_signals = @import("process_signals.zig");
 const window_style_types = @import("window_style.zig");
 const webview_backend = @import("ported/webview/backend.zig");
@@ -603,6 +604,75 @@ const RpcRegistryState = struct {
     }
 };
 
+const default_client_token = "default-client";
+
+const WsConnectionState = struct {
+    connection_id: usize,
+    conn: *websocket.Conn,
+};
+
+const ScriptWsContext = struct {
+    state: *WindowState,
+};
+
+const ScriptWsHandler = struct {
+    context: *ScriptWsContext,
+    conn: *websocket.Conn,
+    token: []u8,
+    connection_id: usize = 0,
+
+    pub fn init(handshake: *websocket.Handshake, conn: *websocket.Conn, context: *ScriptWsContext) !ScriptWsHandler {
+        const path_only = pathWithoutQuery(handshake.url);
+        if (!std.mem.eql(u8, path_only, "/webui/ws")) return error.InvalidWebSocketRoute;
+
+        const token = wsClientTokenFromUrl(handshake.url);
+        const token_copy = try context.state.allocator.dupe(u8, token);
+
+        return .{
+            .context = context,
+            .conn = conn,
+            .token = token_copy,
+            .connection_id = 0,
+        };
+    }
+
+    pub fn afterInit(self: *ScriptWsHandler) !void {
+        const state = self.context.state;
+        state.state_mutex.lock();
+        defer state.state_mutex.unlock();
+
+        const client_ref = try state.findOrCreateClientSessionLocked(self.token);
+        self.connection_id = client_ref.connection_id;
+        try state.registerWsConnectionLocked(self.connection_id, self.conn);
+        try state.dispatchPendingScriptTasksLocked();
+
+        if (state.rpc_state.log_enabled) {
+            std.debug.print("[webui.ws] connected connection_id={d}\n", .{self.connection_id});
+        }
+    }
+
+    pub fn clientMessage(self: *ScriptWsHandler, data: []const u8) !void {
+        const state = self.context.state;
+        try state.handleWebSocketClientMessage(data);
+    }
+
+    pub fn close(self: *ScriptWsHandler) void {
+        const state = self.context.state;
+        state.state_mutex.lock();
+        if (self.connection_id != 0) {
+            state.unregisterWsConnectionLocked(self.connection_id);
+        }
+        state.state_mutex.unlock();
+        state.allocator.free(self.token);
+
+        if (state.rpc_state.log_enabled and self.connection_id != 0) {
+            std.debug.print("[webui.ws] disconnected connection_id={d}\n", .{self.connection_id});
+        }
+    }
+};
+
+const ScriptWsServer = websocket.Server(ScriptWsHandler);
+
 const WindowState = struct {
     allocator: std.mem.Allocator,
     id: usize,
@@ -610,6 +680,7 @@ const WindowState = struct {
     transport_mode: TransportMode,
     window_fallback_emulation: bool,
     server_port: u16,
+    ws_port: u16,
     server_bind_public: bool,
     last_html: ?[]u8,
     last_file: ?[]u8,
@@ -637,6 +708,13 @@ const WindowState = struct {
     next_script_id: u64,
     script_pending: std.array_list.Managed(*ScriptTask),
     script_inflight: std.array_list.Managed(*ScriptTask),
+    next_close_signal_id: u64,
+    last_close_ack_id: u64,
+    close_ack_cond: std.Thread.Condition,
+    ws_connections: std.array_list.Managed(WsConnectionState),
+    ws_server: ?*ScriptWsServer,
+    ws_context: ?*ScriptWsContext,
+    ws_thread: ?std.Thread,
 
     state_mutex: std.Thread.Mutex,
     server_thread: ?std.Thread,
@@ -663,6 +741,7 @@ const WindowState = struct {
             .transport_mode = app_options.transport_mode,
             .window_fallback_emulation = app_options.window_fallback_emulation,
             .server_port = core_runtime.nextFallbackPort(id),
+            .ws_port = core_runtime.nextFallbackPort(id) + 10_000,
             .server_bind_public = app_options.public_network,
             .last_html = null,
             .last_file = null,
@@ -690,6 +769,13 @@ const WindowState = struct {
             .next_script_id = 1,
             .script_pending = std.array_list.Managed(*ScriptTask).init(allocator),
             .script_inflight = std.array_list.Managed(*ScriptTask).init(allocator),
+            .next_close_signal_id = 1,
+            .last_close_ack_id = 0,
+            .close_ack_cond = .{},
+            .ws_connections = std.array_list.Managed(WsConnectionState).init(allocator),
+            .ws_server = null,
+            .ws_context = null,
+            .ws_thread = null,
             .state_mutex = .{},
             .server_thread = null,
             .server_stop = std.atomic.Value(bool).init(false),
@@ -835,6 +921,9 @@ const WindowState = struct {
         if (cmd == .close and !self.requestClose()) {
             return error.CloseDenied;
         }
+        if (cmd == .close) {
+            self.notifyFrontendCloseLocked("window-control-close", 250);
+        }
 
         if (self.isNativeWindowActive()) {
             const native_ok = blk: {
@@ -856,6 +945,15 @@ const WindowState = struct {
             }
         }
 
+        if (cmd == .close) {
+            return .{
+                .success = true,
+                .emulation = null,
+                .closed = true,
+                .warning = self.last_warning,
+            };
+        }
+
         if (!self.window_fallback_emulation) return error.UnsupportedWindowControl;
 
         return switch (cmd) {
@@ -870,7 +968,7 @@ const WindowState = struct {
                 self.current_style.hidden = false;
                 break :blk .{ .success = true, .emulation = "show_page", .closed = false, .warning = self.last_warning };
             },
-            .close => .{ .success = true, .emulation = "close_window", .closed = true, .warning = self.last_warning },
+            .close => unreachable,
         };
     }
 
@@ -1067,7 +1165,162 @@ const WindowState = struct {
         const task = try ScriptTask.init(allocator, self.next_script_id, script, target_connection, expect_result);
         self.next_script_id += 1;
         try self.script_pending.append(task);
+        try self.dispatchPendingScriptTasksLocked();
         return task;
+    }
+
+    fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, conn: *websocket.Conn) !void {
+        for (self.ws_connections.items) |*entry| {
+            if (entry.connection_id != connection_id) continue;
+            entry.conn = conn;
+            return;
+        }
+        try self.ws_connections.append(.{
+            .connection_id = connection_id,
+            .conn = conn,
+        });
+    }
+
+    fn unregisterWsConnectionLocked(self: *WindowState, connection_id: usize) void {
+        for (self.ws_connections.items, 0..) |entry, idx| {
+            if (entry.connection_id != connection_id) continue;
+            _ = self.ws_connections.orderedRemove(idx);
+            return;
+        }
+    }
+
+    fn findWsConnectionByIdLocked(self: *WindowState, connection_id: usize) ?*WsConnectionState {
+        for (self.ws_connections.items) |*entry| {
+            if (entry.connection_id == connection_id) return entry;
+        }
+        return null;
+    }
+
+    fn firstWsConnectionLocked(self: *WindowState) ?*WsConnectionState {
+        if (self.ws_connections.items.len == 0) return null;
+        return &self.ws_connections.items[0];
+    }
+
+    fn clientIdForConnectionLocked(self: *const WindowState, connection_id: usize) ?usize {
+        for (self.client_sessions.items) |session| {
+            if (session.connection_id == connection_id) return session.client_id;
+        }
+        return null;
+    }
+
+    fn dispatchPendingScriptTasksLocked(self: *WindowState) !void {
+        var idx: usize = 0;
+        while (idx < self.script_pending.items.len) {
+            const task = self.script_pending.items[idx];
+
+            const ws_entry = if (task.target_connection) |target_connection|
+                self.findWsConnectionByIdLocked(target_connection)
+            else
+                self.firstWsConnectionLocked();
+
+            if (ws_entry == null) {
+                idx += 1;
+                continue;
+            }
+
+            const entry = ws_entry.?;
+            const client_id = self.clientIdForConnectionLocked(entry.connection_id) orelse 0;
+            const payload = try std.json.Stringify.valueAlloc(self.allocator, .{
+                .type = "script_task",
+                .id = task.id,
+                .script = task.script,
+                .expect_result = task.expect_result,
+                .client_id = client_id,
+                .connection_id = entry.connection_id,
+            }, .{});
+            defer self.allocator.free(payload);
+
+            entry.conn.write(payload) catch |err| {
+                if (self.rpc_state.log_enabled) {
+                    std.debug.print(
+                        "[webui.ws] send failed connection_id={d} err={s}\n",
+                        .{ entry.connection_id, @errorName(err) },
+                    );
+                }
+                self.unregisterWsConnectionLocked(entry.connection_id);
+                idx += 1;
+                continue;
+            };
+
+            _ = self.script_pending.orderedRemove(idx);
+
+            if (task.expect_result) {
+                try self.script_inflight.append(task);
+            } else {
+                task.mutex.lock();
+                task.done = true;
+                task.cond.signal();
+                task.mutex.unlock();
+                task.deinit();
+            }
+        }
+    }
+
+    fn pushBackendCloseSignalLocked(self: *WindowState, reason: []const u8) !u64 {
+        if (self.ws_connections.items.len == 0) return 0;
+
+        const signal_id = self.next_close_signal_id;
+        self.next_close_signal_id += 1;
+
+        const payload = try std.json.Stringify.valueAlloc(self.allocator, .{
+            .type = "backend_close",
+            .id = signal_id,
+            .reason = reason,
+        }, .{});
+        defer self.allocator.free(payload);
+
+        var sent_any = false;
+        var idx: usize = 0;
+        while (idx < self.ws_connections.items.len) {
+            const entry = self.ws_connections.items[idx];
+            entry.conn.write(payload) catch |err| {
+                if (self.rpc_state.log_enabled) {
+                    std.debug.print(
+                        "[webui.ws] close signal write failed connection_id={d} err={s}\n",
+                        .{ entry.connection_id, @errorName(err) },
+                    );
+                }
+                _ = self.ws_connections.orderedRemove(idx);
+                continue;
+            };
+            sent_any = true;
+            idx += 1;
+        }
+
+        if (!sent_any) return 0;
+        return signal_id;
+    }
+
+    fn waitForCloseAckLocked(self: *WindowState, signal_id: u64, timeout_ms: u32) bool {
+        if (signal_id == 0) return false;
+        const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
+        const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
+
+        while (self.last_close_ack_id < signal_id) {
+            const now = std.time.nanoTimestamp();
+            if (now >= deadline) break;
+            const remaining = @as(u64, @intCast(deadline - now));
+            self.close_ack_cond.timedWait(&self.state_mutex, remaining) catch break;
+        }
+        return self.last_close_ack_id >= signal_id;
+    }
+
+    fn notifyFrontendCloseLocked(self: *WindowState, reason: []const u8, timeout_ms: u32) void {
+        const signal_id = self.pushBackendCloseSignalLocked(reason) catch 0;
+        if (signal_id == 0) return;
+
+        const acked = self.waitForCloseAckLocked(signal_id, timeout_ms);
+        if (self.rpc_state.log_enabled) {
+            std.debug.print(
+                "[webui.ws] close signal id={d} acked={any}\n",
+                .{ signal_id, acked },
+            );
+        }
     }
 
     fn removeScriptPendingLocked(self: *WindowState, task: *ScriptTask) bool {
@@ -1147,6 +1400,78 @@ const WindowState = struct {
         task.mutex.unlock();
     }
 
+    fn handleWebSocketClientMessage(self: *WindowState, data: []const u8) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return;
+        const msg_type_value = parsed.value.object.get("type") orelse return;
+        if (msg_type_value != .string) return;
+
+        if (std.mem.eql(u8, msg_type_value.string, "close_ack")) {
+            const id_value = parsed.value.object.get("id") orelse return;
+            const ack_id: u64 = switch (id_value) {
+                .integer => |v| @as(u64, @intCast(v)),
+                .float => |v| @as(u64, @intFromFloat(v)),
+                else => return,
+            };
+
+            self.state_mutex.lock();
+            if (ack_id > self.last_close_ack_id) {
+                self.last_close_ack_id = ack_id;
+            }
+            self.close_ack_cond.broadcast();
+            self.state_mutex.unlock();
+            return;
+        }
+
+        if (std.mem.eql(u8, msg_type_value.string, "lifecycle")) {
+            const event_value = parsed.value.object.get("event") orelse return;
+            if (event_value != .string) return;
+            if (!std.mem.eql(u8, event_value.string, "window_closing")) return;
+
+            self.state_mutex.lock();
+            self.requestLifecycleCloseFromFrontend();
+            self.state_mutex.unlock();
+            return;
+        }
+
+        if (!std.mem.eql(u8, msg_type_value.string, "script_response")) return;
+
+        const id_value = parsed.value.object.get("id") orelse return;
+        const task_id: u64 = switch (id_value) {
+            .integer => |v| @as(u64, @intCast(v)),
+            .float => |v| @as(u64, @intFromFloat(v)),
+            else => return,
+        };
+
+        const js_error = if (parsed.value.object.get("js_error")) |err_val|
+            switch (err_val) {
+                .bool => |b| b,
+                else => false,
+            }
+        else
+            false;
+
+        const value_json = if (parsed.value.object.get("value")) |value|
+            try std.json.Stringify.valueAlloc(self.allocator, value, .{})
+        else
+            null;
+        defer if (value_json) |buf| self.allocator.free(buf);
+
+        const error_message = if (parsed.value.object.get("error_message")) |err_msg|
+            switch (err_msg) {
+                .string => |msg| msg,
+                else => null,
+            }
+        else
+            null;
+
+        self.state_mutex.lock();
+        _ = try self.completeScriptTaskLocked(task_id, js_error, value_json, error_message);
+        self.state_mutex.unlock();
+    }
+
     fn deinit(self: *WindowState, allocator: std.mem.Allocator) void {
         self.stopServer();
 
@@ -1173,6 +1498,7 @@ const WindowState = struct {
             task.deinit();
         }
         self.script_inflight.deinit();
+        self.ws_connections.deinit();
 
         self.terminateLaunchedBrowser(allocator);
         self.backend.destroyWindow();
@@ -1200,6 +1526,7 @@ const WindowState = struct {
         }
 
         if (!self.server_listen_ok) return error.ServerStartFailed;
+        try self.ensureWebSocketStarted();
     }
 
     fn ensureServerReachable(self: *WindowState) !void {
@@ -1226,6 +1553,80 @@ const WindowState = struct {
             thread.join();
             self.server_thread = null;
         }
+
+        self.stopWebSocket();
+    }
+
+    fn ensureWebSocketStarted(self: *WindowState) !void {
+        if (self.ws_server != null) return;
+
+        const bind_host = if (self.server_bind_public) "0.0.0.0" else "127.0.0.1";
+
+        const server = try self.allocator.create(ScriptWsServer);
+        errdefer self.allocator.destroy(server);
+
+        server.* = try ScriptWsServer.init(self.allocator, .{
+            .port = self.ws_port,
+            .address = bind_host,
+            .handshake = .{
+                .timeout = 3,
+                .max_size = 8 * 1024,
+                .max_headers = 16,
+            },
+        });
+        errdefer server.deinit();
+
+        const context = try self.allocator.create(ScriptWsContext);
+        errdefer self.allocator.destroy(context);
+        context.* = .{ .state = self };
+
+        const ws_thread = try server.listenInNewThread(context);
+
+        self.ws_server = server;
+        self.ws_context = context;
+        self.ws_thread = ws_thread;
+
+        if (self.rpc_state.log_enabled) {
+            std.debug.print("[webui.ws] listening on {d}\n", .{self.ws_port});
+        }
+    }
+
+    fn stopWebSocket(self: *WindowState) void {
+        if (self.ws_server) |server| {
+            if (builtin.os.tag == .windows) {
+                stopWebSocketServerCompat(server);
+            } else {
+                server.stop();
+            }
+            if (self.ws_thread) |thread| {
+                thread.join();
+            }
+            server.deinit();
+            self.allocator.destroy(server);
+            self.ws_server = null;
+            self.ws_thread = null;
+        }
+
+        if (self.ws_context) |context| {
+            self.allocator.destroy(context);
+            self.ws_context = null;
+        }
+
+        self.ws_connections.clearRetainingCapacity();
+    }
+
+    fn stopWebSocketServerCompat(server: *ScriptWsServer) void {
+        server._mut.lock();
+        defer server._mut.unlock();
+
+        for (server._signals) |signal_fd| {
+            if (comptime websocket.blockingMode()) {
+                const sock: std.posix.socket_t = @ptrCast(signal_fd);
+                std.posix.shutdown(sock, .recv) catch {};
+            }
+            std.posix.close(signal_fd);
+        }
+        server._cond.wait(&server._mut);
     }
 
     fn serverThreadMain(self: *WindowState) void {
@@ -1388,6 +1789,10 @@ pub const App = struct {
         self.shutdown_requested = true;
 
         for (self.windows.items) |*state| {
+            state.state_mutex.lock();
+            state.close_requested.store(true, .release);
+            state.notifyFrontendCloseLocked("app-shutdown", 250);
+            state.state_mutex.unlock();
             state.terminateLaunchedBrowser(self.allocator);
             state.stopServer();
             if (state.event_callback.handler) |handler| {
@@ -2261,8 +2666,6 @@ fn handleLifecycleRoute(
     return true;
 }
 
-const default_client_token = "default-client";
-
 fn handleScriptPullRoute(
     state: *WindowState,
     allocator: std.mem.Allocator,
@@ -2398,6 +2801,21 @@ fn handleScriptResponseRoute(
 
 fn pathWithoutQuery(path: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, path, '?')) |q| path[0..q] else path;
+}
+
+fn wsClientTokenFromUrl(url: []const u8) []const u8 {
+    const query_start = std.mem.indexOfScalar(u8, url, '?') orelse return default_client_token;
+    var pair_it = std.mem.splitScalar(u8, url[query_start + 1 ..], '&');
+    while (pair_it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        if (!std.mem.eql(u8, key, "client_id")) continue;
+        const value = pair[eq + 1 ..];
+        if (value.len == 0) return default_client_token;
+        return value;
+    }
+    return default_client_token;
 }
 
 fn httpHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
@@ -2669,7 +3087,17 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpRe
     var content_length: usize = 0;
 
     while (true) {
-        const read_n = try stream.read(&scratch);
+        const read_n = std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.SocketNotConnected,
+            => break,
+            else => return err,
+        };
         if (read_n == 0) break;
         try buf.appendSlice(scratch[0..read_n]);
 
@@ -2764,8 +3192,15 @@ fn readAllFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, max_b
 
     var scratch: [4096]u8 = undefined;
     while (true) {
-        const n = stream.read(&scratch) catch |err| switch (err) {
-            error.ConnectionResetByPeer => break,
+        const n = std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.SocketNotConnected,
+            => break,
             else => return err,
         };
         if (n == 0) break;
@@ -3230,7 +3665,26 @@ test "window control close handler veto and allow" {
     allow_close = true;
     const close_result = try win.control(.close);
     try std.testing.expect(close_result.closed);
+    try std.testing.expect(close_result.emulation == null);
     try std.testing.expect(win.state().close_requested.load(.acquire));
+}
+
+test "close control remains backend-driven when emulation is disabled" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .transport_mode = .browser_fallback,
+        .window_fallback_emulation = false,
+        .auto_open_browser = false,
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{});
+    const close_result = try win.control(.close);
+    try std.testing.expect(close_result.success);
+    try std.testing.expect(close_result.closed);
+    try std.testing.expect(close_result.emulation == null);
 }
 
 test "native backend unavailability returns warnings and falls back to emulation" {
@@ -3313,6 +3767,11 @@ test "window control and style routes roundtrip" {
     const style_get_res = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/webui/window/style", null);
     defer gpa.allocator().free(style_get_res);
     try std.testing.expect(std.mem.indexOf(u8, style_get_res, "\"transparent\":true") != null);
+
+    const close_res = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/window/control", "{\"cmd\":\"close\"}");
+    defer gpa.allocator().free(close_res);
+    try std.testing.expect(std.mem.indexOf(u8, close_res, "\"closed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, close_res, "\"emulation\":null") != null);
 }
 
 test "typed rpc registration, invocation, and bridge generation" {
