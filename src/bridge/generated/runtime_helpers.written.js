@@ -223,10 +223,7 @@ function __webuiSocketUrl() {
   try {
     if (typeof globalThis === "undefined" || !globalThis.location) return null;
     const url = new URL(globalThis.location.href);
-    const currentPort = Number(url.port || "0");
-    if (!Number.isFinite(currentPort) || currentPort <= 0) return null;
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    url.port = String(currentPort + 10000);
     url.pathname = "/webui/ws";
     url.search = `client_id=${encodeURIComponent(__webuiClientId)}`;
     return url.toString();

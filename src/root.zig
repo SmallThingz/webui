@@ -581,70 +581,8 @@ const default_client_token = "default-client";
 
 const WsConnectionState = struct {
     connection_id: usize,
-    conn: *websocket.Conn,
+    stream: std.net.Stream,
 };
-
-const ScriptWsContext = struct {
-    state: *WindowState,
-};
-
-const ScriptWsHandler = struct {
-    context: *ScriptWsContext,
-    conn: *websocket.Conn,
-    token: []u8,
-    connection_id: usize = 0,
-
-    pub fn init(handshake: *websocket.Handshake, conn: *websocket.Conn, context: *ScriptWsContext) !ScriptWsHandler {
-        const path_only = pathWithoutQuery(handshake.url);
-        if (!std.mem.eql(u8, path_only, "/webui/ws")) return error.InvalidWebSocketRoute;
-
-        const token = wsClientTokenFromUrl(handshake.url);
-        const token_copy = try context.state.allocator.dupe(u8, token);
-
-        return .{
-            .context = context,
-            .conn = conn,
-            .token = token_copy,
-            .connection_id = 0,
-        };
-    }
-
-    pub fn afterInit(self: *ScriptWsHandler) !void {
-        const state = self.context.state;
-        state.state_mutex.lock();
-        defer state.state_mutex.unlock();
-
-        const client_ref = try state.findOrCreateClientSessionLocked(self.token);
-        self.connection_id = client_ref.connection_id;
-        try state.registerWsConnectionLocked(self.connection_id, self.conn);
-        try state.dispatchPendingScriptTasksLocked();
-
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.ws] connected connection_id={d}\n", .{self.connection_id});
-        }
-    }
-
-    pub fn clientMessage(self: *ScriptWsHandler, data: []const u8) !void {
-        const state = self.context.state;
-        try state.handleWebSocketClientMessage(data);
-    }
-
-    pub fn close(self: *ScriptWsHandler) void {
-        const state = self.context.state;
-        state.state_mutex.lock();
-        if (self.connection_id != 0) {
-            state.unregisterWsConnectionLocked(self.connection_id);
-        }
-        state.state_mutex.unlock();
-        state.allocator.free(self.token);
-
-        if (state.rpc_state.log_enabled and self.connection_id != 0) {
-            std.debug.print("[webui.ws] disconnected connection_id={d}\n", .{self.connection_id});
-        }
-    }
-};
-
-const ScriptWsServer = websocket.Server(ScriptWsHandler);
 
 const WindowState = struct {
     allocator: std.mem.Allocator,
@@ -653,7 +591,6 @@ const WindowState = struct {
     transport_mode: TransportMode,
     window_fallback_emulation: bool,
     server_port: u16,
-    ws_port: u16,
     server_bind_public: bool,
     last_html: ?[]u8,
     last_file: ?[]u8,
@@ -685,9 +622,6 @@ const WindowState = struct {
     last_close_ack_id: u64,
     close_ack_cond: std.Thread.Condition,
     ws_connections: std.array_list.Managed(WsConnectionState),
-    ws_server: ?*ScriptWsServer,
-    ws_context: ?*ScriptWsContext,
-    ws_thread: ?std.Thread,
 
     state_mutex: std.Thread.Mutex,
     server_thread: ?std.Thread,
@@ -714,7 +648,6 @@ const WindowState = struct {
             .transport_mode = app_options.transport_mode,
             .window_fallback_emulation = app_options.window_fallback_emulation,
             .server_port = core_runtime.nextFallbackPort(id),
-            .ws_port = core_runtime.nextFallbackPort(id) + 10_000,
             .server_bind_public = app_options.public_network,
             .last_html = null,
             .last_file = null,
@@ -746,9 +679,6 @@ const WindowState = struct {
             .last_close_ack_id = 0,
             .close_ack_cond = .{},
             .ws_connections = std.array_list.Managed(WsConnectionState).init(allocator),
-            .ws_server = null,
-            .ws_context = null,
-            .ws_thread = null,
             .state_mutex = .{},
             .server_thread = null,
             .server_stop = std.atomic.Value(bool).init(false),
@@ -1133,15 +1063,47 @@ const WindowState = struct {
         return task;
     }
 
-    fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, conn: *websocket.Conn) !void {
+    fn writeSocketAll(handle: std.posix.socket_t, bytes: []const u8) !void {
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const n = std.posix.send(handle, bytes[sent..], 0) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.Thread.sleep(std.time.ns_per_ms);
+                    continue;
+                },
+                error.BrokenPipe,
+                error.ConnectionResetByPeer,
+                => return error.Closed,
+                else => return err,
+            };
+            if (n == 0) return error.Closed;
+            sent += n;
+        }
+    }
+
+    fn writeWsFrame(stream: std.net.Stream, opcode: websocket.OpCode, payload: []const u8) !void {
+        var header_buf: [10]u8 = undefined;
+        const header = websocket.proto.writeFrameHeader(&header_buf, opcode, payload.len, false);
+        try writeSocketAll(stream.handle, header);
+        if (payload.len > 0) {
+            try writeSocketAll(stream.handle, payload);
+        }
+    }
+
+    fn sendWsTextLocked(_: *WindowState, stream: std.net.Stream, payload: []const u8) !void {
+        try writeWsFrame(stream, .text, payload);
+    }
+
+    fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, stream: std.net.Stream) !void {
         for (self.ws_connections.items) |*entry| {
             if (entry.connection_id != connection_id) continue;
-            entry.conn = conn;
+            entry.stream.close();
+            entry.stream = stream;
             return;
         }
         try self.ws_connections.append(.{
             .connection_id = connection_id,
-            .conn = conn,
+            .stream = stream,
         });
     }
 
@@ -1151,6 +1113,22 @@ const WindowState = struct {
             _ = self.ws_connections.orderedRemove(idx);
             return;
         }
+    }
+
+    fn closeWsConnectionLocked(self: *WindowState, connection_id: usize) void {
+        for (self.ws_connections.items, 0..) |entry, idx| {
+            if (entry.connection_id != connection_id) continue;
+            entry.stream.close();
+            _ = self.ws_connections.orderedRemove(idx);
+            return;
+        }
+    }
+
+    fn closeAllWsConnectionsLocked(self: *WindowState) void {
+        for (self.ws_connections.items) |entry| {
+            entry.stream.close();
+        }
+        self.ws_connections.clearRetainingCapacity();
     }
 
     fn findWsConnectionByIdLocked(self: *WindowState, connection_id: usize) ?*WsConnectionState {
@@ -1199,14 +1177,14 @@ const WindowState = struct {
             }, .{});
             defer self.allocator.free(payload);
 
-            entry.conn.write(payload) catch |err| {
+            self.sendWsTextLocked(entry.stream, payload) catch |err| {
                 if (self.rpc_state.log_enabled) {
                     std.debug.print(
                         "[webui.ws] send failed connection_id={d} err={s}\n",
                         .{ entry.connection_id, @errorName(err) },
                     );
                 }
-                self.unregisterWsConnectionLocked(entry.connection_id);
+                self.closeWsConnectionLocked(entry.connection_id);
                 idx += 1;
                 continue;
             };
@@ -1242,14 +1220,14 @@ const WindowState = struct {
         var idx: usize = 0;
         while (idx < self.ws_connections.items.len) {
             const entry = self.ws_connections.items[idx];
-            entry.conn.write(payload) catch |err| {
+            self.sendWsTextLocked(entry.stream, payload) catch |err| {
                 if (self.rpc_state.log_enabled) {
                     std.debug.print(
                         "[webui.ws] close signal write failed connection_id={d} err={s}\n",
                         .{ entry.connection_id, @errorName(err) },
                     );
                 }
-                _ = self.ws_connections.orderedRemove(idx);
+                self.closeWsConnectionLocked(entry.connection_id);
                 continue;
             };
             sent_any = true;
@@ -1490,7 +1468,6 @@ const WindowState = struct {
         }
 
         if (!self.server_listen_ok) return error.ServerStartFailed;
-        try self.ensureWebSocketStarted();
     }
 
     fn ensureServerReachable(self: *WindowState) !void {
@@ -1517,80 +1494,9 @@ const WindowState = struct {
             thread.join();
             self.server_thread = null;
         }
-
-        self.stopWebSocket();
-    }
-
-    fn ensureWebSocketStarted(self: *WindowState) !void {
-        if (self.ws_server != null) return;
-
-        const bind_host = if (self.server_bind_public) "0.0.0.0" else "127.0.0.1";
-
-        const server = try self.allocator.create(ScriptWsServer);
-        errdefer self.allocator.destroy(server);
-
-        server.* = try ScriptWsServer.init(self.allocator, .{
-            .port = self.ws_port,
-            .address = bind_host,
-            .handshake = .{
-                .timeout = 3,
-                .max_size = 8 * 1024,
-                .max_headers = 16,
-            },
-        });
-        errdefer server.deinit();
-
-        const context = try self.allocator.create(ScriptWsContext);
-        errdefer self.allocator.destroy(context);
-        context.* = .{ .state = self };
-
-        const ws_thread = try server.listenInNewThread(context);
-
-        self.ws_server = server;
-        self.ws_context = context;
-        self.ws_thread = ws_thread;
-
-        if (self.rpc_state.log_enabled) {
-            std.debug.print("[webui.ws] listening on {d}\n", .{self.ws_port});
-        }
-    }
-
-    fn stopWebSocket(self: *WindowState) void {
-        if (self.ws_server) |server| {
-            if (builtin.os.tag == .windows) {
-                stopWebSocketServerCompat(server);
-            } else {
-                server.stop();
-            }
-            if (self.ws_thread) |thread| {
-                thread.join();
-            }
-            server.deinit();
-            self.allocator.destroy(server);
-            self.ws_server = null;
-            self.ws_thread = null;
-        }
-
-        if (self.ws_context) |context| {
-            self.allocator.destroy(context);
-            self.ws_context = null;
-        }
-
-        self.ws_connections.clearRetainingCapacity();
-    }
-
-    fn stopWebSocketServerCompat(server: *ScriptWsServer) void {
-        server._mut.lock();
-        defer server._mut.unlock();
-
-        for (server._signals) |signal_fd| {
-            if (comptime websocket.blockingMode()) {
-                const sock: std.posix.socket_t = @ptrCast(signal_fd);
-                std.posix.shutdown(sock, .recv) catch {};
-            }
-            std.posix.close(signal_fd);
-        }
-        server._cond.wait(&server._mut);
+        self.state_mutex.lock();
+        self.closeAllWsConnectionsLocked();
+        self.state_mutex.unlock();
     }
 
     fn serverThreadMain(self: *WindowState) void {
@@ -1630,8 +1536,13 @@ const WindowState = struct {
                     else => continue,
                 }
             };
-            defer conn.stream.close();
-            handleConnection(self, std.heap.page_allocator, conn.stream) catch {};
+            const transfer_ownership = handleConnection(self, std.heap.page_allocator, conn.stream) catch {
+                conn.stream.close();
+                continue;
+            };
+            if (!transfer_ownership) {
+                conn.stream.close();
+            }
         }
     }
 };
@@ -2541,22 +2452,250 @@ const HttpRequest = struct {
     body: []const u8,
 };
 
-fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: std.net.Stream) !void {
+const WsInboundType = enum {
+    text,
+    binary,
+    ping,
+    pong,
+    close,
+};
+
+const WsInboundFrame = struct {
+    kind: WsInboundType,
+    payload: []u8,
+};
+
+fn readSocketExact(handle: std.posix.socket_t, out: []u8) !void {
+    var offset: usize = 0;
+    while (offset < out.len) {
+        const n = std.posix.recv(handle, out[offset..], 0) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.SocketNotConnected,
+            => return error.Closed,
+            else => return err,
+        };
+        if (n == 0) return error.Closed;
+        offset += n;
+    }
+}
+
+fn decodeWsOpcode(byte: u8) !WsInboundType {
+    return switch (byte & 0x0F) {
+        0x1 => .text,
+        0x2 => .binary,
+        0x8 => .close,
+        0x9 => .ping,
+        0xA => .pong,
+        else => error.UnsupportedWebSocketOpcode,
+    };
+}
+
+fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream, max_payload_size: usize) !WsInboundFrame {
+    var header: [2]u8 = undefined;
+    try readSocketExact(stream.handle, &header);
+
+    const fin = (header[0] & 0x80) != 0;
+    if (!fin) return error.UnsupportedWebSocketFragmentation;
+
+    const kind = try decodeWsOpcode(header[0]);
+    const masked = (header[1] & 0x80) != 0;
+    if (!masked) return error.InvalidWebSocketMasking;
+
+    var payload_len_u64: u64 = header[1] & 0x7F;
+    if (payload_len_u64 == 126) {
+        var ext: [2]u8 = undefined;
+        try readSocketExact(stream.handle, &ext);
+        payload_len_u64 = (@as(u64, ext[0]) << 8) | @as(u64, ext[1]);
+    } else if (payload_len_u64 == 127) {
+        var ext: [8]u8 = undefined;
+        try readSocketExact(stream.handle, &ext);
+        payload_len_u64 =
+            (@as(u64, ext[0]) << 56) |
+            (@as(u64, ext[1]) << 48) |
+            (@as(u64, ext[2]) << 40) |
+            (@as(u64, ext[3]) << 32) |
+            (@as(u64, ext[4]) << 24) |
+            (@as(u64, ext[5]) << 16) |
+            (@as(u64, ext[6]) << 8) |
+            (@as(u64, ext[7]));
+    }
+
+    if (payload_len_u64 > max_payload_size) return error.WebSocketMessageTooLarge;
+    const payload_len: usize = @intCast(payload_len_u64);
+
+    var masking_key: [4]u8 = undefined;
+    try readSocketExact(stream.handle, &masking_key);
+
+    const payload = try allocator.alloc(u8, payload_len);
+    errdefer allocator.free(payload);
+
+    if (payload_len > 0) {
+        try readSocketExact(stream.handle, payload);
+        for (payload, 0..) |byte, i| {
+            payload[i] = byte ^ masking_key[i & 3];
+        }
+    }
+
+    return .{
+        .kind = kind,
+        .payload = payload,
+    };
+}
+
+fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |part| {
+        const normalized = std.mem.trim(u8, part, " \t");
+        if (std.ascii.eqlIgnoreCase(normalized, token)) return true;
+    }
+    return false;
+}
+
+fn writeWebSocketHandshakeResponse(stream: std.net.Stream, sec_key: []const u8) !void {
+    var sha1_digest: [20]u8 = undefined;
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update(sec_key);
+    hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    hasher.final(&sha1_digest);
+
+    var accept_key: [28]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&accept_key, &sha1_digest);
+
+    var response_buf: [512]u8 = undefined;
+    const response = try std.fmt.bufPrint(
+        &response_buf,
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n\r\n",
+        .{accept_key},
+    );
+
+    try WindowState.writeSocketAll(stream.handle, response);
+}
+
+fn wsConnectionThreadMain(state: *WindowState, stream: std.net.Stream, connection_id: usize) void {
+    defer {
+        state.state_mutex.lock();
+        state.unregisterWsConnectionLocked(connection_id);
+        state.state_mutex.unlock();
+        stream.close();
+
+        if (state.rpc_state.log_enabled) {
+            std.debug.print("[webui.ws] disconnected connection_id={d}\n", .{connection_id});
+        }
+    }
+
+    while (!state.server_stop.load(.acquire)) {
+        const frame = readWsInboundFrameAlloc(state.allocator, stream, 8 * 1024 * 1024) catch |err| {
+            if (state.rpc_state.log_enabled and err != error.Closed) {
+                std.debug.print("[webui.ws] read failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
+            }
+            return;
+        };
+        defer state.allocator.free(frame.payload);
+
+        switch (frame.kind) {
+            .text, .binary => {
+                state.handleWebSocketClientMessage(frame.payload) catch |err| {
+                    if (state.rpc_state.log_enabled) {
+                        std.debug.print("[webui.ws] message handling failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
+                    }
+                };
+            },
+            .ping => {
+                WindowState.writeWsFrame(stream, .pong, frame.payload) catch return;
+            },
+            .pong => {},
+            .close => {
+                WindowState.writeWsFrame(stream, .close, frame.payload) catch {};
+                return;
+            },
+        }
+    }
+}
+
+fn handleWebSocketUpgradeRoute(state: *WindowState, stream: std.net.Stream, request: HttpRequest, path_only: []const u8) !bool {
+    if (!std.mem.eql(u8, request.method, "GET")) return false;
+    if (!std.mem.eql(u8, path_only, "/webui/ws")) return false;
+
+    const upgrade = httpHeaderValue(request.headers, "Upgrade") orelse {
+        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Upgrade header");
+        return false;
+    };
+    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) {
+        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "invalid Upgrade header");
+        return false;
+    }
+
+    const connection = httpHeaderValue(request.headers, "Connection") orelse {
+        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Connection header");
+        return false;
+    };
+    if (!containsTokenIgnoreCase(connection, "upgrade")) {
+        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "invalid Connection header");
+        return false;
+    }
+
+    const version = httpHeaderValue(request.headers, "Sec-WebSocket-Version") orelse {
+        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Version header");
+        return false;
+    };
+    if (!std.mem.eql(u8, std.mem.trim(u8, version, " \t"), "13")) {
+        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "unsupported websocket version");
+        return false;
+    }
+
+    const sec_key = httpHeaderValue(request.headers, "Sec-WebSocket-Key") orelse {
+        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Key header");
+        return false;
+    };
+
+    try writeWebSocketHandshakeResponse(stream, sec_key);
+
+    const token = wsClientTokenFromUrl(request.path);
+    var connection_id: usize = 0;
+    state.state_mutex.lock();
+    {
+        const client_ref = try state.findOrCreateClientSessionLocked(token);
+        connection_id = client_ref.connection_id;
+        try state.registerWsConnectionLocked(connection_id, stream);
+        try state.dispatchPendingScriptTasksLocked();
+    }
+    state.state_mutex.unlock();
+
+    if (state.rpc_state.log_enabled) {
+        std.debug.print("[webui.ws] connected connection_id={d}\n", .{connection_id});
+    }
+
+    const thread = try std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, stream, connection_id });
+    thread.detach();
+    return true;
+}
+
+fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: std.net.Stream) !bool {
     const request = try readHttpRequest(allocator, stream);
     defer allocator.free(request.raw);
 
     const path_only = pathWithoutQuery(request.path);
+    if (try handleWebSocketUpgradeRoute(state, stream, request, path_only)) return true;
 
-    if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return;
-    if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return;
-    if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return;
-    if (try handleScriptPullRoute(state, allocator, stream, request.method, path_only, request.headers)) return;
-    if (try handleScriptResponseRoute(state, allocator, stream, request.method, path_only, request.body)) return;
-    if (try handleWindowControlRoute(state, allocator, stream, request.method, path_only, request.body)) return;
-    if (try handleWindowStyleRoute(state, allocator, stream, request.method, path_only, request.body)) return;
-    if (try handleWindowContentRoute(state, allocator, stream, request.method, path_only)) return;
+    if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return false;
+    if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
+    if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
+    if (try handleScriptPullRoute(state, allocator, stream, request.method, path_only, request.headers)) return false;
+    if (try handleScriptResponseRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
+    if (try handleWindowControlRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
+    if (try handleWindowStyleRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
+    if (try handleWindowContentRoute(state, allocator, stream, request.method, path_only)) return false;
 
     try writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "not found");
+    return false;
 }
 
 fn handleLifecycleRoute(
@@ -3196,6 +3335,32 @@ fn httpRoundTripWithHeaders(
     return readAllFromStream(allocator, stream, 1024 * 1024);
 }
 
+fn readHttpHeadersFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    var scratch: [512]u8 = undefined;
+    while (out.items.len < max_bytes) {
+        const n = std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.SocketNotConnected,
+            => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        if (out.items.len + n > max_bytes) return error.ResponseTooLarge;
+        try out.appendSlice(scratch[0..n]);
+        if (std.mem.indexOf(u8, out.items, "\r\n\r\n") != null) break;
+    }
+
+    return out.toOwnedSlice();
+}
+
 fn httpResponseBody(response: []const u8) []const u8 {
     const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
     return response[header_end + 4 ..];
@@ -3299,6 +3464,42 @@ test "public network mode binds server with public listen policy" {
     const response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/", null);
     defer gpa.allocator().free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "public-network-ok") != null);
+}
+
+test "websocket upgrade uses same http server port" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .transport_mode = .browser_fallback,
+        .auto_open_browser = false,
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "WsSamePort" });
+    try win.showHtml("<html><body>ws-same-port</body></html>");
+    try app.run();
+
+    const address = try std.net.Address.parseIp4("127.0.0.1", win.state().server_port);
+    const stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+
+    try stream.writeAll(
+        "GET /webui/ws?client_id=test-client HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+    );
+
+    const response = try readHttpHeadersFromStream(gpa.allocator(), stream, 64 * 1024);
+    defer gpa.allocator().free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 101 Switching Protocols") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Upgrade: websocket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
 }
 
 test "native_webview transport falls back to browser rendering by default" {
