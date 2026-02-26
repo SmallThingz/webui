@@ -1,8 +1,23 @@
+const __webuiClientId = (() => {
+  try {
+    if (typeof globalThis !== "undefined" && globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch (_) {}
+  return `webui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+})();
+
+function __webuiRequestHeaders(extraHeaders) {
+  const headers = Object.assign({}, extraHeaders || {});
+  headers["x-webui-client-id"] = __webuiClientId;
+  return headers;
+}
+
 async function __webuiInvoke(endpoint, name, args) {
   const payload = JSON.stringify({ name, args });
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: __webuiRequestHeaders({ "content-type": "application/json" }),
     body: payload,
   });
   if (!res.ok) {
@@ -13,7 +28,9 @@ async function __webuiInvoke(endpoint, name, args) {
 }
 
 async function __webuiJson(endpoint, options) {
-  const res = await fetch(endpoint, options);
+  const reqOptions = Object.assign({}, options || {});
+  reqOptions.headers = __webuiRequestHeaders(reqOptions.headers || {});
+  const res = await fetch(endpoint, reqOptions);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`HTTP ${res.status} ${endpoint}: ${text}`);
@@ -211,7 +228,7 @@ async function __webuiGetWindowCapabilities() {
 }
 
 async function __webuiNotifyLifecycle(eventName) {
-  const payload = JSON.stringify({ event: eventName });
+  const payload = JSON.stringify({ event: eventName, client_id: __webuiClientId });
   try {
     if (typeof navigator !== "undefined" && navigator.sendBeacon) {
       const blob = new Blob([payload], { type: "application/json" });
@@ -223,12 +240,83 @@ async function __webuiNotifyLifecycle(eventName) {
   try {
     await fetch("/webui/lifecycle", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: __webuiRequestHeaders({ "content-type": "application/json" }),
       body: payload,
       keepalive: true,
     });
   } catch (_) {}
 }
+
+async function __webuiExecuteScriptTask(task) {
+  let js_error = false;
+  let value = null;
+  let error_message = null;
+
+  try {
+    const runner = new Function(`return (async () => {\n${task.script}\n})();`);
+    const result = await runner();
+    value = typeof result === "undefined" ? null : result;
+  } catch (err) {
+    js_error = true;
+    error_message = String(err);
+  }
+
+  if (!task.expect_result) return;
+  try {
+    await __webuiJson("/webui/script/response", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: task.id,
+        js_error,
+        value,
+        error_message,
+      }),
+      keepalive: false,
+    });
+  } catch (_) {}
+}
+
+(function __webuiInstallScriptLoop() {
+  if (typeof globalThis === "undefined") return;
+  if (globalThis.__webuiScriptLoopInstalled) return;
+  globalThis.__webuiScriptLoopInstalled = true;
+
+  let stopped = false;
+  if (typeof globalThis.addEventListener === "function") {
+    globalThis.addEventListener("beforeunload", () => {
+      stopped = true;
+    });
+  }
+
+  async function loop() {
+    while (!stopped) {
+      try {
+        const res = await fetch("/webui/script/pull", {
+          method: "GET",
+          headers: __webuiRequestHeaders({}),
+          cache: "no-store",
+        });
+        if (res.status === 204) {
+          await new Promise((resolve) => setTimeout(resolve, 90));
+          continue;
+        }
+        if (!res.ok) {
+          await new Promise((resolve) => setTimeout(resolve, 180));
+          continue;
+        }
+        const task = await res.json();
+        if (task && typeof task === "object" && typeof task.script === "string") {
+          await __webuiExecuteScriptTask(task);
+          continue;
+        }
+      } catch (_) {}
+      await new Promise((resolve) => setTimeout(resolve, 90));
+    }
+  }
+
+  void loop();
+})();
 
 (function __webuiInstallLifecycleHooks() {
   if (typeof globalThis === "undefined" || typeof globalThis.addEventListener !== "function") return;

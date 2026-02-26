@@ -7,6 +7,7 @@ const bridge_runtime_helpers = @import("bridge/runtime_helpers.zig");
 const core_runtime = @import("ported/webui.zig");
 const browser_discovery = @import("ported/browser_discovery.zig");
 const civetweb = @import("ported/civetweb/civetweb.zig");
+const tls_runtime = @import("network/tls_runtime.zig");
 pub const process_signals = @import("process_signals.zig");
 const window_style_types = @import("window_style.zig");
 const webview_backend = @import("ported/webview/backend.zig");
@@ -18,6 +19,8 @@ pub const runtime_helpers_js_written = bridge_runtime_helpers.written_runtime_he
 pub const BrowserPromptPreset = core_runtime.BrowserPromptPreset;
 pub const BrowserPromptPolicy = core_runtime.BrowserPromptPolicy;
 pub const BrowserLaunchOptions = core_runtime.BrowserLaunchOptions;
+pub const TlsOptions = tls_runtime.TlsOptions;
+pub const TlsInfo = tls_runtime.TlsInfo;
 
 pub const Size = window_style_types.Size;
 pub const Point = window_style_types.Point;
@@ -67,6 +70,8 @@ pub const Event = struct {
     kind: EventKind,
     name: []const u8,
     payload: []const u8,
+    client_id: ?usize = null,
+    connection_id: ?usize = null,
 };
 
 pub const EventHandler = *const fn (context: ?*anyopaque, event: *const Event) void;
@@ -92,7 +97,11 @@ pub const RpcOptions = struct {
 pub const AppOptions = struct {
     transport_mode: TransportMode = .browser_fallback,
     enable_tls: bool = build_options.enable_tls,
+    tls: TlsOptions = .{
+        .enabled = build_options.enable_tls,
+    },
     enable_webui_log: bool = build_options.enable_webui_log,
+    public_network: bool = false,
     auto_open_browser: bool = false,
     browser_launch: BrowserLaunchOptions = .{},
     browser_fallback_on_native_failure: bool = true,
@@ -116,6 +125,24 @@ pub const WindowControlResult = struct {
     emulation: ?[]const u8 = null,
     closed: bool = false,
     warning: ?[]const u8 = null,
+};
+
+pub const ScriptTarget = union(enum) {
+    window_default,
+    client_connection: usize,
+};
+
+pub const ScriptOptions = struct {
+    target: ScriptTarget = .window_default,
+    timeout_ms: ?u32 = null,
+};
+
+pub const ScriptEvalResult = struct {
+    ok: bool,
+    timed_out: bool,
+    js_error: bool,
+    value: ?[]u8,
+    error_message: ?[]u8,
 };
 
 pub const ServiceOptions = struct {
@@ -217,6 +244,53 @@ const RpcTask = struct {
     fn deinit(self: *RpcTask) void {
         self.allocator.free(self.payload_json);
         if (self.result_json) |result| self.allocator.free(result);
+        self.allocator.destroy(self);
+    }
+};
+
+const ClientSession = struct {
+    token: []u8,
+    client_id: usize,
+    connection_id: usize,
+    last_seen_ms: i64,
+};
+
+const ScriptTask = struct {
+    allocator: std.mem.Allocator,
+    id: u64,
+    target_connection: ?usize,
+    script: []u8,
+    expect_result: bool,
+    done: bool = false,
+    timed_out: bool = false,
+    js_error: bool = false,
+    value_json: ?[]u8 = null,
+    error_message: ?[]u8 = null,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+
+    fn init(
+        allocator: std.mem.Allocator,
+        id: u64,
+        script: []const u8,
+        target_connection: ?usize,
+        expect_result: bool,
+    ) !*ScriptTask {
+        const task = try allocator.create(ScriptTask);
+        task.* = .{
+            .allocator = allocator,
+            .id = id,
+            .target_connection = target_connection,
+            .script = try allocator.dupe(u8, script),
+            .expect_result = expect_result,
+        };
+        return task;
+    }
+
+    fn deinit(self: *ScriptTask) void {
+        self.allocator.free(self.script);
+        if (self.value_json) |value| self.allocator.free(value);
+        if (self.error_message) |msg| self.allocator.free(msg);
         self.allocator.destroy(self);
     }
 };
@@ -530,11 +604,13 @@ const RpcRegistryState = struct {
 };
 
 const WindowState = struct {
+    allocator: std.mem.Allocator,
     id: usize,
     title: []u8,
     transport_mode: TransportMode,
     window_fallback_emulation: bool,
     server_port: u16,
+    server_bind_public: bool,
     last_html: ?[]u8,
     last_file: ?[]u8,
     last_url: ?[]u8,
@@ -555,6 +631,12 @@ const WindowState = struct {
     launched_browser_lifecycle_linked: bool,
     launched_browser_profile_dir: ?[]u8,
     last_warning: ?[]const u8,
+    next_client_id: usize,
+    next_connection_id: usize,
+    client_sessions: std.array_list.Managed(ClientSession),
+    next_script_id: u64,
+    script_pending: std.array_list.Managed(*ScriptTask),
+    script_inflight: std.array_list.Managed(*ScriptTask),
 
     state_mutex: std.Thread.Mutex,
     server_thread: ?std.Thread,
@@ -575,11 +657,13 @@ const WindowState = struct {
 
     fn init(allocator: std.mem.Allocator, id: usize, options: WindowOptions, app_options: AppOptions) !WindowState {
         var state: WindowState = .{
+            .allocator = allocator,
             .id = id,
             .title = try allocator.dupe(u8, options.title),
             .transport_mode = app_options.transport_mode,
             .window_fallback_emulation = app_options.window_fallback_emulation,
             .server_port = core_runtime.nextFallbackPort(id),
+            .server_bind_public = app_options.public_network,
             .last_html = null,
             .last_file = null,
             .last_url = null,
@@ -600,6 +684,12 @@ const WindowState = struct {
             .launched_browser_lifecycle_linked = false,
             .launched_browser_profile_dir = null,
             .last_warning = null,
+            .next_client_id = 1,
+            .next_connection_id = 1,
+            .client_sessions = std.array_list.Managed(ClientSession).init(allocator),
+            .next_script_id = 1,
+            .script_pending = std.array_list.Managed(*ScriptTask).init(allocator),
+            .script_inflight = std.array_list.Managed(*ScriptTask).init(allocator),
             .state_mutex = .{},
             .server_thread = null,
             .server_stop = std.atomic.Value(bool).init(false),
@@ -613,6 +703,13 @@ const WindowState = struct {
         state.native_capabilities = state.backend.capabilities();
         try state.setStyleOwned(allocator, options.style);
         if (state.isNativeWindowActive()) {
+            state.backend.createWindow(state.id, state.title, state.current_style) catch |err| {
+                if (state.rpc_state.log_enabled) {
+                    if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
+                        std.debug.print("[webui.warning] window={d} {s}\n", .{ state.id, warning });
+                    }
+                }
+            };
             state.backend.applyStyle(state.current_style) catch |err| {
                 if (state.rpc_state.log_enabled) {
                     if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
@@ -925,6 +1022,131 @@ const WindowState = struct {
         }
     }
 
+    const ClientRef = struct {
+        client_id: usize,
+        connection_id: usize,
+    };
+
+    fn findOrCreateClientSessionLocked(self: *WindowState, token: []const u8) !ClientRef {
+        const now_ms = std.time.milliTimestamp();
+        for (self.client_sessions.items) |*session| {
+            if (!std.mem.eql(u8, session.token, token)) continue;
+            session.last_seen_ms = now_ms;
+            return .{
+                .client_id = session.client_id,
+                .connection_id = session.connection_id,
+            };
+        }
+
+        const duped = try self.allocator.dupe(u8, token);
+        errdefer self.allocator.free(duped);
+
+        const created: ClientSession = .{
+            .token = duped,
+            .client_id = self.next_client_id,
+            .connection_id = self.next_connection_id,
+            .last_seen_ms = now_ms,
+        };
+        self.next_client_id += 1;
+        self.next_connection_id += 1;
+        try self.client_sessions.append(created);
+
+        return .{
+            .client_id = created.client_id,
+            .connection_id = created.connection_id,
+        };
+    }
+
+    fn queueScriptLocked(
+        self: *WindowState,
+        allocator: std.mem.Allocator,
+        script: []const u8,
+        target_connection: ?usize,
+        expect_result: bool,
+    ) !*ScriptTask {
+        const task = try ScriptTask.init(allocator, self.next_script_id, script, target_connection, expect_result);
+        self.next_script_id += 1;
+        try self.script_pending.append(task);
+        return task;
+    }
+
+    fn removeScriptPendingLocked(self: *WindowState, task: *ScriptTask) bool {
+        for (self.script_pending.items, 0..) |pending, idx| {
+            if (pending != task) continue;
+            _ = self.script_pending.orderedRemove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    fn removeScriptInflightLocked(self: *WindowState, task: *ScriptTask) bool {
+        for (self.script_inflight.items, 0..) |inflight, idx| {
+            if (inflight != task) continue;
+            _ = self.script_inflight.orderedRemove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    fn dequeueScriptForConnectionLocked(self: *WindowState, connection_id: usize) ?*ScriptTask {
+        for (self.script_pending.items, 0..) |task, idx| {
+            if (task.target_connection) |target| {
+                if (target != connection_id) continue;
+            }
+            _ = self.script_pending.orderedRemove(idx);
+            return task;
+        }
+        return null;
+    }
+
+    fn completeScriptTaskLocked(
+        self: *WindowState,
+        task_id: u64,
+        js_error: bool,
+        value_json: ?[]const u8,
+        error_message: ?[]const u8,
+    ) !bool {
+        for (self.script_inflight.items, 0..) |task, idx| {
+            if (task.id != task_id) continue;
+            _ = self.script_inflight.orderedRemove(idx);
+
+            task.mutex.lock();
+            defer task.mutex.unlock();
+
+            if (task.value_json) |buf| {
+                task.allocator.free(buf);
+                task.value_json = null;
+            }
+            if (task.error_message) |buf| {
+                task.allocator.free(buf);
+                task.error_message = null;
+            }
+
+            if (value_json) |value| {
+                task.value_json = try task.allocator.dupe(u8, value);
+            }
+            if (error_message) |msg| {
+                task.error_message = try task.allocator.dupe(u8, msg);
+            }
+
+            task.js_error = js_error;
+            task.done = true;
+            task.cond.signal();
+            return true;
+        }
+        return false;
+    }
+
+    fn markScriptTimedOutLocked(self: *WindowState, task: *ScriptTask) void {
+        _ = self.removeScriptPendingLocked(task);
+        _ = self.removeScriptInflightLocked(task);
+        task.mutex.lock();
+        task.timed_out = true;
+        task.done = true;
+        task.cond.signal();
+        task.mutex.unlock();
+    }
+
     fn deinit(self: *WindowState, allocator: std.mem.Allocator) void {
         self.stopServer();
 
@@ -936,7 +1158,24 @@ const WindowState = struct {
         if (self.style_icon_bytes) |buf| allocator.free(buf);
         if (self.style_icon_mime) |buf| allocator.free(buf);
 
+        for (self.client_sessions.items) |session| allocator.free(session.token);
+        self.client_sessions.deinit();
+
+        for (self.script_pending.items) |task| task.deinit();
+        self.script_pending.deinit();
+
+        for (self.script_inflight.items) |task| {
+            task.mutex.lock();
+            task.timed_out = true;
+            task.done = true;
+            task.cond.broadcast();
+            task.mutex.unlock();
+            task.deinit();
+        }
+        self.script_inflight.deinit();
+
         self.terminateLaunchedBrowser(allocator);
+        self.backend.destroyWindow();
         self.backend.deinit();
         self.rpc_state.deinit(allocator);
     }
@@ -990,7 +1229,8 @@ const WindowState = struct {
     }
 
     fn serverThreadMain(self: *WindowState) void {
-        const address = std.net.Address.parseIp4("127.0.0.1", self.server_port) catch {
+        const bind_host = if (self.server_bind_public) "0.0.0.0" else "127.0.0.1";
+        const address = std.net.Address.parseIp4(bind_host, self.server_port) catch {
             self.server_ready_mutex.lock();
             self.server_listen_ok = false;
             self.server_ready = true;
@@ -1034,15 +1274,28 @@ const WindowState = struct {
 pub const App = struct {
     allocator: std.mem.Allocator,
     options: AppOptions,
+    tls_state: tls_runtime.Runtime,
     windows: std.array_list.Managed(WindowState),
     shutdown_requested: bool,
     next_window_id: usize,
 
     pub fn init(allocator: std.mem.Allocator, options: AppOptions) !App {
-        core_runtime.initializeRuntime(options.enable_tls, options.enable_webui_log);
+        var resolved_options = options;
+        if (resolved_options.enable_tls and !resolved_options.tls.enabled) resolved_options.tls.enabled = true;
+        if (resolved_options.tls.enabled and !resolved_options.enable_tls) resolved_options.enable_tls = true;
+
+        core_runtime.initializeRuntime(resolved_options.tls.enabled, resolved_options.enable_webui_log);
+        const tls_state = try tls_runtime.Runtime.init(allocator, resolved_options.tls);
+        if (resolved_options.tls.enabled and resolved_options.enable_webui_log) {
+            std.debug.print(
+                "[webui.warning] TLS certificates/runtime state are configured, but active HTTP transport remains plaintext in this build.\n",
+                .{},
+            );
+        }
         return .{
             .allocator = allocator,
-            .options = options,
+            .options = resolved_options,
+            .tls_state = tls_state,
             .windows = std.array_list.Managed(WindowState).init(allocator),
             .shutdown_requested = false,
             .next_window_id = 1,
@@ -1058,6 +1311,17 @@ pub const App = struct {
             state.deinit(self.allocator);
         }
         self.windows.deinit();
+        self.tls_state.deinit();
+    }
+
+    pub fn setTlsCertificate(self: *App, cert_pem: []const u8, key_pem: []const u8) !void {
+        try self.tls_state.setCertificate(cert_pem, key_pem);
+        self.options.enable_tls = true;
+        self.options.tls.enabled = true;
+    }
+
+    pub fn tlsInfo(self: *const App) TlsInfo {
+        return self.tls_state.info();
     }
 
     pub fn newWindow(self: *App, options: WindowOptions) !Window {
@@ -1097,6 +1361,10 @@ pub const App = struct {
 
             if (state.shouldServeBrowser(self.options) and (state.last_html != null or state.last_file != null)) {
                 try state.ensureServerStarted();
+            }
+
+            if (state.isNativeWindowActive()) {
+                state.backend.pumpEvents() catch {};
             }
 
             state.connected_emitted = true;
@@ -1156,6 +1424,11 @@ pub const Window = struct {
         win_state.shown = true;
 
         try win_state.ensureBrowserRenderState(self.app.allocator, self.app.options);
+        if (win_state.isNativeWindowActive()) {
+            if (win_state.last_url) |url| {
+                _ = win_state.backend.showContent(.{ .url = url }) catch {};
+            }
+        }
 
         self.emit(.navigation, "show-html", html);
     }
@@ -1186,6 +1459,11 @@ pub const Window = struct {
         win_state.shown = true;
 
         try win_state.ensureBrowserRenderState(self.app.allocator, self.app.options);
+        if (win_state.isNativeWindowActive()) {
+            if (win_state.last_url) |url| {
+                _ = win_state.backend.showContent(.{ .url = url }) catch {};
+            }
+        }
 
         self.emit(.navigation, "show-file", path);
     }
@@ -1202,7 +1480,7 @@ pub const Window = struct {
         win_state.shown = true;
 
         if (win_state.isNativeWindowActive()) {
-            win_state.backend.navigate(url);
+            _ = win_state.backend.showContent(.{ .url = url }) catch {};
         }
 
         if (self.app.options.auto_open_browser) {
@@ -1246,6 +1524,84 @@ pub const Window = struct {
 
     pub fn rpcTypeDeclarations(self: *Window, options: BridgeOptions) []const u8 {
         return self.rpc().generatedTypeScriptDeclarations(options);
+    }
+
+    pub fn runScript(self: *Window, script: []const u8, options: ScriptOptions) !void {
+        if (script.len == 0) return error.EmptyScript;
+
+        const win_state = self.state();
+        win_state.state_mutex.lock();
+        defer win_state.state_mutex.unlock();
+
+        const target_connection: ?usize = switch (options.target) {
+            .window_default => null,
+            .client_connection => |connection_id| connection_id,
+        };
+        _ = try win_state.queueScriptLocked(self.app.allocator, script, target_connection, false);
+    }
+
+    pub fn evalScript(
+        self: *Window,
+        allocator: std.mem.Allocator,
+        script: []const u8,
+        options: ScriptOptions,
+    ) !ScriptEvalResult {
+        if (script.len == 0) return error.EmptyScript;
+
+        const win_state = self.state();
+
+        win_state.state_mutex.lock();
+        const target_connection: ?usize = switch (options.target) {
+            .window_default => null,
+            .client_connection => |connection_id| connection_id,
+        };
+        const task = try win_state.queueScriptLocked(self.app.allocator, script, target_connection, true);
+        win_state.state_mutex.unlock();
+
+        var timed_out = false;
+        task.mutex.lock();
+
+        if (options.timeout_ms) |timeout_ms| {
+            const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
+            const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
+            while (!task.done) {
+                const now = std.time.nanoTimestamp();
+                if (now >= deadline) {
+                    timed_out = true;
+                    break;
+                }
+                const remaining = @as(u64, @intCast(deadline - now));
+                task.cond.timedWait(&task.mutex, remaining) catch {};
+            }
+        } else {
+            while (!task.done) task.cond.wait(&task.mutex);
+        }
+        const finished = task.done;
+        task.mutex.unlock();
+
+        if (timed_out and !finished) {
+            win_state.state_mutex.lock();
+            win_state.markScriptTimedOutLocked(task);
+            win_state.state_mutex.unlock();
+        }
+
+        task.mutex.lock();
+        const result = ScriptEvalResult{
+            .ok = !task.js_error and !timed_out,
+            .timed_out = timed_out or task.timed_out,
+            .js_error = task.js_error,
+            .value = if (task.value_json) |value| try allocator.dupe(u8, value) else null,
+            .error_message = if (task.error_message) |msg| try allocator.dupe(u8, msg) else null,
+        };
+        task.mutex.unlock();
+
+        win_state.state_mutex.lock();
+        _ = win_state.removeScriptPendingLocked(task);
+        _ = win_state.removeScriptInflightLocked(task);
+        win_state.state_mutex.unlock();
+        task.deinit();
+
+        return result;
     }
 
     pub fn sendRaw(self: *Window, bytes: []const u8) !void {
@@ -1424,6 +1780,14 @@ pub const Service = struct {
         self.app.shutdown();
     }
 
+    pub fn setTlsCertificate(self: *Service, cert_pem: []const u8, key_pem: []const u8) !void {
+        try self.app.setTlsCertificate(cert_pem, key_pem);
+    }
+
+    pub fn tlsInfo(self: *Service) TlsInfo {
+        return self.app.tlsInfo();
+    }
+
     pub fn show(self: *Service, content: WindowContent) !void {
         var win = self.window();
         try win.show(content);
@@ -1502,6 +1866,21 @@ pub const Service = struct {
     pub fn sendRaw(self: *Service, bytes: []const u8) !void {
         var win = self.window();
         try win.sendRaw(bytes);
+    }
+
+    pub fn runScript(self: *Service, script: []const u8, options: ScriptOptions) !void {
+        var win = self.window();
+        try win.runScript(script, options);
+    }
+
+    pub fn evalScript(
+        self: *Service,
+        allocator: std.mem.Allocator,
+        script: []const u8,
+        options: ScriptOptions,
+    ) !ScriptEvalResult {
+        var win = self.window();
+        return win.evalScript(allocator, script, options);
     }
 
     pub fn browserUrl(self: *Service) ![]u8 {
@@ -1789,6 +2168,7 @@ const HttpRequest = struct {
     raw: []u8,
     method: []const u8,
     path: []const u8,
+    headers: []const u8,
     body: []const u8,
 };
 
@@ -1799,9 +2179,11 @@ fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: s
     const path_only = pathWithoutQuery(request.path);
 
     if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return;
-    if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.body)) return;
+    if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return;
     if (try handleLifecycleConfigRoute(state, allocator, stream, request.method, path_only)) return;
-    if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.body)) return;
+    if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return;
+    if (try handleScriptPullRoute(state, allocator, stream, request.method, path_only, request.headers)) return;
+    if (try handleScriptResponseRoute(state, allocator, stream, request.method, path_only, request.body)) return;
     if (try handleWindowControlRoute(state, allocator, stream, request.method, path_only, request.body)) return;
     if (try handleWindowStyleRoute(state, allocator, stream, request.method, path_only, request.body)) return;
     if (try handleWindowContentRoute(state, allocator, stream, request.method, path_only)) return;
@@ -1836,6 +2218,7 @@ fn handleLifecycleRoute(
     stream: std.net.Stream,
     method: []const u8,
     path_only: []const u8,
+    headers: []const u8,
     body: []const u8,
 ) !bool {
     if (!std.mem.eql(u8, method, "POST")) return false;
@@ -1844,6 +2227,10 @@ fn handleLifecycleRoute(
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
     var logged_event = false;
     var heartbeat_event = false;
+    const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
+    state.state_mutex.lock();
+    _ = state.findOrCreateClientSessionLocked(client_token) catch null;
+    state.state_mutex.unlock();
     if (parsed) |*p| {
         defer p.deinit();
         if (p.value == .object) {
@@ -1874,8 +2261,155 @@ fn handleLifecycleRoute(
     return true;
 }
 
+const default_client_token = "default-client";
+
+fn handleScriptPullRoute(
+    state: *WindowState,
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    method: []const u8,
+    path_only: []const u8,
+    headers: []const u8,
+) !bool {
+    if (!std.mem.eql(u8, method, "GET")) return false;
+    if (!std.mem.eql(u8, path_only, "/webui/script/pull")) return false;
+
+    const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
+
+    state.state_mutex.lock();
+    const client_ref = state.findOrCreateClientSessionLocked(client_token) catch {
+        state.state_mutex.unlock();
+        try writeHttpResponse(stream, 500, "application/json; charset=utf-8", "{\"error\":\"client_session_failed\"}");
+        return true;
+    };
+    const task = state.dequeueScriptForConnectionLocked(client_ref.connection_id);
+    if (task) |work| {
+        if (work.expect_result) {
+            state.script_inflight.append(work) catch {
+                state.state_mutex.unlock();
+                try writeHttpResponse(stream, 500, "application/json; charset=utf-8", "{\"error\":\"script_queue_failed\"}");
+                return true;
+            };
+        }
+    }
+    state.state_mutex.unlock();
+
+    if (task == null) {
+        try writeHttpResponse(stream, 204, "application/json; charset=utf-8", "");
+        return true;
+    }
+
+    const work = task.?;
+    const payload = try std.json.Stringify.valueAlloc(allocator, .{
+        .id = work.id,
+        .script = work.script,
+        .expect_result = work.expect_result,
+        .client_id = client_ref.client_id,
+        .connection_id = client_ref.connection_id,
+    }, .{});
+    defer allocator.free(payload);
+
+    if (!work.expect_result) {
+        work.mutex.lock();
+        work.done = true;
+        work.cond.signal();
+        work.mutex.unlock();
+        work.deinit();
+    }
+
+    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+    return true;
+}
+
+fn handleScriptResponseRoute(
+    state: *WindowState,
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    method: []const u8,
+    path_only: []const u8,
+    body: []const u8,
+) !bool {
+    if (!std.mem.eql(u8, method, "POST")) return false;
+    if (!std.mem.eql(u8, path_only, "/webui/script/response")) return false;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_script_response\"}");
+        return true;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_script_response\"}");
+        return true;
+    }
+
+    const id_value = parsed.value.object.get("id") orelse {
+        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"missing_script_id\"}");
+        return true;
+    };
+
+    const task_id: u64 = switch (id_value) {
+        .integer => |v| @as(u64, @intCast(v)),
+        .float => |v| @as(u64, @intFromFloat(v)),
+        else => {
+            try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_script_id\"}");
+            return true;
+        },
+    };
+
+    const js_error = if (parsed.value.object.get("js_error")) |err_val|
+        switch (err_val) {
+            .bool => |b| b,
+            else => false,
+        }
+    else
+        false;
+
+    const value_json = if (parsed.value.object.get("value")) |value|
+        try std.json.Stringify.valueAlloc(allocator, value, .{})
+    else
+        null;
+    defer if (value_json) |buf| allocator.free(buf);
+
+    const error_message = if (parsed.value.object.get("error_message")) |err_msg|
+        switch (err_msg) {
+            .string => |msg| msg,
+            else => null,
+        }
+    else
+        null;
+
+    state.state_mutex.lock();
+    const completed = state.completeScriptTaskLocked(task_id, js_error, value_json, error_message) catch {
+        state.state_mutex.unlock();
+        try writeHttpResponse(stream, 500, "application/json; charset=utf-8", "{\"error\":\"script_completion_failed\"}");
+        return true;
+    };
+    state.state_mutex.unlock();
+
+    if (!completed) {
+        try writeHttpResponse(stream, 404, "application/json; charset=utf-8", "{\"error\":\"script_not_found\"}");
+        return true;
+    }
+
+    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", "{\"ok\":true}");
+    return true;
+}
+
 fn pathWithoutQuery(path: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, path, '?')) |q| path[0..q] else path;
+}
+
+fn httpHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const sep = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = std.mem.trim(u8, line[0..sep], " \t");
+        if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
+        return std.mem.trim(u8, line[sep + 1 ..], " \t");
+    }
+    return null;
 }
 
 fn handleBridgeScriptRoute(
@@ -1902,6 +2436,7 @@ fn handleRpcRoute(
     stream: std.net.Stream,
     method: []const u8,
     path_only: []const u8,
+    headers: []const u8,
     body: []const u8,
 ) !bool {
     if (!std.mem.eql(u8, method, "POST")) return false;
@@ -1910,6 +2445,11 @@ fn handleRpcRoute(
     if (state.rpc_state.log_enabled) {
         std.debug.print("[webui.rpc] raw body={s}\n", .{body});
     }
+
+    const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
+    state.state_mutex.lock();
+    const client_ref = state.findOrCreateClientSessionLocked(client_token) catch null;
+    state.state_mutex.unlock();
 
     const payload = state.rpc_state.invokeFromJsonPayload(allocator, body) catch |err| {
         const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
@@ -1932,6 +2472,8 @@ fn handleRpcRoute(
             .kind = .rpc,
             .name = "rpc",
             .payload = "rpc-dispatch",
+            .client_id = if (client_ref) |ref| ref.client_id else null,
+            .connection_id = if (client_ref) |ref| ref.connection_id else null,
         };
         handler(state.event_callback.context, &event);
     }
@@ -2157,11 +2699,15 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpRe
 
     const body_end = end_idx + content_length;
     if (body_end > raw.len) return error.InvalidHttpRequest;
+    const headers_start = first_line_end + 2;
+    const headers_end = end_idx - 4;
+    const headers = if (headers_start <= headers_end) raw[headers_start..headers_end] else "";
 
     return .{
         .raw = raw,
         .method = method,
         .path = path,
+        .headers = headers,
         .body = raw[end_idx..body_end],
     };
 }
@@ -2183,6 +2729,7 @@ fn writeHttpResponse(stream: std.net.Stream, status: u16, content_type: []const 
     var header_buf: [512]u8 = undefined;
     const status_text = switch (status) {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         500 => "Internal Server Error",
@@ -2236,26 +2783,49 @@ fn httpRoundTrip(
     path: []const u8,
     body: ?[]const u8,
 ) ![]u8 {
+    return httpRoundTripWithHeaders(allocator, port, method, path, body, &.{});
+}
+
+fn httpRoundTripWithHeaders(
+    allocator: std.mem.Allocator,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    body: ?[]const u8,
+    extra_headers: []const []const u8,
+) ![]u8 {
     const address = try std.net.Address.parseIp4("127.0.0.1", port);
     const stream = try std.net.tcpConnectToAddress(address);
     defer stream.close();
 
+    var extra = std.array_list.Managed(u8).init(allocator);
+    defer extra.deinit();
+    for (extra_headers) |header| {
+        try extra.appendSlice(header);
+        try extra.appendSlice("\r\n");
+    }
+
     const request = if (body) |b|
         try std.fmt.allocPrint(
             allocator,
-            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-            .{ method, path, b.len, b },
+            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ method, path, extra.items, b.len, b },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            .{ method, path },
+            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Connection: close\r\n\r\n",
+            .{ method, path, extra.items },
         );
     defer allocator.free(request);
 
     try stream.writeAll(request);
     return readAllFromStream(allocator, stream, 1024 * 1024);
+}
+
+fn httpResponseBody(response: []const u8) []const u8 {
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
+    return response[header_end + 4 ..];
 }
 
 test "window lifecycle" {
@@ -2335,6 +2905,27 @@ test "browser fallback server is reachable across repeated connects" {
         try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "reachability-ok") != null);
     }
+}
+
+test "public network mode binds server with public listen policy" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .transport_mode = .browser_fallback,
+        .auto_open_browser = false,
+        .public_network = true,
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "PublicNetwork" });
+    try win.showHtml("<html><body>public-network-ok</body></html>");
+    try app.run();
+
+    try std.testing.expect(win.state().server_bind_public);
+    const response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/", null);
+    defer gpa.allocator().free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "public-network-ok") != null);
 }
 
 test "native_webview transport falls back to browser rendering by default" {
@@ -2772,6 +3363,60 @@ test "typed rpc registration, invocation, and bridge generation" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"value\":5") != null);
 }
 
+test "rpc event carries client and connection identifiers" {
+    const DemoRpc = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    const Capture = struct {
+        var seen: bool = false;
+        var client_id: ?usize = null;
+        var connection_id: ?usize = null;
+
+        fn onEvent(_: ?*anyopaque, event: *const Event) void {
+            if (event.kind != .rpc) return;
+            seen = true;
+            client_id = event.client_id;
+            connection_id = event.connection_id;
+        }
+    };
+
+    Capture.seen = false;
+    Capture.client_id = null;
+    Capture.connection_id = null;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .transport_mode = .browser_fallback,
+        .auto_open_browser = false,
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{});
+    try win.bindRpc(DemoRpc, .{});
+    win.onEvent(Capture.onEvent, null);
+    try win.showHtml("<html><body>rpc-client-meta</body></html>");
+    try app.run();
+
+    const rpc_response = try httpRoundTripWithHeaders(
+        gpa.allocator(),
+        win.state().server_port,
+        "POST",
+        "/webui/rpc",
+        "{\"name\":\"ping\",\"args\":[]}",
+        &.{"x-webui-client-id: rpc-meta-client"},
+    );
+    defer gpa.allocator().free(rpc_response);
+    try std.testing.expect(std.mem.indexOf(u8, rpc_response, "\"value\":\"pong\"") != null);
+    try std.testing.expect(Capture.seen);
+    try std.testing.expect(Capture.client_id != null);
+    try std.testing.expect(Capture.connection_id != null);
+}
+
 test "friendly service api with compile-time rpc_methods constant" {
     const rpc_methods = struct {
         pub fn ping() []const u8 {
@@ -2922,4 +3567,103 @@ test "raw channel callback" {
     win.onRaw(State.onRaw, null);
     try win.sendRaw("abc123");
     try std.testing.expectEqual(@as(usize, 6), State.bytes_seen);
+}
+
+test "evalScript times out when no client is polling" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .transport_mode = .browser_fallback,
+        .auto_open_browser = false,
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{});
+    const result = try win.evalScript(gpa.allocator(), "return 1 + 1;", .{
+        .timeout_ms = 20,
+    });
+    defer {
+        if (result.value) |value| gpa.allocator().free(value);
+        if (result.error_message) |msg| gpa.allocator().free(msg);
+    }
+
+    try std.testing.expect(!result.ok);
+    try std.testing.expect(result.timed_out);
+    try std.testing.expect(!result.js_error);
+    try std.testing.expect(result.value == null);
+}
+
+test "script pull and response routes complete queued eval task" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .transport_mode = .browser_fallback,
+        .auto_open_browser = false,
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "ScriptQueue" });
+    try win.showHtml("<html><body>script-route</body></html>");
+    try app.run();
+
+    const state = win.state();
+    state.state_mutex.lock();
+    const task = try state.queueScriptLocked(gpa.allocator(), "return 6 * 7;", null, true);
+    state.state_mutex.unlock();
+
+    const pull_response = try httpRoundTripWithHeaders(
+        gpa.allocator(),
+        state.server_port,
+        "GET",
+        "/webui/script/pull",
+        null,
+        &.{"x-webui-client-id: script-test-client"},
+    );
+    defer gpa.allocator().free(pull_response);
+    try std.testing.expect(std.mem.indexOf(u8, pull_response, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pull_response, "\"expect_result\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pull_response, "return 6 * 7;") != null);
+
+    const body = httpResponseBody(pull_response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa.allocator(), body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const id_value = parsed.value.object.get("id") orelse return error.InvalidHttpRequest;
+    const pulled_id: u64 = switch (id_value) {
+        .integer => |v| @as(u64, @intCast(v)),
+        .float => |v| @as(u64, @intFromFloat(v)),
+        else => return error.InvalidHttpRequest,
+    };
+    try std.testing.expectEqual(task.id, pulled_id);
+
+    const completion_body = try std.fmt.allocPrint(
+        gpa.allocator(),
+        "{{\"id\":{d},\"js_error\":false,\"value\":42}}",
+        .{pulled_id},
+    );
+    defer gpa.allocator().free(completion_body);
+
+    const complete_response = try httpRoundTripWithHeaders(
+        gpa.allocator(),
+        state.server_port,
+        "POST",
+        "/webui/script/response",
+        completion_body,
+        &.{"x-webui-client-id: script-test-client"},
+    );
+    defer gpa.allocator().free(complete_response);
+    try std.testing.expect(std.mem.indexOf(u8, complete_response, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete_response, "{\"ok\":true}") != null);
+
+    task.mutex.lock();
+    const done = task.done;
+    const value = task.value_json;
+    task.mutex.unlock();
+    try std.testing.expect(done);
+    try std.testing.expect(value != null);
+    try std.testing.expect(std.mem.eql(u8, value.?, "42"));
+
+    task.deinit();
 }

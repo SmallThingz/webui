@@ -20,14 +20,14 @@
 
     { "id": "server.http.local_routes", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },
     { "id": "server.vfs_support", "status": "implemented", "tests": ["build step vfs-gen"] },
-    { "id": "server.public_private_modes", "status": "partial", "tests": ["webui/examples/C/public_network_access/main.zig"] },
+    { "id": "server.public_private_modes", "status": "implemented", "tests": ["root.test.public network mode binds server with public listen policy"] },
     { "id": "server.port_management", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
-    { "id": "server.proxy_support", "status": "partial", "tests": ["manual validation required"] },
+    { "id": "server.proxy_support", "status": "implemented", "tests": ["ported.webui.test.proxy server launch option maps to chromium proxy flag"] },
     { "id": "server.tls_toggle", "status": "partial", "tests": ["docs.manual_gui_checklist"] },
 
     { "id": "event.lifecycle_callbacks", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
     { "id": "event.raw_channel", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },
-    { "id": "event.client_context", "status": "partial", "tests": ["manual validation required"] },
+    { "id": "event.client_context", "status": "implemented", "tests": ["root.test.rpc event carries client and connection identifiers"] },
 
     { "id": "rpc.typed_registration", "status": "implemented", "tests": ["root.test.typed rpc registration, invocation, and bridge generation"] },
     { "id": "rpc.dispatch.sync_threaded_custom", "status": "implemented", "tests": ["root.test.threaded dispatcher executes rpc on worker queue", "root.test.custom dispatcher can wrap default invoker"] },

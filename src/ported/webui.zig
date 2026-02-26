@@ -37,6 +37,7 @@ pub const BrowserPromptPolicy = struct {
 pub const BrowserLaunchOptions = struct {
     prompt_policy: BrowserPromptPolicy = .{},
     extra_args: []const []const u8 = &.{},
+    proxy_server: ?[]const u8 = null,
     require_app_mode_window: bool = false,
     allow_system_fallback: bool = true,
     force_isolated_chromium_instance: bool = true,
@@ -249,6 +250,9 @@ fn launchSpecForKind(
         try appendPromptPolicyArgs(&spec, kind, launch_options.prompt_policy);
         try spec.append("--new-window");
         try spec.appendOwnedFmt(allocator, "--app={s}", .{url});
+        if (launch_options.proxy_server) |proxy_server| {
+            try spec.appendOwnedFmt(allocator, "--proxy-server={s}", .{proxy_server});
+        }
         if (launch_options.force_isolated_chromium_instance) {
             if (try maybeCreateIsolatedProfileDir(allocator)) |profile_dir| {
                 spec.profile_dir = profile_dir;
@@ -974,6 +978,16 @@ test "browser default preset disables quiet flags unless explicitly re-enabled" 
     defer override_spec.deinit(std.testing.allocator);
 
     try std.testing.expect(containsArg(override_spec.args[0..override_spec.len], "--no-first-run"));
+}
+
+test "proxy server launch option maps to chromium proxy flag" {
+    var spec = try launchSpecForKind(std.testing.allocator, .chrome, "http://127.0.0.1:3040/", .{}, .{
+        .proxy_server = "http://127.0.0.1:8080",
+        .force_isolated_chromium_instance = false,
+    });
+    defer spec.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsArg(spec.args[0..spec.len], "--proxy-server=http://127.0.0.1:8080"));
 }
 
 fn containsArg(args: []const []const u8, needle: []const u8) bool {

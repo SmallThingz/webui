@@ -4,6 +4,8 @@ const browser_discovery = @import("../browser_discovery.zig");
 const core_runtime = @import("../webui.zig");
 
 pub const LinuxWebView = struct {
+    window_id: usize = 0,
+    title: []const u8 = "",
     style: style_types.WindowStyle = .{},
     hidden: bool = false,
     maximized: bool = false,
@@ -11,6 +13,23 @@ pub const LinuxWebView = struct {
     browser_kind: ?browser_discovery.BrowserKind = null,
     browser_pid: ?i64 = null,
     browser_is_child: bool = false,
+
+    pub fn isReady(self: *const LinuxWebView) bool {
+        return self.native_host_ready;
+    }
+
+    pub fn createWindow(self: *LinuxWebView, window_id: usize, title: []const u8, style: style_types.WindowStyle) !void {
+        self.window_id = window_id;
+        self.title = title;
+        self.style = style;
+    }
+
+    pub fn showContent(self: *LinuxWebView, content: anytype) !void {
+        switch (content) {
+            .url => |url| self.navigate(url),
+            else => return error.UnsupportedWindowContent,
+        }
+    }
 
     pub fn attachBrowserProcess(self: *LinuxWebView, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
         self.browser_kind = kind;
@@ -99,6 +118,17 @@ pub const LinuxWebView = struct {
                 return error.UnsupportedWindowControl;
             },
         }
+    }
+
+    pub fn pumpEvents(self: *LinuxWebView) !void {
+        _ = self;
+    }
+
+    pub fn destroyWindow(self: *LinuxWebView) void {
+        self.native_host_ready = false;
+        self.browser_kind = null;
+        self.browser_pid = null;
+        self.browser_is_child = false;
     }
 
     pub fn capabilities(self: *const LinuxWebView) []const style_types.WindowCapability {
