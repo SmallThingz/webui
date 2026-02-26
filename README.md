@@ -1,34 +1,36 @@
-# WebUI Zig (Manual Port)
+# WebUI Zig
 
-A Zig-first WebUI runtime with typed RPC, generated JS/TS bridge code, native-webview-first execution, and browser fallback.
+Zig-first WebUI runtime: native webview when available, browser fallback when needed, and a comptime-generated RPC bridge that feels like calling local functions from JS.
 
-## Status
+- Zig: `0.15.2+` (`build.zig.zon` sets `.minimum_zig_version`)
+- CI: Linux/macOS/Windows via `.github/workflows/ci.yml`
 
-This project is actively usable, but it is not yet full behavioral parity with upstream `webui.c`.
+## Status (Parity Snapshot)
 
-Current parity snapshot (`zig build parity-local`):
+This repo targets **behavioral parity with upstream `webui.c`**, but it is not yet 100% there.
+
+Current snapshot (`zig build parity-local`):
 - `total=40`
 - `implemented=36`
 - `partial=4`
 - `missing=0`
 
-Current partial areas:
+Partial areas (still require manual GUI validation and/or runtime completion):
 - `window.visual.transparency`
 - `window.visual.frameless`
 - `window.visual.corner_radius`
 - `server.tls_toggle`
 
-See `parity/status.json` and `docs/upstream_file_parity.md` for details.
+See `parity/status.json`, `docs/manual_gui_checklist.md`, and `docs/upstream_file_parity.md`.
 
-## Highlights
+## What You Get
 
-- Zig-only active runtime/library build path (`@cImport` and runtime C/C++/ObjC compilation removed).
-- Idiomatic API (`App`, `Window`, `Service`, `RpcRegistry`, `WindowStyle`, typed events).
-- Comptime RPC registration via `pub const rpc_methods = struct { ... }`.
-- Generated JS client + TypeScript declarations.
-- `sync`, `threaded`, and `custom` RPC dispatch modes.
-- Native-webview-first runtime with browser fallback.
-- Extensive third-party browser discovery/search paths across Linux/macOS/Windows.
+- **Pure Zig active build graph**: no `@cImport`, no `translate-c`, no runtime C/C++/ObjC compilation in the active library.
+- **Dev-friendly API**: `App`, `Window`, `Service`, `WindowStyle`, `WindowControl`, typed `Event`s.
+- **Comptime RPC surface**: define `pub const rpc_methods = struct { ... }` once, generate JS/TS bridge from it.
+- **Push transport for scripts**: WebSocket push channel (no constant `/lifecycle` polling).
+- **Aggressive browser discovery**: broad catalog + OS-specific search paths + env overrides.
+- **Parity/test gates**: `zig build test`, `zig build examples`, `zig build parity-local`, `zig build os-matrix`.
 
 ## Quick Start
 
@@ -39,89 +41,75 @@ zig build examples
 zig build run
 ```
 
-Run one example:
+Run a specific example:
 
 ```bash
-zig build run -Dexample=translucent_rounded
+zig build run -Dexample=fancy_window
 ```
 
-Force runtime mode:
+Force runtime mode for examples:
 
 ```bash
 zig build run -Dexample=fancy_window -Drun-mode=webview
 zig build run -Dexample=fancy_window -Drun-mode=browser
 ```
 
-List all build steps/options:
+List steps and options:
 
 ```bash
 zig build -l
 zig build -h
 ```
 
-## Build Flags
+## Add To Your Project
 
-| Flag | Default | Effect |
-|---|---:|---|
-| `-Ddynamic=true` | `false` | Build/install `webui` as a shared library (`.so`/`.dylib`/`.dll`) instead of static archive. |
-| `-Denable-tls=true` | `false` | Enables TLS defaults in runtime options/API state. |
-| `-Denable-webui-log=true` | `false` | Enables runtime log defaults. |
-| `-Dminify-embedded-js=true` | `true` | Minifies embedded runtime helper JS asset at build time. |
-| `-Dminify-written-js=true` | `false` | Minifies written runtime helper JS output artifact. |
-| `-Dexample=<name>` | `all` | Selects example used by `zig build run`. |
-| `-Drun-mode=webview|browser` | `webview` | Chooses native-webview path or browser-mode path in examples. |
-| `-Dtarget=<triple>` | host | Cross-compiles the library/examples for another target. |
+This is a normal Zig package (`.name = "webui"` in `build.zig.zon`).
 
-Exported compile-time values:
-- `webui.BuildFlags.dynamic`
-- `webui.BuildFlags.enable_tls`
-- `webui.BuildFlags.enable_webui_log`
-- `webui.BuildFlags.run_mode`
+```bash
+zig fetch --save <git-or-tarball-url>
+```
 
-## Build Steps
+```zig
+// build.zig
+const webui_dep = b.dependency("webui", .{
+    .target = target,
+    .optimize = optimize,
+});
+const webui = webui_dep.module("webui");
 
-- `zig build` (default install)
-- `zig build test`
-- `zig build examples`
-- `zig build run`
-- `zig build bridge`
-- `zig build runtime-helpers`
-- `zig build vfs-gen`
-- `zig build parity-report`
-- `zig build parity-local`
-- `zig build os-matrix`
+exe.root_module.addImport("webui", webui);
+```
 
-## API Overview
+## Transport Model
 
-Top-level exports (`src/root.zig`):
-- `App`, `Window`, `Service`
-- `Event`, `EventKind`
-- `RpcRegistry`, `RpcOptions`, `DispatcherMode`
-- `WindowStyle`, `WindowControl`, `WindowCapability`
-- `BridgeOptions`, `TransportMode`
-- `ScriptOptions`, `ScriptEvalResult`
-- `TlsOptions`, `TlsInfo`
+Browser fallback serves local HTTP and uses a WebSocket push channel for script tasks and lifecycle signaling. Native mode uses the platform webview backend when available.
+
+```mermaid
+flowchart LR
+  A["Zig app (Service/App)"] --> B["Local HTTP server (browser fallback)"]
+  B --> C["Browser tab/window"]
+  C -->|WS push| D["/webui/ws"]
+  C -->|HTTP RPC| E["/webui/rpc"]
+  A --> F["Native webview backend"]
+  F --> G["WebView window (OS)"]
+```
+
+## API At A Glance
 
 Core flow:
-1. Declare `pub const rpc_methods` as a comptime struct of functions.
-2. Initialize `Service` or `App + Window`.
-3. Show `html`, `file`, or `url` content.
-4. Run app loop and exchange RPC/raw messages.
+1. Declare `pub const rpc_methods = struct { ... }` (comptime).
+2. Initialize `Service` (or `App + Window`).
+3. `showHtml/showFile/showUrl` and `run`.
 
-### Minimal Service Example
+Minimal service:
 
 ```zig
 const std = @import("std");
 const webui = @import("webui");
 
 pub const rpc_methods = struct {
-    pub fn ping() []const u8 {
-        return "pong";
-    }
-
-    pub fn add(a: i64, b: i64) i64 {
-        return a + b;
-    }
+    pub fn ping() []const u8 { return "pong"; }
+    pub fn add(a: i64, b: i64) i64 { return a + b; }
 };
 
 pub fn main() !void {
@@ -134,7 +122,7 @@ pub fn main() !void {
             .browser_fallback_on_native_failure = true,
             .auto_open_browser = true,
         },
-        .window = .{ .title = "WebUI Zig Demo" },
+        .window = .{ .title = "WebUI Zig" },
         .rpc = .{ .dispatcher_mode = .threaded },
     });
     defer service.deinit();
@@ -145,17 +133,22 @@ pub fn main() !void {
             "<script type=\"module\" src=\"/webui_bridge.js\"></script></head>" ++
             "<body><button id=\"b\">Ping</button><pre id=\"out\"></pre>" ++
             "<script>document.getElementById('b').onclick=async()=>{" ++
-            "const p=await webuiRpc.ping();const s=await webuiRpc.add(20,22);" ++
-            "document.getElementById('out').textContent=`${p} ${s}`;};</script></body></html>",
+            "document.getElementById('out').textContent=" ++
+            "`ping=${await webuiRpc.ping()} add=${await webuiRpc.add(20,22)}`;};</script>" ++
+            "</body></html>",
     });
 
     try service.run();
+    while (!service.shouldExit()) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        try service.run();
+    }
 }
 ```
 
 ## Typed RPC + Bridge Generation
 
-All RPC methods are declared once at comptime:
+Everything starts with a comptime method set:
 
 ```zig
 pub const rpc_methods = struct {
@@ -164,38 +157,91 @@ pub const rpc_methods = struct {
 };
 ```
 
-Then you can:
-- Serve runtime-generated client script: `service.rpcClientScript(.{})`
-- Generate compile-time client script: `webui.Service.generatedClientScriptComptime(rpc_methods, .{})`
-- Generate compile-time TypeScript declarations: `webui.Service.generatedTypeScriptDeclarationsComptime(rpc_methods, .{})`
+What you can generate:
+- Runtime-generated JS client string: `Window.rpcClientScript(.{})`
+- Comptime JS client string: `webui.Service.generatedClientScriptComptime(rpc_methods, .{})`
+- Comptime TypeScript declarations: `webui.Service.generatedTypeScriptDeclarationsComptime(rpc_methods, .{})`
 
-Script execution APIs:
-- `Window.runScript(script, options)`
-- `Window.evalScript(allocator, script, options)`
+Dispatch modes:
+- `sync` (direct execution)
+- `threaded` (worker queue)
+- `custom` (hook dispatcher)
 
-## Browser Support (Discovery Catalog)
+## Close Semantics (No Random Window Closes)
 
-The discovery catalog includes at least these families:
+Close is backend-authoritative:
+- The frontend closes **only** after receiving a backend `backend_close` push signal.
+- The backend sends the close signal and waits briefly for `close_ack` before tearing down.
+
+This is implemented in `src/root.zig` and `src/bridge/runtime_helpers.source.js`.
+
+## Browser Discovery Catalog
+
+The discovery catalog includes at least these families (and more):
 - Firefox, Chrome, Edge, Chromium, Yandex, Brave, Vivaldi
 - Epic, Safari, Opera
-- Plus: Arc, DuckDuckGo, Tor, LibreWolf, Mullvad, Sidekick, Shift, Opera GX, Pale Moon, SigmaOS, Lightpanda
+- Arc, DuckDuckGo, Tor, LibreWolf, Mullvad, Sidekick, Shift, Opera GX, Pale Moon, SigmaOS, Lightpanda
 
-Notes:
-- Discovery means executable/path support in the catalog and search paths.
-- Actual availability still depends on what is installable on each OS.
-- Env overrides are supported: `WEBUI_BROWSER_PATH`, `WEBUI_BROWSER`, `BROWSER`.
+Overrides:
+- `WEBUI_BROWSER_PATH` (absolute path)
+- `WEBUI_BROWSER` (kind/name)
+- `BROWSER` (kind/name)
 
 ## Runtime Helper JS Assets
 
-Runtime helper JS is maintained as a source file and exposed in two variants:
-- `webui.runtime_helpers_js` (embedded variant)
-- `webui.runtime_helpers_js_written` (written-file variant)
+Runtime helpers live in `src/bridge/runtime_helpers.source.js` and are built into two variants:
+- `webui.runtime_helpers_js` (embedded; minified by default)
+- `webui.runtime_helpers_js_written` (written-file; not minified by default)
 
 Build outputs:
 - `zig-out/share/webui/runtime_helpers.embed.js`
 - `zig-out/share/webui/runtime_helpers.written.js`
 
+## Build Flags
+
+| Flag | Default | What it does |
+|---|---:|---|
+| `-Ddynamic=true` | `false` | Builds/installs `webui` as a shared library (`.so`/`.dylib`/`.dll`) instead of a static archive. |
+| `-Denable-tls=true` | `false` | Enables TLS defaults in runtime options/API state (transport completion still tracked as partial). |
+| `-Denable-webui-log=true` | `false` | Enables runtime logging defaults (prints RPC/control/lifecycle diagnostics). |
+| `-Dminify-embedded-js=true` | `true` | Minifies the embedded runtime helper JS asset at build time. |
+| `-Dminify-written-js=true` | `false` | Minifies the written runtime helper JS output artifact. |
+| `-Dexample=<name>` | `all` | Selects which demo `zig build run` executes. |
+| `-Drun-mode=webview|browser` | `webview` | Chooses native-webview vs browser-mode path in examples. |
+| `-Dtarget=<triple>` | host | Cross-compiles the library/examples for another target. |
+
+Exported compile-time values:
+- `webui.BuildFlags.dynamic`
+- `webui.BuildFlags.enable_tls`
+- `webui.BuildFlags.enable_webui_log`
+- `webui.BuildFlags.run_mode`
+
+## Useful Build Steps
+
+- `zig build` (install)
+- `zig build test`
+- `zig build examples`
+- `zig build run`
+- `zig build bridge`
+- `zig build runtime-helpers`
+- `zig build vfs-gen`
+- `zig build parity-report`
+- `zig build parity-local`
+- `zig build os-matrix`
+
 ## Examples
+
+Run all demos:
+
+```bash
+zig build run
+```
+
+Run one demo:
+
+```bash
+zig build run -Dexample=translucent_rounded -Drun-mode=webview
+```
 
 Available `-Dexample=` values:
 - `minimal`
@@ -217,30 +263,31 @@ Available `-Dexample=` values:
 - `call_oop_from_js`
 - `serve_folder_oop`
 - `vfs_oop`
-- `all` (default for `zig build run`)
+- `all`
 
 ## Production Notes
 
-What is strong now:
-- Typed RPC and generated bridge tooling.
-- Browser discovery breadth and fallback policy controls.
-- Build/test/parity automation (`parity-local`, `os-matrix`, static guards).
+Strong now:
+- Typed RPC + generated bridge tooling.
+- Browser discovery breadth and fallback control.
+- Push messaging for script execution (WebSocket).
+- Parity/test gates and static build guards.
 
-What still needs completion for strict full parity:
-- TLS-enabled transport should be true HTTPS end-to-end (currently TLS state exists but transport path is still partial).
-- Visual parity for transparency/frameless/corner radius is still marked partial and relies on manual GUI validation.
+Still tracked as partial for strict upstream parity:
+- End-to-end HTTPS transport (`server.tls_toggle`).
+- Visual parity items require manual GUI smoke on real desktops.
 
-Use `docs/manual_gui_checklist.md` for required Linux/macOS/Windows smoke validation.
+Manual GUI validation checklist: `docs/manual_gui_checklist.md`.
 
-## Repository Layout
+## Layout
 
-- `src/` - active Zig runtime and API.
-- `tools/` - build-time generators (`bridge_gen.zig`, `vfs_gen.zig`, asset tooling).
-- `webui/examples/` - Zig example entrypoints and example assets.
-- `docs/` - parity and manual validation docs.
-- `parity/` - parity status + report definitions.
+- `src/` - active Zig runtime + public API (`src/root.zig`)
+- `tools/` - build-time generators (bridge/VFS/assets)
+- `docs/` - parity audit + manual validation checklists
+- `parity/` - parity status + report definitions
+- `upstream_snapshot/` - archived upstream sources (not in active builds)
 
-## Migration Docs
+## Docs
 
 - `MIGRATION.md`
 - `CHANGELOG.md`
