@@ -278,6 +278,7 @@ const RpcRegistryState = struct {
     custom_dispatcher: ?CustomDispatcher,
     custom_context: ?*anyopaque,
     threaded_poll_interval_ns: u64,
+    invoke_mutex: std.Thread.Mutex,
 
     queue_mutex: std.Thread.Mutex,
     queue_cond: std.Thread.Condition,
@@ -296,6 +297,7 @@ const RpcRegistryState = struct {
             .custom_dispatcher = null,
             .custom_context = null,
             .threaded_poll_interval_ns = 2 * std.time.ns_per_ms,
+            .invoke_mutex = .{},
             .queue_mutex = .{},
             .queue_cond = .{},
             .queue = std.array_list.Managed(*RpcTask).init(allocator),
@@ -624,6 +626,9 @@ const WindowState = struct {
     ws_connections: std.array_list.Managed(WsConnectionState),
 
     state_mutex: std.Thread.Mutex,
+    connection_mutex: std.Thread.Mutex,
+    connection_cond: std.Thread.Condition,
+    active_connection_workers: usize,
     server_thread: ?std.Thread,
     server_stop: std.atomic.Value(bool),
     server_ready_mutex: std.Thread.Mutex,
@@ -680,6 +685,9 @@ const WindowState = struct {
             .close_ack_cond = .{},
             .ws_connections = std.array_list.Managed(WsConnectionState).init(allocator),
             .state_mutex = .{},
+            .connection_mutex = .{},
+            .connection_cond = .{},
+            .active_connection_workers = 0,
             .server_thread = null,
             .server_stop = std.atomic.Value(bool).init(false),
             .server_ready_mutex = .{},
@@ -1494,6 +1502,13 @@ const WindowState = struct {
             thread.join();
             self.server_thread = null;
         }
+
+        self.connection_mutex.lock();
+        while (self.active_connection_workers > 0) {
+            self.connection_cond.timedWait(&self.connection_mutex, 10 * std.time.ns_per_ms) catch {};
+        }
+        self.connection_mutex.unlock();
+
         self.state_mutex.lock();
         self.closeAllWsConnectionsLocked();
         self.state_mutex.unlock();
@@ -1536,13 +1551,39 @@ const WindowState = struct {
                     else => continue,
                 }
             };
-            const transfer_ownership = handleConnection(self, std.heap.page_allocator, conn.stream) catch {
+
+            self.connection_mutex.lock();
+            self.active_connection_workers += 1;
+            self.connection_mutex.unlock();
+
+            const thread = std.Thread.spawn(.{}, connectionThreadMain, .{ self, conn.stream }) catch {
+                self.connection_mutex.lock();
+                self.active_connection_workers -= 1;
+                self.connection_cond.broadcast();
+                self.connection_mutex.unlock();
                 conn.stream.close();
                 continue;
             };
-            if (!transfer_ownership) {
-                conn.stream.close();
+            thread.detach();
+        }
+    }
+
+    fn connectionThreadMain(self: *WindowState, stream: std.net.Stream) void {
+        defer {
+            self.connection_mutex.lock();
+            if (self.active_connection_workers > 0) {
+                self.active_connection_workers -= 1;
             }
+            self.connection_cond.broadcast();
+            self.connection_mutex.unlock();
+        }
+
+        const transfer_ownership = handleConnection(self, std.heap.page_allocator, stream) catch {
+            stream.close();
+            return;
+        };
+        if (!transfer_ownership) {
+            stream.close();
         }
     }
 };
@@ -2915,13 +2956,22 @@ fn handleBridgeScriptRoute(
     path_only: []const u8,
 ) !bool {
     if (!std.mem.eql(u8, method, "GET")) return false;
-    if (!std.mem.eql(u8, path_only, state.rpc_state.bridge_options.script_route)) return false;
+    const script_route = state.rpc_state.bridge_options.script_route;
+    if (!std.mem.eql(u8, path_only, script_route)) return false;
 
-    if (state.rpc_state.generated_script == null) {
-        try state.rpc_state.rebuildScript(allocator, state.rpc_state.bridge_options);
-    }
-    const script = state.rpc_state.generated_script orelse bridge_template.default_script;
-    try writeHttpResponse(stream, 200, "application/javascript; charset=utf-8", script);
+    const script_copy = blk: {
+        state.rpc_state.invoke_mutex.lock();
+        defer state.rpc_state.invoke_mutex.unlock();
+
+        if (state.rpc_state.generated_script == null) {
+            try state.rpc_state.rebuildScript(allocator, state.rpc_state.bridge_options);
+        }
+        const script = state.rpc_state.generated_script orelse bridge_template.default_script;
+        break :blk try allocator.dupe(u8, script);
+    };
+    defer allocator.free(script_copy);
+
+    try writeHttpResponse(stream, 200, "application/javascript; charset=utf-8", script_copy);
     return true;
 }
 
@@ -2946,7 +2996,9 @@ fn handleRpcRoute(
     const client_ref = state.findOrCreateClientSessionLocked(client_token) catch null;
     state.state_mutex.unlock();
 
+    state.rpc_state.invoke_mutex.lock();
     const payload = state.rpc_state.invokeFromJsonPayload(allocator, body) catch |err| {
+        state.rpc_state.invoke_mutex.unlock();
         const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
         defer allocator.free(err_body);
         if (state.rpc_state.log_enabled) {
@@ -2955,6 +3007,7 @@ fn handleRpcRoute(
         try writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_body);
         return true;
     };
+    state.rpc_state.invoke_mutex.unlock();
     defer allocator.free(payload);
 
     if (state.rpc_state.log_enabled) {
@@ -3247,8 +3300,8 @@ fn writeHttpResponse(stream: std.net.Stream, status: u16, content_type: []const 
         .{ status, status_text, content_type, body.len },
     );
 
-    try stream.writeAll(header);
-    try stream.writeAll(body);
+    try WindowState.writeSocketAll(stream.handle, header);
+    try WindowState.writeSocketAll(stream.handle, body);
 }
 
 fn contentTypeForPath(path: []const u8) []const u8 {
@@ -3500,6 +3553,77 @@ test "websocket upgrade uses same http server port" {
     try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 101 Switching Protocols") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Upgrade: websocket") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+}
+
+test "lifecycle route stays responsive during long running rpc" {
+    const DemoRpc = struct {
+        pub fn slow() []const u8 {
+            std.Thread.sleep(900 * std.time.ns_per_ms);
+            return "done";
+        }
+    };
+
+    const RpcCallCtx = struct {
+        allocator: std.mem.Allocator,
+        port: u16,
+        response: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            const result = httpRoundTrip(ctx.allocator, ctx.port, "POST", "/rpc", "{\"name\":\"slow\",\"args\":[]}");
+            if (result) |response| {
+                ctx.response = response;
+            } else |err| {
+                ctx.err = err;
+            }
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .transport_mode = .browser_fallback,
+        .auto_open_browser = false,
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "LifecycleResponsive" });
+    try win.bindRpc(DemoRpc, .{
+        .bridge_options = .{ .rpc_route = "/rpc" },
+    });
+    try win.showHtml("<html><body>lifecycle-responsive</body></html>");
+    try app.run();
+
+    var rpc_call_ctx = RpcCallCtx{
+        .allocator = gpa.allocator(),
+        .port = win.state().server_port,
+    };
+    const rpc_thread = try std.Thread.spawn(.{}, RpcCallCtx.run, .{&rpc_call_ctx});
+    errdefer rpc_thread.join();
+
+    std.Thread.sleep(40 * std.time.ns_per_ms);
+
+    const started_ns = std.time.nanoTimestamp();
+    const lifecycle_response = try httpRoundTrip(
+        gpa.allocator(),
+        win.state().server_port,
+        "POST",
+        "/webui/lifecycle",
+        "{\"event\":\"ping\"}",
+    );
+    defer gpa.allocator().free(lifecycle_response);
+    const elapsed_ms = @as(i64, @intCast(@divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms)));
+
+    try std.testing.expect(std.mem.indexOf(u8, lifecycle_response, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(elapsed_ms < 400);
+
+    rpc_thread.join();
+
+    if (rpc_call_ctx.err) |err| return err;
+    const rpc_response = rpc_call_ctx.response orelse return error.InvalidRpcResult;
+    defer gpa.allocator().free(rpc_response);
+    try std.testing.expect(std.mem.indexOf(u8, rpc_response, "\"value\":\"done\"") != null);
 }
 
 test "native_webview transport falls back to browser rendering by default" {
