@@ -136,6 +136,64 @@ Common presets:
 - `LaunchPolicy.browserFirst()` -> `browser_window -> web_url -> native_webview`
 - `LaunchPolicy.webUrlOnly()` -> `web_url` only
 
+## Profile Path Configuration (Explicit, Rule-Based)
+
+`BrowserLaunchOptions` now uses enums/unions instead of profile booleans:
+
+```zig
+pub const BrowserLaunchOptions = struct {
+    surface_mode: BrowserSurfaceMode = .tab,      // tab | app_window | native_webview_host
+    fallback_mode: BrowserFallbackMode = .allow_system, // allow_system | strict
+    profile_rules: []const ProfileRule = &.{},
+    // prompt_policy / extra_args / proxy_server ...
+};
+
+pub const ProfilePathSpec = union(enum) {
+    default,
+    ephemeral,
+    custom: []const u8,
+};
+
+pub const ProfileRuleTarget = union(enum) {
+    webview,
+    browser_any,
+    browser_kind: BrowserKind,
+};
+```
+
+Resolution behavior:
+- First matching rule wins (`profile_rules` order is authoritative).
+- Browser default profile is empty-path semantics: no `--user-data-dir`.
+- `custom: ""` for browser is normalized to browser default profile behavior.
+- Webview `default` uses OS-standard persistent path:
+  - Linux: `$XDG_CONFIG_HOME/webui/` or `$HOME/.config/webui/`
+  - macOS: `$HOME/Library/Application Support/webui/`
+  - Windows: `%LOCALAPPDATA%\\webui\\`
+
+Helpers:
+- `webui.browser_default_profile_path` (`""`)
+- `webui.profile_base_prefix_hint` (current OS hint with trailing separator)
+- `webui.resolveProfileBasePrefix(allocator) ![]u8`
+- `webui.defaultWebviewProfilePath(allocator) ![]u8`
+
+Example:
+
+```zig
+const rules = [_]webui.ProfileRule{
+    .{ .target = .webview, .path = .default },
+    .{ .target = .browser_any, .path = .{ .custom = webui.browser_default_profile_path } },
+};
+
+.app = .{
+    .launch_policy = webui.LaunchPolicy.webviewFirst(),
+    .browser_launch = .{
+        .surface_mode = .native_webview_host,
+        .fallback_mode = .allow_system,
+        .profile_rules = rules[0..],
+    },
+}
+```
+
 ## API At A Glance
 
 Core flow:

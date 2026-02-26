@@ -20,9 +20,25 @@ pub const runtime_helpers_js = bridge_runtime_helpers.embedded_runtime_helpers_j
 pub const runtime_helpers_js_written = bridge_runtime_helpers.written_runtime_helpers_js;
 pub const BrowserPromptPreset = core_runtime.BrowserPromptPreset;
 pub const BrowserPromptPolicy = core_runtime.BrowserPromptPolicy;
+pub const BrowserSurfaceMode = core_runtime.BrowserSurfaceMode;
+pub const BrowserFallbackMode = core_runtime.BrowserFallbackMode;
+pub const ProfilePathSpec = core_runtime.ProfilePathSpec;
+pub const ProfileRuleTarget = core_runtime.ProfileRuleTarget;
+pub const ProfileRule = core_runtime.ProfileRule;
+pub const BrowserLaunchProfileOwnership = core_runtime.BrowserLaunchProfileOwnership;
 pub const BrowserLaunchOptions = core_runtime.BrowserLaunchOptions;
+pub const browser_default_profile_path = core_runtime.browser_default_profile_path;
+pub const profile_base_prefix_hint = core_runtime.profile_base_prefix_hint;
 pub const TlsOptions = tls_runtime.TlsOptions;
 pub const TlsInfo = tls_runtime.TlsInfo;
+
+pub fn resolveProfileBasePrefix(allocator: std.mem.Allocator) ![]u8 {
+    return core_runtime.resolveProfileBasePrefix(allocator);
+}
+
+pub fn defaultWebviewProfilePath(allocator: std.mem.Allocator) ![]u8 {
+    return core_runtime.defaultWebviewProfilePath(allocator);
+}
 
 pub const Size = window_style_types.Size;
 pub const Point = window_style_types.Point;
@@ -1110,6 +1126,7 @@ const WindowState = struct {
     launched_browser_is_child: bool,
     launched_browser_lifecycle_linked: bool,
     launched_browser_profile_dir: ?[]u8,
+    launched_browser_profile_ownership: BrowserLaunchProfileOwnership,
     last_warning: ?[]const u8,
     next_client_id: usize,
     next_connection_id: usize,
@@ -1186,6 +1203,7 @@ const WindowState = struct {
             .launched_browser_is_child = false,
             .launched_browser_lifecycle_linked = false,
             .launched_browser_profile_dir = null,
+            .launched_browser_profile_ownership = .none,
             .last_warning = null,
             .next_client_id = 1,
             .next_connection_id = 1,
@@ -1507,6 +1525,7 @@ const WindowState = struct {
         self.launched_browser_is_child = launch.is_child_process;
         self.launched_browser_lifecycle_linked = launch.lifecycle_linked;
         self.launched_browser_profile_dir = launch.profile_dir;
+        self.launched_browser_profile_ownership = launch.profile_ownership;
         self.runtime_render_state.using_system_fallback_launcher = launch.used_system_fallback;
         self.runtime_render_state.browser_process = if (launch.pid) |pid|
             .{
@@ -1532,8 +1551,9 @@ const WindowState = struct {
 
     fn cleanupBrowserProfileDir(self: *WindowState, allocator: std.mem.Allocator) void {
         if (self.launched_browser_profile_dir) |dir| {
-            core_runtime.cleanupBrowserProfileDir(allocator, dir);
+            core_runtime.cleanupBrowserProfileDir(allocator, dir, self.launched_browser_profile_ownership);
             self.launched_browser_profile_dir = null;
+            self.launched_browser_profile_ownership = .none;
         }
     }
 
@@ -1541,6 +1561,7 @@ const WindowState = struct {
         if (self.launched_browser_profile_dir) |dir| {
             allocator.free(dir);
             self.launched_browser_profile_dir = null;
+            self.launched_browser_profile_ownership = .none;
         }
     }
 
@@ -1634,6 +1655,21 @@ const WindowState = struct {
         return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{self.server_port});
     }
 
+    fn effectiveBrowserLaunchOptions(self: *const WindowState, base: BrowserLaunchOptions) BrowserLaunchOptions {
+        var out = base;
+        if (self.runtime_render_state.active_surface == .native_webview) {
+            // Native-webview mode bootstraps via the platform host process.
+            out.surface_mode = .native_webview_host;
+            out.fallback_mode = .strict;
+            return out;
+        }
+        if (out.surface_mode == .native_webview_host) {
+            // Surface fallback already happened; map to a concrete browser surface.
+            out.surface_mode = if (self.runtime_render_state.active_surface == .browser_window) .app_window else .tab;
+        }
+        return out;
+    }
+
     fn shouldOpenBrowser(self: *const WindowState) bool {
         if (self.runtime_render_state.active_surface == .browser_window) return true;
         if (self.runtime_render_state.active_surface == .native_webview) {
@@ -1684,7 +1720,8 @@ const WindowState = struct {
         try replaceOwned(allocator, &self.last_url, url);
 
         if (self.shouldAttemptBrowserSpawnLocked(allocator, true)) {
-            if (core_runtime.openInBrowser(allocator, url, self.current_style, app_options.browser_launch)) |launch| {
+            const launch_options = self.effectiveBrowserLaunchOptions(app_options.browser_launch);
+            if (core_runtime.openInBrowser(allocator, url, self.current_style, launch_options)) |launch| {
                 self.setLaunchedBrowserLaunch(allocator, launch);
             } else |err| {
                 _ = self.resolveAfterBrowserLaunchFailure(self.runtime_render_state.active_surface);
@@ -2592,7 +2629,8 @@ pub const Window = struct {
         }
 
         if (win_state.shouldAttemptBrowserSpawnLocked(self.app.allocator, false)) {
-            if (core_runtime.openInBrowser(self.app.allocator, url, win_state.current_style, self.app.options.browser_launch)) |launch| {
+            const launch_options = win_state.effectiveBrowserLaunchOptions(self.app.options.browser_launch);
+            if (core_runtime.openInBrowser(self.app.allocator, url, win_state.current_style, launch_options)) |launch| {
                 win_state.setLaunchedBrowserLaunch(self.app.allocator, launch);
             } else |err| {
                 _ = win_state.resolveAfterBrowserLaunchFailure(win_state.runtime_render_state.active_surface);
@@ -4964,6 +5002,44 @@ test "native webview mode bootstraps host process spawn when backend is not read
     } else {
         try std.testing.expect(active_surface == .web_url or active_surface == .browser_window);
     }
+}
+
+test "effective browser launch options reserve native host bootstrap for webview surface" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app_browser = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .browser_window, .second = .web_url, .third = null },
+    });
+    defer app_browser.deinit();
+    var win_browser = try app_browser.newWindow(.{ .title = "EffectiveLaunchBrowser" });
+
+    win_browser.state().state_mutex.lock();
+    const browser_base: BrowserLaunchOptions = .{
+        .surface_mode = .native_webview_host,
+        .fallback_mode = .strict,
+    };
+    const browser_effective = win_browser.state().effectiveBrowserLaunchOptions(browser_base);
+    win_browser.state().state_mutex.unlock();
+
+    try std.testing.expectEqual(@as(BrowserSurfaceMode, .app_window), browser_effective.surface_mode);
+    try std.testing.expectEqual(@as(BrowserFallbackMode, .strict), browser_effective.fallback_mode);
+
+    var app_native = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .native_webview, .second = .web_url, .third = null },
+    });
+    defer app_native.deinit();
+    var win_native = try app_native.newWindow(.{ .title = "EffectiveLaunchNative" });
+
+    win_native.state().state_mutex.lock();
+    const native_effective = win_native.state().effectiveBrowserLaunchOptions(.{
+        .surface_mode = .tab,
+        .fallback_mode = .allow_system,
+    });
+    win_native.state().state_mutex.unlock();
+
+    try std.testing.expectEqual(@as(BrowserSurfaceMode, .native_webview_host), native_effective.surface_mode);
+    try std.testing.expectEqual(@as(BrowserFallbackMode, .strict), native_effective.fallback_mode);
 }
 
 test "browser launch failure fallback advances from active launch surface" {

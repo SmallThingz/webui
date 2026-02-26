@@ -273,19 +273,21 @@ fn appOptionsFor(comptime kind: ExampleKind) webui.AppOptions {
     const launch_policy = launchPolicyFromRunModeValue(run_mode);
     const launch_pref = browserLaunchPreferenceFromRunMode(run_mode);
     const native_first = launch_policy.first == .native_webview;
-    var require_app_window = native_first;
-    var allow_system_fallback = !native_first;
+    var surface_mode: webui.BrowserSurfaceMode = if (native_first) .native_webview_host else .tab;
+    var fallback_mode: webui.BrowserFallbackMode = if (native_first) .strict else .allow_system;
     switch (launch_pref) {
-        .app_window => {
-            require_app_window = true;
-            allow_system_fallback = false;
-        },
-        .web_tab => {
-            require_app_window = false;
-            allow_system_fallback = true;
-        },
+        .app_window => surface_mode = .app_window,
+        .web_tab => surface_mode = .tab,
         .auto => {},
     }
+    if (!native_first and surface_mode == .app_window) {
+        fallback_mode = .strict;
+    }
+
+    const profile_rules = [_]webui.ProfileRule{
+        .{ .target = .webview, .path = .default },
+        .{ .target = .browser_any, .path = .{ .custom = webui.browser_default_profile_path } },
+    };
 
     return .{
         .launch_policy = launch_policy,
@@ -293,8 +295,9 @@ fn appOptionsFor(comptime kind: ExampleKind) webui.AppOptions {
         .enable_webui_log = true,
         .public_network = kind == .public_network,
         .browser_launch = .{
-            .require_app_mode_window = require_app_window,
-            .allow_system_fallback = allow_system_fallback,
+            .surface_mode = surface_mode,
+            .fallback_mode = fallback_mode,
+            .profile_rules = profile_rules[0..],
         },
         .window_fallback_emulation = !native_first,
     };

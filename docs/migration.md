@@ -28,6 +28,76 @@ pub const LaunchPolicy = struct {
 };
 ```
 
+## Browser/Profile Launch Options (Hard Replace)
+
+Removed `BrowserLaunchOptions` fields:
+- `force_isolated_chromium_instance`
+- `isolated_profile_global`
+- `isolated_profile_dir`
+- `native_webview_global_profile`
+- `prefer_native_webview_host`
+- `require_app_mode_window`
+- `allow_system_fallback`
+
+Replacement:
+- `surface_mode: BrowserSurfaceMode`
+- `fallback_mode: BrowserFallbackMode`
+- `profile_rules: []const ProfileRule`
+
+```zig
+pub const BrowserSurfaceMode = enum {
+    tab,
+    app_window,
+    native_webview_host,
+};
+
+pub const BrowserFallbackMode = enum {
+    allow_system,
+    strict,
+};
+
+pub const ProfilePathSpec = union(enum) {
+    default,
+    ephemeral,
+    custom: []const u8,
+};
+
+pub const ProfileRuleTarget = union(enum) {
+    webview,
+    browser_any,
+    browser_kind: BrowserKind,
+};
+
+pub const ProfileRule = struct {
+    target: ProfileRuleTarget,
+    path: ProfilePathSpec,
+};
+```
+
+Rule behavior:
+- First matching rule wins.
+- Browser default profile uses empty-string semantics (`webui.browser_default_profile_path`).
+- Browser `custom: ""` means default browser profile (no `--user-data-dir`).
+- Webview `default` resolves to OS-standard app config path.
+
+Example:
+
+```zig
+const rules = [_]webui.ProfileRule{
+    .{ .target = .webview, .path = .default },
+    .{ .target = .browser_any, .path = .{ .custom = webui.browser_default_profile_path } },
+};
+
+.app = .{
+    .launch_policy = webui.LaunchPolicy.webviewFirst(),
+    .browser_launch = .{
+        .surface_mode = .native_webview_host,
+        .fallback_mode = .allow_system,
+        .profile_rules = rules[0..],
+    },
+}
+```
+
 ## Old -> New Mapping
 
 ### Native-first with browser fallback

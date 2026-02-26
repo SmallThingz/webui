@@ -57,8 +57,22 @@ var app = try webui.App.init(allocator, .{
         .second = .browser_window,
         .third = .web_url,
     },
+    .browser_launch = .{
+        .surface_mode = .native_webview_host,
+        .fallback_mode = .allow_system,
+        .profile_rules = &.{
+            .{ .target = .webview, .path = .default },
+            .{ .target = .browser_any, .path = .{ .custom = webui.browser_default_profile_path } },
+        },
+    },
 });
 ```
+
+Profile-path notes:
+- Browser default profile is represented by `webui.browser_default_profile_path` (empty string); no `--user-data-dir` is forced.
+- Webview default profile path is OS-standard config/app-data location (`defaultWebviewProfilePath`).
+- `ProfileRule` resolution is first-match wins.
+- Use `resolveProfileBasePrefix` and `profile_base_prefix_hint` to build custom portable profile paths.
 
 Repository cleanup notes:
 - Active example sources are under `examples/` (used directly by `zig build run`/`zig build examples`).
