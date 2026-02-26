@@ -215,6 +215,9 @@ let __webuiSocketOpen = false;
 let __webuiSocketStopped = false;
 let __webuiSocketReconnectDelayMs = 120;
 let __webuiSocketQueue = [];
+let __webuiSocketEverOpened = false;
+let __webuiSocketFailedAttempts = 0;
+const __webuiSocketMaxFailedAttemptsBeforeStop = 8;
 
 function __webuiSocketUrl() {
   try {
@@ -319,6 +322,10 @@ function __webuiConnectPushSocket() {
   if (typeof globalThis === "undefined") return;
   if (__webuiSocketStopped) return;
   if (typeof globalThis.WebSocket !== "function") return;
+  if (!__webuiSocketEverOpened && __webuiSocketFailedAttempts >= __webuiSocketMaxFailedAttemptsBeforeStop) {
+    __webuiSocketStopped = true;
+    return;
+  }
   if (__webuiSocket && (__webuiSocket.readyState === globalThis.WebSocket.CONNECTING || __webuiSocket.readyState === globalThis.WebSocket.OPEN)) return;
 
   const url = __webuiSocketUrl();
@@ -335,6 +342,8 @@ function __webuiConnectPushSocket() {
   __webuiSocket = socket;
   socket.onopen = () => {
     __webuiSocketOpen = true;
+    __webuiSocketEverOpened = true;
+    __webuiSocketFailedAttempts = 0;
     __webuiSocketReconnectDelayMs = 120;
     __webuiSocketFlushQueue();
   };
@@ -346,6 +355,12 @@ function __webuiConnectPushSocket() {
     __webuiSocketOpen = false;
     __webuiSocket = null;
     if (__webuiSocketStopped) return;
+    __webuiSocketFailedAttempts += 1;
+    if (!__webuiSocketEverOpened && __webuiSocketFailedAttempts >= __webuiSocketMaxFailedAttemptsBeforeStop) {
+      __webuiSocketStopped = true;
+      __webuiSocketQueue = [];
+      return;
+    }
     const delay = Math.min(1500, __webuiSocketReconnectDelayMs);
     __webuiSocketReconnectDelayMs = Math.min(2500, __webuiSocketReconnectDelayMs * 2);
     setTimeout(__webuiConnectPushSocket, delay);
@@ -453,6 +468,5 @@ async function __webuiExecuteScriptTask(task) {
     globalThis.__webuiWindowStyle = __webuiWindowStyle;
     globalThis.__webuiGetWindowStyle = __webuiGetWindowStyle;
     globalThis.__webuiGetWindowCapabilities = __webuiGetWindowCapabilities;
-    setTimeout(() => { __webuiGetWindowStyle().catch(() => {}); }, 0);
   }
 })();

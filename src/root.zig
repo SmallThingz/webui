@@ -167,33 +167,6 @@ const CloseCallbackState = struct {
     context: ?*anyopaque = null,
 };
 
-const LifecycleConfig = struct {
-    enable_heartbeat: bool,
-    heartbeat_interval_ms: u32,
-    heartbeat_hidden_interval_ms: u32,
-    heartbeat_timeout_ms: u32,
-    heartbeat_failures_before_close: u8,
-    heartbeat_initial_delay_ms: u32,
-};
-
-const lifecycle_child_process_config = LifecycleConfig{
-    .enable_heartbeat = false,
-    .heartbeat_interval_ms = 0,
-    .heartbeat_hidden_interval_ms = 0,
-    .heartbeat_timeout_ms = 0,
-    .heartbeat_failures_before_close = 0,
-    .heartbeat_initial_delay_ms = 0,
-};
-
-const lifecycle_fallback_config = LifecycleConfig{
-    .enable_heartbeat = true,
-    .heartbeat_interval_ms = 1_200,
-    .heartbeat_hidden_interval_ms = 3_000,
-    .heartbeat_timeout_ms = 500,
-    .heartbeat_failures_before_close = 2,
-    .heartbeat_initial_delay_ms = 400,
-};
-
 fn backendWarningForError(err: anyerror, will_fallback: bool) ?[]const u8 {
     return switch (err) {
         error.NativeBackendUnavailable => if (will_fallback)
@@ -1074,15 +1047,6 @@ const WindowState = struct {
         }
 
         _ = self.requestClose();
-    }
-
-    fn hasTrackedChildBrowser(self: *const WindowState) bool {
-        return self.launched_browser_lifecycle_linked;
-    }
-
-    fn lifecycleConfig(self: *const WindowState) LifecycleConfig {
-        if (self.hasTrackedChildBrowser()) return lifecycle_child_process_config;
-        return lifecycle_fallback_config;
     }
 
     fn terminateLaunchedBrowser(self: *WindowState, allocator: std.mem.Allocator) void {
@@ -2585,7 +2549,6 @@ fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: s
 
     if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return;
     if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return;
-    if (try handleLifecycleConfigRoute(state, allocator, stream, request.method, path_only)) return;
     if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return;
     if (try handleScriptPullRoute(state, allocator, stream, request.method, path_only, request.headers)) return;
     if (try handleScriptResponseRoute(state, allocator, stream, request.method, path_only, request.body)) return;
@@ -2594,27 +2557,6 @@ fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: s
     if (try handleWindowContentRoute(state, allocator, stream, request.method, path_only)) return;
 
     try writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "not found");
-}
-
-fn handleLifecycleConfigRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "GET")) return false;
-    if (!std.mem.eql(u8, path_only, "/webui/lifecycle/config")) return false;
-
-    state.state_mutex.lock();
-    const config = state.lifecycleConfig();
-    state.state_mutex.unlock();
-
-    const payload = try std.json.Stringify.valueAlloc(allocator, config, .{});
-    defer allocator.free(payload);
-
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-    return true;
 }
 
 fn handleLifecycleRoute(
@@ -2631,7 +2573,6 @@ fn handleLifecycleRoute(
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
     var logged_event = false;
-    var heartbeat_event = false;
     const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
     state.state_mutex.lock();
     _ = state.findOrCreateClientSessionLocked(client_token) catch null;
@@ -2646,10 +2587,7 @@ fn handleLifecycleRoute(
                         state.requestLifecycleCloseFromFrontend();
                         state.state_mutex.unlock();
                     }
-                    if (std.mem.eql(u8, event_value.string, "heartbeat")) {
-                        heartbeat_event = true;
-                    }
-                    if (state.rpc_state.log_enabled and !std.mem.eql(u8, event_value.string, "heartbeat")) {
+                    if (state.rpc_state.log_enabled) {
                         std.debug.print("[webui.lifecycle] event={s}\n", .{event_value.string});
                         logged_event = true;
                     }
@@ -2658,7 +2596,7 @@ fn handleLifecycleRoute(
         }
     }
 
-    if (state.rpc_state.log_enabled and !logged_event and !heartbeat_event) {
+    if (state.rpc_state.log_enabled and !logged_event) {
         std.debug.print("[webui.lifecycle] body={s}\n", .{body});
     }
 
@@ -3414,54 +3352,6 @@ test "native_webview browser fallback can be disabled" {
 
     var win = try app.newWindow(.{ .title = "NativeOnly" });
     try std.testing.expectError(error.TransportNotBrowserRenderable, win.browserUrl());
-}
-
-test "lifecycle config enables heartbeat without tracked child browser" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
-    });
-    defer app.deinit();
-
-    var win = try app.newWindow(.{ .title = "LifecycleConfigEnabled" });
-    try win.showHtml("<html><body>lifecycle-config</body></html>");
-    try app.run();
-
-    const response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/webui/lifecycle/config", null);
-    defer gpa.allocator().free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"enable_heartbeat\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"heartbeat_interval_ms\":1200") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"heartbeat_hidden_interval_ms\":3000") != null);
-}
-
-test "lifecycle config disables heartbeat for lifecycle-linked child launches" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    var app = try App.init(gpa.allocator(), .{
-        .transport_mode = .browser_fallback,
-        .auto_open_browser = false,
-    });
-    defer app.deinit();
-
-    var win = try app.newWindow(.{ .title = "LifecycleConfigDisabled" });
-    try win.showHtml("<html><body>lifecycle-config-child</body></html>");
-    try app.run();
-
-    win.state().state_mutex.lock();
-    win.state().launched_browser_is_child = true;
-    win.state().launched_browser_lifecycle_linked = true;
-    win.state().state_mutex.unlock();
-
-    const response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/webui/lifecycle/config", null);
-    defer gpa.allocator().free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"enable_heartbeat\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"heartbeat_interval_ms\":0") != null);
 }
 
 test "linked child exit requests close immediately" {

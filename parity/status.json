@@ -13,7 +13,7 @@
 
     { "id": "browser.discovery.catalog", "status": "implemented", "tests": ["browser_discovery.test.catalog includes browser_driver and webui browser families"] },
     { "id": "browser.discovery.env_precedence", "status": "implemented", "tests": ["browser_discovery.test.required browser matrix coverage is present across all os specs"] },
-    { "id": "browser.launch.fallback", "status": "implemented", "tests": ["root.test.lifecycle config enables heartbeat without tracked child browser"] },
+    { "id": "browser.launch.fallback", "status": "implemented", "tests": ["root.test.non-linked tracked browser pid death requests close"] },
     { "id": "browser.launch.prompt_quiet_defaults", "status": "implemented", "tests": ["ported.webui.test.quiet prompt policy injects suppression flags for chromium family"] },
     { "id": "browser.launch.prompt_opt_in", "status": "implemented", "tests": ["ported.webui.test.browser default preset disables quiet flags unless explicitly re-enabled"] },
     { "id": "browser.launch.browser_specific_flags", "status": "implemented", "tests": ["ported.webui.test.edge and brave receive browser-specific quiet flags"] },

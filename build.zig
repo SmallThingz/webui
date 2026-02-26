@@ -296,12 +296,6 @@ pub fn build(b: *Build) void {
     vfs_step.dependOn(&run_vfs_gen.step);
 
     const examples_step = b.step("examples", "Build all Zig ported examples");
-    if (linux_webview_host_install_step) |host_install| {
-        examples_step.dependOn(host_install);
-    }
-    if (linux_browser_host_install_step) |host_install| {
-        examples_step.dependOn(host_install);
-    }
     var selected_example_found = selected_example == .all;
     if (example_shared_mod) |shared_mod| {
         for (examples) |example| {
@@ -309,14 +303,8 @@ pub fn build(b: *Build) void {
 
             const built = addExample(b, example, webui_mod, shared_mod, webui_lib, target, optimize, runtime_helpers_assets.prepare_step);
             examples_step.dependOn(built.install_step);
-            if (linux_webview_host_install_step) |host_install| {
-                built.install_step.dependOn(host_install);
-                built.run_step.dependOn(host_install);
-            }
-            if (linux_browser_host_install_step) |host_install| {
-                built.install_step.dependOn(host_install);
-                built.run_step.dependOn(host_install);
-            }
+            if (linux_webview_host_install_step) |host_install| built.run_step.dependOn(host_install);
+            if (linux_browser_host_install_step) |host_install| built.run_step.dependOn(host_install);
 
             if (selected_example == .all or selected_example == example.selector) {
                 selected_example_found = true;
