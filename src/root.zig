@@ -1810,17 +1810,6 @@ const WindowState = struct {
         return false;
     }
 
-    fn dequeueScriptForConnectionLocked(self: *WindowState, connection_id: usize) ?*ScriptTask {
-        for (self.script_pending.items, 0..) |task, idx| {
-            if (task.target_connection) |target| {
-                if (target != connection_id) continue;
-            }
-            _ = self.script_pending.orderedRemove(idx);
-            return task;
-        }
-        return null;
-    }
-
     fn completeScriptTaskLocked(
         self: *WindowState,
         task_id: u64,
@@ -3430,7 +3419,6 @@ fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: s
     if (try handleRpcJobRoute(state, allocator, stream, request.method, request.path, path_only)) return false;
     if (try handleRpcJobCancelRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
     if (try handleLifecycleRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
-    if (try handleScriptPullRoute(state, allocator, stream, request.method, path_only, request.headers)) return false;
     if (try handleScriptResponseRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
     if (try handleWindowControlRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
     if (try handleWindowStyleRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
@@ -3482,64 +3470,6 @@ fn handleLifecycleRoute(
     }
 
     try writeHttpResponse(stream, 200, "application/json; charset=utf-8", "{\"ok\":true}");
-    return true;
-}
-
-fn handleScriptPullRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-    headers: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "GET")) return false;
-    if (!std.mem.eql(u8, path_only, "/webui/script/pull")) return false;
-
-    const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
-
-    state.state_mutex.lock();
-    const client_ref = state.findOrCreateClientSessionLocked(client_token) catch {
-        state.state_mutex.unlock();
-        try writeHttpResponse(stream, 500, "application/json; charset=utf-8", "{\"error\":\"client_session_failed\"}");
-        return true;
-    };
-    const task = state.dequeueScriptForConnectionLocked(client_ref.connection_id);
-    if (task) |work| {
-        if (work.expect_result) {
-            state.script_inflight.append(work) catch {
-                state.state_mutex.unlock();
-                try writeHttpResponse(stream, 500, "application/json; charset=utf-8", "{\"error\":\"script_queue_failed\"}");
-                return true;
-            };
-        }
-    }
-    state.state_mutex.unlock();
-
-    if (task == null) {
-        try writeHttpResponse(stream, 204, "application/json; charset=utf-8", "");
-        return true;
-    }
-
-    const work = task.?;
-    const payload = try std.json.Stringify.valueAlloc(allocator, .{
-        .id = work.id,
-        .script = work.script,
-        .expect_result = work.expect_result,
-        .client_id = client_ref.client_id,
-        .connection_id = client_ref.connection_id,
-    }, .{});
-    defer allocator.free(payload);
-
-    if (!work.expect_result) {
-        work.mutex.lock();
-        work.done = true;
-        work.cond.signal();
-        work.mutex.unlock();
-        work.deinit();
-    }
-
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
     return true;
 }
 
@@ -5055,7 +4985,7 @@ test "evalScript times out when no client is polling" {
     try std.testing.expect(result.value == null);
 }
 
-test "script pull and response routes complete queued eval task" {
+test "script response route completes queued eval task" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -5071,37 +5001,15 @@ test "script pull and response routes complete queued eval task" {
     const state = win.state();
     state.state_mutex.lock();
     const task = try state.queueScriptLocked(gpa.allocator(), "return 6 * 7;", null, true);
+    const moved = state.removeScriptPendingLocked(task);
+    try std.testing.expect(moved);
+    try state.script_inflight.append(task);
     state.state_mutex.unlock();
-
-    const pull_response = try httpRoundTripWithHeaders(
-        gpa.allocator(),
-        state.server_port,
-        "GET",
-        "/webui/script/pull",
-        null,
-        &.{"x-webui-client-id: script-test-client"},
-    );
-    defer gpa.allocator().free(pull_response);
-    try std.testing.expect(std.mem.indexOf(u8, pull_response, "HTTP/1.1 200 OK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pull_response, "\"expect_result\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pull_response, "return 6 * 7;") != null);
-
-    const body = httpResponseBody(pull_response);
-    var parsed = try std.json.parseFromSlice(std.json.Value, gpa.allocator(), body, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value == .object);
-    const id_value = parsed.value.object.get("id") orelse return error.InvalidHttpRequest;
-    const pulled_id: u64 = switch (id_value) {
-        .integer => |v| @as(u64, @intCast(v)),
-        .float => |v| @as(u64, @intFromFloat(v)),
-        else => return error.InvalidHttpRequest,
-    };
-    try std.testing.expectEqual(task.id, pulled_id);
 
     const completion_body = try std.fmt.allocPrint(
         gpa.allocator(),
         "{{\"id\":{d},\"js_error\":false,\"value\":42}}",
-        .{pulled_id},
+        .{task.id},
     );
     defer gpa.allocator().free(completion_body);
 

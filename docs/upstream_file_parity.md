@@ -50,7 +50,7 @@ Implemented capability groups:
 - Raw channel send/receive.
 - Public/private bind policy equivalent (`AppOptions.public_network`).
 - Proxy launch option equivalent (`BrowserLaunchOptions.proxy_server`).
-- Script command queue + response routing (`/webui/script/pull`, `/webui/script/response`) with modern `runScript`/`evalScript`.
+- Script command queue + push dispatch (`/webui/ws`) with response routing (`/webui/script/response`) for modern `runScript`/`evalScript`.
 - TLS runtime state API (`TlsOptions`, `App.setTlsCertificate`, `App.tlsInfo`) with certificate ingest and generated fallback material.
 
 Remaining gaps versus full `webui.c` behavior:
