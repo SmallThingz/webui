@@ -1606,13 +1606,30 @@ const WindowState = struct {
     fn reconcileChildExit(self: *WindowState, allocator: std.mem.Allocator) void {
         const pid = self.launched_browser_pid orelse return;
 
+        // IMPORTANT:
+        // In browser/web modes, the PID we track can be a short-lived launcher process
+        // (or helper) rather than the long-lived browser tab/window process.
+        // We must not close the backend just because that PID exits.
+        // Only native-webview-first mode treats tracked process death as a terminal close.
+        const should_close_on_pid_exit = self.launch_policy.first == .native_webview;
+
         if (self.launched_browser_lifecycle_linked and core_runtime.linkedChildExited(pid)) {
-            self.markClosedFromTrackedBrowserExit(allocator, "child-exited");
+            if (should_close_on_pid_exit) {
+                self.markClosedFromTrackedBrowserExit(allocator, "child-exited");
+            } else {
+                self.clearTrackedBrowserState(allocator);
+                self.emit(.window_state, "browser-detached", "child-exited");
+            }
             return;
         }
 
         if (!core_runtime.isProcessAlive(pid)) {
-            self.markClosedFromTrackedBrowserExit(allocator, "browser-exited");
+            if (should_close_on_pid_exit) {
+                self.markClosedFromTrackedBrowserExit(allocator, "browser-exited");
+            } else {
+                self.clearTrackedBrowserState(allocator);
+                self.emit(.window_state, "browser-detached", "browser-exited");
+            }
         }
     }
 
@@ -2548,6 +2565,15 @@ pub const Window = struct {
     index: usize,
     id: usize,
 
+    fn refreshRenderedContentLocked(self: *Window, win_state: *WindowState) !void {
+        try win_state.ensureBrowserRenderState(self.app.allocator, self.app.options);
+        if (win_state.isNativeWindowActive()) {
+            if (win_state.last_url) |url| {
+                _ = win_state.backend.showContent(.{ .url = url }) catch {};
+            }
+        }
+    }
+
     pub fn showHtml(self: *Window, html: []const u8) !void {
         self.app.enforcePinnedMoveInvariant(.app);
         if (html.len == 0) return error.EmptyHtml;
@@ -2564,12 +2590,7 @@ pub const Window = struct {
         }
         win_state.shown = true;
 
-        try win_state.ensureBrowserRenderState(self.app.allocator, self.app.options);
-        if (win_state.isNativeWindowActive()) {
-            if (win_state.last_url) |url| {
-                _ = win_state.backend.showContent(.{ .url = url }) catch {};
-            }
-        }
+        try self.refreshRenderedContentLocked(win_state);
 
         self.emitRuntimeDiagnostics();
         self.emit(.navigation, "show-html", html);
@@ -2601,12 +2622,7 @@ pub const Window = struct {
         }
         win_state.shown = true;
 
-        try win_state.ensureBrowserRenderState(self.app.allocator, self.app.options);
-        if (win_state.isNativeWindowActive()) {
-            if (win_state.last_url) |url| {
-                _ = win_state.backend.showContent(.{ .url = url }) catch {};
-            }
-        }
+        try self.refreshRenderedContentLocked(win_state);
 
         self.emitRuntimeDiagnostics();
         self.emit(.navigation, "show-file", path);
@@ -3020,6 +3036,9 @@ pub const Service = struct {
         const state = win.state();
         state.state_mutex.lock();
         defer state.state_mutex.unlock();
+        // Reconcile tracked process state every loop.
+        // `reconcileChildExit()` is mode-aware and only turns PID exit into app close
+        // for native-webview-first mode. Browser/web modes only detach PID tracking.
         state.reconcileChildExit(self.app.allocator);
         return state.close_requested.load(.acquire);
     }
@@ -3755,7 +3774,6 @@ fn handleLifecycleRoute(
     if (!std.mem.eql(u8, path_only, "/webui/lifecycle")) return false;
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
-    var logged_event = false;
     const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
     state.state_mutex.lock();
     _ = state.findOrCreateClientSessionLocked(client_token) catch null;
@@ -3770,17 +3788,9 @@ fn handleLifecycleRoute(
                         state.requestLifecycleCloseFromFrontend();
                         state.state_mutex.unlock();
                     }
-                    if (state.rpc_state.log_enabled) {
-                        std.debug.print("[webui.lifecycle] event={s}\n", .{event_value.string});
-                        logged_event = true;
-                    }
                 }
             }
         }
-    }
-
-    if (state.rpc_state.log_enabled and !logged_event) {
-        std.debug.print("[webui.lifecycle] body={s}\n", .{body});
     }
 
     try writeHttpResponse(stream, 200, "application/json; charset=utf-8", "{\"ok\":true}");
@@ -5120,7 +5130,7 @@ test "window_closing lifecycle event is ignored while tracked browser pid is ali
     try std.testing.expect(!should_close);
 }
 
-test "non-linked tracked browser pid death requests close" {
+test "non-linked tracked browser pid death detaches without close in web mode" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -5152,20 +5162,27 @@ test "non-linked tracked browser pid death requests close" {
     win.state().state_mutex.unlock();
 
     var closed = false;
+    var detached = false;
     var attempts: usize = 0;
     while (attempts < 120) : (attempts += 1) {
         win.state().state_mutex.lock();
         win.state().reconcileChildExit(gpa.allocator());
         const requested = win.state().close_requested.load(.acquire);
+        const tracked_pid = win.state().launched_browser_pid;
         win.state().state_mutex.unlock();
         if (requested) {
             closed = true;
             break;
         }
+        if (tracked_pid == null) {
+            detached = true;
+            break;
+        }
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
 
-    try std.testing.expect(closed);
+    try std.testing.expect(!closed);
+    try std.testing.expect(detached);
 }
 
 test "window style apply updates persisted state" {

@@ -65,11 +65,11 @@ zig build -l
 zig build -h
 ```
 
-## Cleanup Notes
+## Repository Hygiene
 
-- Removed stale compatibility handling from JS asset generation (`js_asset_gen` no longer accepts legacy extra args).
-- Collapsed duplicated `Service` move-invariant guard calls to a single guard boundary (`Service.window()` + `App` entrypoints).
-- Async RPC jobs remain push-first; fallback polling now starts only when needed (or after a short grace window) to reduce extra requests.
+- Removed duplicate render-path logic in `Window.showHtml` / `Window.showFile`.
+- Removed unnecessary lifecycle unload signaling to reduce extra runtime traffic.
+- Profile launch semantics are strict and rule-based (`profile_rules`, first-match wins).
 
 ## Add To Your Project
 

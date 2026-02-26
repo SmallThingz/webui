@@ -579,17 +579,10 @@ async function __webuiExecuteScriptTask(task) {
 })();
 
 (function __webuiInstallLifecycleHooks() {
-  if (typeof globalThis === "undefined" || typeof globalThis.addEventListener !== "function") return;
-  globalThis.addEventListener("beforeunload", () => {
-    // beforeunload also fires on reload/navigation, so do not signal hard-close here.
-    __webuiNotifyLifecycle("window_unloading");
-  });
-
-  if (typeof globalThis !== "undefined") {
-    globalThis.__webuiNotifyLifecycle = __webuiNotifyLifecycle;
-    globalThis.__webuiWindowControl = __webuiWindowControl;
-    globalThis.__webuiWindowStyle = __webuiWindowStyle;
-    globalThis.__webuiGetWindowStyle = __webuiGetWindowStyle;
-    globalThis.__webuiGetWindowCapabilities = __webuiGetWindowCapabilities;
-  }
+  if (typeof globalThis === "undefined") return;
+  globalThis.__webuiNotifyLifecycle = __webuiNotifyLifecycle;
+  globalThis.__webuiWindowControl = __webuiWindowControl;
+  globalThis.__webuiWindowStyle = __webuiWindowStyle;
+  globalThis.__webuiGetWindowStyle = __webuiGetWindowStyle;
+  globalThis.__webuiGetWindowCapabilities = __webuiGetWindowCapabilities;
 })();

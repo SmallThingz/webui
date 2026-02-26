@@ -76,7 +76,7 @@ Profile-path notes:
 
 Repository cleanup notes:
 - Active example sources are under `examples/` (used directly by `zig build run`/`zig build examples`).
-- Legacy bridge asset compatibility arguments were removed from the build-time JS asset generator.
+- Bridge asset generation uses a single strict build-time path.
 
 ## Pinned Struct Move Safety
 

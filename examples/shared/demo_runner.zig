@@ -419,7 +419,7 @@ fn hintFor(comptime kind: ExampleKind) []const u8 {
         .public_network => "Public listen policy enabled for LAN testing.",
         .multi_client => "Open multiple clients and verify independent RPC sessions.",
         .chatgpt_api => "RPC transport pattern suitable for chat-like workflows.",
-        .custom_web_server => "Custom server integration shape with bridge-compatible routes.",
+        .custom_web_server => "Custom server integration shape with bridge RPC routes.",
         .react => "Component-style RPC calls using the generated bridge contract.",
         else => "Window style/control and transport demo.",
     };

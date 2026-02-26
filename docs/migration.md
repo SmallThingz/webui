@@ -213,7 +213,7 @@ Typed control APIs:
 - Existing warning log strings may still appear, but typed diagnostics are the authoritative integration surface.
 - For Linux packaging, validate helper/runtime presence through `listRuntimeRequirements`.
 - Active examples are tracked under `examples/` and built from those paths directly.
-- Legacy JS asset generator compatibility arguments were removed; the build path is now strict and deterministic.
+- JS asset generation is strict and deterministic in the active build path.
 
 ## Pinned Struct Move Safety
 
