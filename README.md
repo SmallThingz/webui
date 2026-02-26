@@ -28,8 +28,9 @@ See `parity/status.json`, `docs/manual_gui_checklist.md`, and `docs/upstream_fil
 - **Pure Zig active build graph**: no `@cImport`, no `translate-c`, no runtime C/C++/ObjC compilation in the active library.
 - **Dev-friendly API**: `App`, `Window`, `Service`, `WindowStyle`, `WindowControl`, typed `Event`s.
 - **Comptime RPC surface**: define `pub const rpc_methods = struct { ... }` once, generate JS/TS bridge from it.
-- **Push transport for scripts**: WebSocket push channel (no constant `/lifecycle` polling).
+- **Push transport for scripts**: WebSocket push channel with delayed bounded poll fallback.
 - **Aggressive browser discovery**: broad catalog + OS-specific search paths + env overrides.
+- **Tracked example tree**: active demos live under `examples/` (no untracked shadow example paths).
 - **Parity/test gates**: `zig build test`, `zig build examples`, `zig build parity-local`, `zig build os-matrix`.
 
 ## Quick Start
@@ -60,6 +61,12 @@ List steps and options:
 zig build -l
 zig build -h
 ```
+
+## Cleanup Notes
+
+- Removed stale compatibility handling from JS asset generation (`js_asset_gen` no longer accepts legacy extra args).
+- Collapsed duplicated `Service` move-invariant guard calls to a single guard boundary (`Service.window()` + `App` entrypoints).
+- Async RPC jobs remain push-first; fallback polling now starts only when needed (or after a short grace window) to reduce extra requests.
 
 ## Add To Your Project
 
@@ -228,7 +235,7 @@ Async jobs (push-first):
 - Set `RpcOptions.execution_mode = .queued_async`.
 - `POST <rpc_route>` returns `{ job_id, state, poll_min_ms, poll_max_ms }`.
 - Completion is pushed over WebSocket as `rpc_job_update`.
-- JS bridge waits for push first, then uses bounded polling fallback (`GET /rpc/job?id=...`).
+- JS bridge waits for push first, then activates bounded polling fallback (`GET /rpc/job?id=...`) only if push is unavailable/late.
 - Cancel route: `POST /rpc/job/cancel` with `{ "job_id": <id> }`.
 
 Typed APIs:
@@ -337,6 +344,8 @@ Run one demo:
 zig build run -Dexample=translucent_rounded -Drun-mode=webview
 ```
 
+All demos share the same runtime harness but now expose scenario-specific controls/flows (for example `call_js_from_zig` performs a backend-driven script update, while data-centric demos expose `word_count` and `save_note` actions).
+
 Available `-Dexample=` values:
 - `minimal`
 - `call_js_from_zig`
@@ -376,10 +385,10 @@ Manual GUI validation checklist: `docs/manual_gui_checklist.md`.
 ## Layout
 
 - `src/` - active Zig runtime + public API (`src/root.zig`)
+- `examples/` - tracked Zig example entrypoints + shared demo runner
 - `tools/` - build-time generators (bridge/VFS/assets)
 - `docs/` - parity audit + manual validation checklists
 - `parity/` - parity status + report definitions
-- `upstream_snapshot/` - archived upstream sources (not in active builds)
 
 ## Docs
 

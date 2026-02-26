@@ -2785,12 +2785,10 @@ pub const Service = struct {
     }
 
     pub fn run(self: *Service) !void {
-        self.enforcePinnedMoveInvariant();
         try self.app.run();
     }
 
     pub fn shouldExit(self: *Service) bool {
-        self.enforcePinnedMoveInvariant();
         if (process_signals.stopRequested()) {
             self.app.shutdown();
             return true;
@@ -2805,7 +2803,6 @@ pub const Service = struct {
     }
 
     pub fn shutdown(self: *Service) void {
-        self.enforcePinnedMoveInvariant();
         self.app.shutdown();
     }
 
@@ -2897,7 +2894,6 @@ pub const Service = struct {
     }
 
     pub fn listRuntimeRequirements(self: *Service, allocator: std.mem.Allocator) ![]RuntimeRequirement {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         const win_state = win.state();
         win_state.state_mutex.lock();
@@ -2921,25 +2917,21 @@ pub const Service = struct {
     }
 
     pub fn onEvent(self: *Service, handler: EventHandler, context: ?*anyopaque) void {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         win.onEvent(handler, context);
     }
 
     pub fn onRaw(self: *Service, handler: RawHandler, context: ?*anyopaque) void {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         win.onRaw(handler, context);
     }
 
     pub fn sendRaw(self: *Service, bytes: []const u8) !void {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.sendRaw(bytes);
     }
 
     pub fn runScript(self: *Service, script: []const u8, options: ScriptOptions) !void {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.runScript(script, options);
     }
@@ -2950,49 +2942,41 @@ pub const Service = struct {
         script: []const u8,
         options: ScriptOptions,
     ) !ScriptEvalResult {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.evalScript(allocator, script, options);
     }
 
     pub fn rpcPollJob(self: *Service, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcPollJob(allocator, job_id);
     }
 
     pub fn rpcCancelJob(self: *Service, job_id: RpcJobId) !bool {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcCancelJob(job_id);
     }
 
     pub fn browserUrl(self: *Service) ![]u8 {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.browserUrl();
     }
 
     pub fn openInBrowser(self: *Service) !void {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.openInBrowser();
     }
 
     pub fn openInBrowserWithOptions(self: *Service, launch_options: BrowserLaunchOptions) !void {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         try win.openInBrowserWithOptions(launch_options);
     }
 
     pub fn rpcClientScript(self: *Service, options: BridgeOptions) []const u8 {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcClientScript(options);
     }
 
     pub fn rpcTypeDeclarations(self: *Service, options: BridgeOptions) []const u8 {
-        self.enforcePinnedMoveInvariant();
         var win = self.window();
         return win.rpcTypeDeclarations(options);
     }

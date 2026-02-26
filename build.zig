@@ -35,97 +35,97 @@ const examples = [_]Example{
     .{
         .selector = .minimal,
         .artifact_name = "minimal_zig",
-        .source_path = "webui/examples/C/minimal/main.zig",
+        .source_path = "examples/C/minimal/main.zig",
     },
     .{
         .selector = .call_js_from_zig,
         .artifact_name = "call_js_from_zig",
-        .source_path = "webui/examples/C/call_js_from_c/main.zig",
+        .source_path = "examples/C/call_js_from_c/main.zig",
     },
     .{
         .selector = .call_zig_from_js,
         .artifact_name = "call_zig_from_js",
-        .source_path = "webui/examples/C/call_c_from_js/main.zig",
+        .source_path = "examples/C/call_c_from_js/main.zig",
     },
     .{
         .selector = .serve_folder,
         .artifact_name = "serve_folder_zig",
-        .source_path = "webui/examples/C/serve_a_folder/main.zig",
+        .source_path = "examples/C/serve_a_folder/main.zig",
     },
     .{
         .selector = .vfs,
         .artifact_name = "vfs_zig",
-        .source_path = "webui/examples/C/virtual_file_system/main.zig",
+        .source_path = "examples/C/virtual_file_system/main.zig",
     },
     .{
         .selector = .public_network,
         .artifact_name = "public_network_access_zig",
-        .source_path = "webui/examples/C/public_network_access/main.zig",
+        .source_path = "examples/C/public_network_access/main.zig",
     },
     .{
         .selector = .multi_client,
         .artifact_name = "multi_client_zig",
-        .source_path = "webui/examples/C/web_app_multi_client/main.zig",
+        .source_path = "examples/C/web_app_multi_client/main.zig",
     },
     .{
         .selector = .chatgpt_api,
         .artifact_name = "chatgpt_api_zig",
-        .source_path = "webui/examples/C/chatgpt_api/main.zig",
+        .source_path = "examples/C/chatgpt_api/main.zig",
     },
     .{
         .selector = .custom_web_server,
         .artifact_name = "custom_web_server_zig",
-        .source_path = "webui/examples/C/custom_web_server/main.zig",
+        .source_path = "examples/C/custom_web_server/main.zig",
     },
     .{
         .selector = .react,
         .artifact_name = "react_zig",
-        .source_path = "webui/examples/C/react/main.zig",
+        .source_path = "examples/C/react/main.zig",
     },
     .{
         .selector = .frameless,
         .artifact_name = "frameless_zig",
-        .source_path = "webui/examples/C/frameless/main.zig",
+        .source_path = "examples/C/frameless/main.zig",
     },
     .{
         .selector = .fancy_window,
         .artifact_name = "fancy_window_zig",
-        .source_path = "webui/examples/C/fancy_window/main.zig",
+        .source_path = "examples/C/fancy_window/main.zig",
     },
     .{
         .selector = .translucent_rounded,
         .artifact_name = "translucent_rounded_zig",
-        .source_path = "webui/examples/C/translucent_rounded/main.zig",
+        .source_path = "examples/C/translucent_rounded/main.zig",
     },
     .{
         .selector = .text_editor,
         .artifact_name = "text_editor_zig",
-        .source_path = "webui/examples/C/text-editor/main.zig",
+        .source_path = "examples/C/text-editor/main.zig",
     },
     .{
         .selector = .minimal_oop,
         .artifact_name = "minimal_oop_zig",
-        .source_path = "webui/examples/C++/minimal/main.zig",
+        .source_path = "examples/C++/minimal/main.zig",
     },
     .{
         .selector = .call_js_oop,
         .artifact_name = "call_js_oop_zig",
-        .source_path = "webui/examples/C++/call_js_from_cpp/main.zig",
+        .source_path = "examples/C++/call_js_from_cpp/main.zig",
     },
     .{
         .selector = .call_oop_from_js,
         .artifact_name = "call_oop_from_js_zig",
-        .source_path = "webui/examples/C++/call_cpp_from_js/main.zig",
+        .source_path = "examples/C++/call_cpp_from_js/main.zig",
     },
     .{
         .selector = .serve_folder_oop,
         .artifact_name = "serve_folder_oop_zig",
-        .source_path = "webui/examples/C++/serve_a_folder/main.zig",
+        .source_path = "examples/C++/serve_a_folder/main.zig",
     },
     .{
         .selector = .vfs_oop,
         .artifact_name = "vfs_oop_zig",
-        .source_path = "webui/examples/C++/virtual_file_system/main.zig",
+        .source_path = "examples/C++/virtual_file_system/main.zig",
     },
 };
 
@@ -189,7 +189,7 @@ pub fn build(b: *Build) void {
     webui_mod.addOptions("build_options", build_opts);
     webui_mod.addImport("websocket", websocket_mod);
 
-    const example_shared_source_path = "webui/examples/shared/demo_runner.zig";
+    const example_shared_source_path = "examples/shared/demo_runner.zig";
     const example_shared_mod: ?*Build.Module = if (pathExists(example_shared_source_path)) b.addModule("example_shared", .{
         .root_source_file = b.path(example_shared_source_path),
         .target = target,
@@ -290,7 +290,7 @@ pub fn build(b: *Build) void {
         }),
     });
     const run_vfs_gen = b.addRunArtifact(vfs_gen);
-    run_vfs_gen.addArg("webui/examples/C/serve_a_folder/index.html");
+    run_vfs_gen.addArg("examples/C/serve_a_folder/index.html");
     run_vfs_gen.addArg("zig-out/share/webui/generated_vfs_index.zig");
     const vfs_step = b.step("vfs-gen", "Generate embedded VFS Zig source from example assets");
     vfs_step.dependOn(&run_vfs_gen.step);
@@ -393,19 +393,19 @@ pub fn build(b: *Build) void {
         "bash",
         "-lc",
         \\set -euo pipefail
-        \\if rg -n "@cImport" src tools webui/examples >/dev/null 2>&1; then
+        \\if rg -n "@cImport" src tools examples >/dev/null 2>&1; then
         \\  echo "static-guard failed: found @cImport in active sources" >&2
         \\  exit 1
         \\fi
-        \\if rg -n "addCSourceFile" src tools webui/examples >/dev/null 2>&1; then
+        \\if rg -n "addCSourceFile" src tools examples >/dev/null 2>&1; then
         \\  echo "static-guard failed: found addCSourceFile in active sources" >&2
         \\  exit 1
         \\fi
-        \\if rg -n "translate-c|std\\.zig\\.c_translation|src/translated" src tools webui/examples >/dev/null 2>&1; then
+        \\if rg -n "translate-c|std\\.zig\\.c_translation|src/translated" src tools examples >/dev/null 2>&1; then
         \\  echo "static-guard failed: found translate-c artifacts in active sources" >&2
         \\  exit 1
         \\fi
-        \\if rg -n "linkLibC\\(|std\\.c\\.|c_allocator" src tools webui/examples >/dev/null 2>&1; then
+        \\if rg -n "linkLibC\\(|std\\.c\\.|c_allocator" src tools examples >/dev/null 2>&1; then
         \\  echo "static-guard failed: found active libc linkage or std.c usage" >&2
         \\  exit 1
         \\fi
@@ -523,26 +523,22 @@ fn prepareRuntimeHelpersAssets(
     generate_embed.addArg(source_path);
     generate_embed.addArg(embed_out_path);
     generate_embed.addArg(if (minify_embedded_js) "1" else "0");
-    generate_embed.addArg("-");
 
     const generate_written = b.addRunArtifact(js_asset_gen);
     generate_written.addArg(source_path);
     generate_written.addArg(written_out_path);
     generate_written.addArg(if (minify_written_js) "1" else "0");
-    generate_written.addArg("-");
 
     const publish_embed = b.addRunArtifact(js_asset_gen);
     publish_embed.addArg(embed_out_path);
     publish_embed.addArg(embed_dist_path);
     publish_embed.addArg("0");
-    publish_embed.addArg("-");
     publish_embed.step.dependOn(&generate_embed.step);
 
     const publish_written = b.addRunArtifact(js_asset_gen);
     publish_written.addArg(written_out_path);
     publish_written.addArg(written_dist_path);
     publish_written.addArg("0");
-    publish_written.addArg("-");
     publish_written.step.dependOn(&generate_written.step);
 
     const prepare = b.step("runtime-helpers", "Prepare runtime helper JS assets (embedded/written)");

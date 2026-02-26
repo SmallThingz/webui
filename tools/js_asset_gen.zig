@@ -8,15 +8,14 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len != 4 and args.len != 5) {
-        std.debug.print("usage: js_asset_gen <input-js> <output-js> <minify:0|1> [legacy-jsmin-bin]\n", .{});
+    if (args.len != 4) {
+        std.debug.print("usage: js_asset_gen <input-js> <output-js> <minify:0|1>\n", .{});
         return error.InvalidArguments;
     }
 
     const input_path = args[1];
     const output_path = args[2];
     const minify = std.mem.eql(u8, args[3], "1");
-    _ = if (args.len == 5) args[4] else "";
 
     if (std.fs.path.dirname(output_path)) |dir_name| {
         try std.fs.cwd().makePath(dir_name);

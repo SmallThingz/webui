@@ -9,6 +9,10 @@
 - Added deterministic invariant regression tests for stable path, moved path detection, diagnostic emission, and no-false-positive flow.
 - Added move/pinning safety guidance in `README.md`, `docs/migration.md`, and `MIGRATION.md`.
 - Preserved runtime architecture (no allocation-based pinning rewrite).
+- Removed stale JS asset-generator compatibility argument handling (`js_asset_gen` now has a strict 3-arg interface).
+- Optimized async RPC job client behavior: push-first path now delays polling fallback to reduce excess requests.
+- Moved active example sources into tracked `examples/` paths and updated build graph references.
+- Reduced duplicate service-level invariant guard calls while preserving guard coverage at the API boundary.
 
 ## 2026-02-24
 

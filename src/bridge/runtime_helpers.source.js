@@ -66,6 +66,14 @@ function __webuiNormalizeResult(result) {
 
 const __webuiRpcJobWaiters = new Map();
 
+function __webuiHasActivePushSocket() {
+  if (typeof globalThis === "undefined" || typeof globalThis.WebSocket !== "function") return false;
+  if (__webuiSocketStopped) return false;
+  if (__webuiSocketOpen) return true;
+  if (__webuiSocket && __webuiSocket.readyState === globalThis.WebSocket.CONNECTING) return true;
+  return false;
+}
+
 async function __webuiFetchRpcJobStatus(endpoint, jobId) {
   const url = new URL("/rpc/job", globalThis.location ? globalThis.location.href : endpoint);
   url.searchParams.set("id", String(jobId));
@@ -76,6 +84,7 @@ async function __webuiAwaitRpcJob(endpoint, jobId, pollMinMs, pollMaxMs) {
   let stopped = false;
   let timer = null;
   let currentDelay = pollMinMs;
+  let pollingStarted = false;
 
   return await new Promise((resolve, reject) => {
     const cleanup = () => {
@@ -92,8 +101,15 @@ async function __webuiAwaitRpcJob(endpoint, jobId, pollMinMs, pollMaxMs) {
       reject(new Error(message));
     };
 
+    const startPolling = () => {
+      if (stopped || pollingStarted) return;
+      pollingStarted = true;
+      currentDelay = pollMinMs;
+      void poll();
+    };
+
     const schedulePoll = () => {
-      if (stopped) return;
+      if (stopped || !pollingStarted) return;
       timer = setTimeout(() => {
         void poll();
       }, currentDelay);
@@ -134,6 +150,10 @@ async function __webuiAwaitRpcJob(endpoint, jobId, pollMinMs, pollMaxMs) {
     __webuiRpcJobWaiters.set(jobId, {
       trigger() {
         if (stopped) return;
+        if (!pollingStarted) {
+          startPolling();
+          return;
+        }
         currentDelay = pollMinMs;
         if (timer) clearTimeout(timer);
         timer = null;
@@ -141,8 +161,17 @@ async function __webuiAwaitRpcJob(endpoint, jobId, pollMinMs, pollMaxMs) {
       },
     });
 
-    // Push-first: await server push, but always keep a bounded polling fallback.
-    schedulePoll();
+    // Push-first: when the WS channel is live/connecting, allow push to drive completion
+    // and only activate polling as a delayed fallback.
+    if (__webuiHasActivePushSocket()) {
+      const delayedFallbackMs = Math.max(400, Math.min(4000, pollMinMs * 8));
+      timer = setTimeout(() => {
+        timer = null;
+        startPolling();
+      }, delayedFallbackMs);
+    } else {
+      startPolling();
+    }
   });
 }
 

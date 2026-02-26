@@ -109,7 +109,7 @@ try window.bindRpc(rpc_methods, .{
 Runtime behavior:
 - `POST <rpc_route>` returns `job_id` immediately.
 - Completion updates are pushed over `/webui/ws` as `rpc_job_update`.
-- If push is unavailable, bridge falls back to bounded polling:
+- If push is unavailable (or delayed), bridge falls back to bounded polling:
   - `GET /rpc/job?id=<job_id>`
   - `POST /rpc/job/cancel`
 
@@ -122,6 +122,8 @@ Typed control APIs:
 
 - Existing warning log strings may still appear, but typed diagnostics are the authoritative integration surface.
 - For Linux packaging, validate helper/runtime presence through `listRuntimeRequirements`.
+- Active examples are tracked under `examples/` and built from those paths directly.
+- Legacy JS asset generator compatibility arguments were removed; the build path is now strict and deterministic.
 
 ## Pinned Struct Move Safety
 
