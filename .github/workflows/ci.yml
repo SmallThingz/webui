@@ -17,9 +17,112 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.15.2
+        shell: bash
+        env:
+          ZIG_VERSION: 0.15.2
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import tarfile
+          import urllib.request
+          import zipfile
+
+          version = os.environ["ZIG_VERSION"]
+          runner_os = os.environ["RUNNER_OS"]
+          runner_arch = os.environ["RUNNER_ARCH"]
+
+          os_map = {
+              "Linux": "linux",
+              "macOS": "macos",
+              "Windows": "windows",
+          }
+          arch_map = {
+              "X64": "x86_64",
+              "ARM64": "aarch64",
+              "X86": "x86",
+          }
+
+          os_part = os_map.get(runner_os)
+          arch_part = arch_map.get(runner_arch.upper())
+          if os_part is None or arch_part is None:
+              raise SystemExit(
+                  f"Unsupported runner combination RUNNER_OS={runner_os} RUNNER_ARCH={runner_arch}"
+              )
+
+          artifact_key = f"{arch_part}-{os_part}"
+          with urllib.request.urlopen("https://ziglang.org/download/index.json") as resp:
+              index = json.load(resp)
+
+          release = index.get(version)
+          if release is None:
+              raise SystemExit(f"Zig version {version} is not present in ziglang download index")
+
+          artifact = release.get(artifact_key)
+          if artifact is None:
+              raise SystemExit(f"No Zig artifact for key {artifact_key} in version {version}")
+
+          tarball_url = artifact["tarball"]
+          expected_sha256 = artifact["shasum"]
+
+          out_root = pathlib.Path(os.environ["RUNNER_TEMP"]) / f"zig-{version}-{artifact_key}"
+          if out_root.exists():
+              shutil.rmtree(out_root)
+          out_root.mkdir(parents=True)
+
+          archive_path = out_root / pathlib.Path(tarball_url).name
+          print(f"Downloading {tarball_url}", flush=True)
+          urllib.request.urlretrieve(tarball_url, archive_path)
+
+          digest = hashlib.sha256()
+          with archive_path.open("rb") as f:
+              for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          actual_sha256 = digest.hexdigest()
+          if actual_sha256.lower() != expected_sha256.lower():
+              raise SystemExit(
+                  f"SHA256 mismatch for {archive_path.name}: {actual_sha256} != {expected_sha256}"
+              )
+
+          extract_dir = out_root / "extract"
+          extract_dir.mkdir()
+          lower_name = archive_path.name.lower()
+          if lower_name.endswith(".zip"):
+              with zipfile.ZipFile(archive_path) as zf:
+                  zf.extractall(extract_dir)
+          else:
+              with tarfile.open(archive_path, "r:*") as tf:
+                  tf.extractall(extract_dir)
+
+          dirs = [p for p in extract_dir.iterdir() if p.is_dir()]
+          if len(dirs) == 1:
+              zig_root = dirs[0]
+          else:
+              candidates = [p for p in extract_dir.rglob("*") if p.is_file() and p.name in ("zig", "zig.exe")]
+              if not candidates:
+                  raise SystemExit("Unable to locate zig executable after extraction")
+              exe = candidates[0]
+              zig_root = exe.parent.parent if exe.parent.name == "bin" else exe.parent
+
+          zig_exe_name = "zig.exe" if runner_os == "Windows" else "zig"
+          zig_path = zig_root / zig_exe_name
+          if not zig_path.exists():
+              zig_path = zig_root / "bin" / zig_exe_name
+          if not zig_path.exists():
+              raise SystemExit(f"Unable to find zig executable under {zig_root}")
+
+          with pathlib.Path(os.environ["GITHUB_PATH"]).open("a", encoding="utf-8") as f:
+              f.write(str(zig_path.parent) + "\n")
+
+          print(f"Installed Zig {version} at {zig_path}", flush=True)
+          PY
+
+      - name: Zig Version
+        run: zig version
 
       - name: Build
         run: zig build
