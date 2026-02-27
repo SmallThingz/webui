@@ -190,10 +190,12 @@ pub const PlatformWebView = struct {
 
     pub fn pumpEvents(self: *PlatformWebView) !void {
         if (self.host) |host| {
+            if (builtin.os.tag == .linux) host.pump();
             if (host.isClosed()) {
                 self.native_host_ready = false;
                 return error.NativeWindowClosed;
             }
+            self.native_host_ready = host.isReady();
         }
     }
 

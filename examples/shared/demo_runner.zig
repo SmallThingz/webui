@@ -274,17 +274,6 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
     }
 
     service.shutdown();
-
-    if (builtin.os.tag == .linux) {
-        const render_state = service.runtimeRenderState();
-        if (render_state.active_surface == .native_webview) {
-            // WebKitGTK can assert during libc exit teardown when internal
-            // global destructors run off its expected UI thread.
-            // Examples exit with _exit() in native-webview mode to avoid the
-            // close-time abort path.
-            std.posix.exit(0);
-        }
-    }
 }
 
 fn shouldAutoOpenTab(spec: RunModeSpec) bool {

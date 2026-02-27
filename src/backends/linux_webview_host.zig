@@ -39,23 +39,17 @@ pub const Host = struct {
     title: []u8,
     style: WindowStyle,
     runtime_target: RuntimeTarget = .webview,
-    thread: ?std.Thread = null,
 
     mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
     queue: Queue,
 
     symbols: ?Symbols = null,
     window_widget: ?*common.GtkWidget = null,
     content_widget: ?*common.GtkWidget = null,
     webview: ?*common.WebKitWebView = null,
-    main_loop: ?*common.GMainLoop = null,
     icon_temp_path: ?[]u8 = null,
 
-    startup_done: bool = false,
-    startup_error: ?anyerror = null,
     ui_ready: bool = false,
-    drain_scheduled: bool = false,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: bool = false,
 
@@ -68,8 +62,7 @@ pub const Host = struct {
         if (!hasDisplaySession()) return error.NativeBackendUnavailable;
 
         const host = try allocator.create(Host);
-        var cleanup_host = true;
-        errdefer if (cleanup_host) allocator.destroy(host);
+        errdefer allocator.destroy(host);
 
         host.* = .{
             .allocator = allocator,
@@ -78,62 +71,43 @@ pub const Host = struct {
             .runtime_target = runtime_target,
             .queue = Queue.init(allocator),
         };
-        var cleanup_title = true;
-        var cleanup_queue = true;
-        errdefer if (cleanup_title) allocator.free(host.title);
-        errdefer if (cleanup_queue) host.queue.deinit();
+        errdefer allocator.free(host.title);
+        errdefer host.queue.deinit();
+        errdefer cleanupIconTempFile(host);
 
-        host.thread = try std.Thread.spawn(.{}, threadMain, .{host});
-        var detach_thread = true;
-        errdefer if (detach_thread) if (host.thread) |thread| thread.detach();
-
-        host.mutex.lock();
-        while (!host.startup_done) {
-            host.cond.wait(&host.mutex);
-        }
-        const startup_error = host.startup_error;
-        const ready = host.ui_ready;
-        host.mutex.unlock();
-
-        if (startup_error) |err| {
-            // Hand off cleanup to host.deinit() to avoid errdefer double-free.
-            detach_thread = false;
-            cleanup_queue = false;
-            cleanup_title = false;
-            cleanup_host = false;
-            host.deinit();
-            return err;
-        }
-        if (!ready) {
-            // Hand off cleanup to host.deinit() to avoid errdefer double-free.
-            detach_thread = false;
-            cleanup_queue = false;
-            cleanup_title = false;
-            cleanup_host = false;
-            host.deinit();
-            return error.NativeBackendUnavailable;
-        }
-
-        // Success path: caller owns host lifecycle.
-        detach_thread = false;
-        cleanup_queue = false;
-        cleanup_title = false;
-        cleanup_host = false;
+        try initOnCurrentThread(host);
         return host;
     }
 
     pub fn deinit(self: *Host) void {
-        self.enqueue(.shutdown) catch {};
+        _ = self.enqueue(.shutdown) catch {};
 
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        var spins: usize = 0;
+        while (spins < 2048 and !self.closed.load(.acquire)) : (spins += 1) {
+            self.pump();
+            std.Thread.sleep(std.time.ns_per_ms);
         }
+        self.pump();
 
         self.mutex.lock();
+        if (!self.closed.load(.acquire)) {
+            if (self.symbols) |symbols| {
+                if (self.window_widget) |window_widget| {
+                    symbols.destroyWindow(window_widget);
+                }
+            }
+            self.closed.store(true, .release);
+            self.ui_ready = false;
+            self.shutdown_requested = true;
+        }
+
         for (self.queue.items) |*cmd| cmd.deinit(self.allocator);
         self.queue.clearRetainingCapacity();
+
         cleanupIconTempFile(self);
+        self.window_widget = null;
+        self.content_widget = null;
+        self.webview = null;
         if (self.symbols) |*symbols| {
             symbols.deinit();
             self.symbols = null;
@@ -169,31 +143,89 @@ pub const Host = struct {
         try self.enqueue(.{ .control = cmd });
     }
 
+    pub fn pump(self: *Host) void {
+        drainCommandsUiThread(self);
+
+        const symbols = self.symbols orelse return;
+        const iterate = symbols.g_main_context_iteration orelse return;
+
+        var spins: usize = 0;
+        while (spins < 64) : (spins += 1) {
+            if (iterate(null, 0) == 0) break;
+        }
+
+        drainCommandsUiThread(self);
+    }
+
     fn enqueue(self: *Host, command: Command) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Reject new work once shutdown starts; callers treat this as a closed window.
-        if (self.closed.load(.acquire) or self.shutdown_requested) {
+        const is_shutdown_cmd = switch (command) {
+            .shutdown => true,
+            else => false,
+        };
+
+        if (self.closed.load(.acquire) or (self.shutdown_requested and !is_shutdown_cmd)) {
             var cmd = command;
             cmd.deinit(self.allocator);
             return error.NativeWindowClosed;
         }
 
+        if (is_shutdown_cmd) self.shutdown_requested = true;
         try self.queue.append(command);
-        scheduleDrainLocked(self);
-    }
-
-    fn scheduleDrainLocked(self: *Host) void {
-        if (!self.ui_ready or self.drain_scheduled or self.queue.items.len == 0) return;
-        if (self.symbols) |symbols| {
-            self.drain_scheduled = true;
-            if (symbols.g_idle_add(&onIdleDrain, self) == 0) {
-                self.drain_scheduled = false;
-            }
-        }
     }
 };
+
+fn initOnCurrentThread(host: *Host) !void {
+    const loaded = Symbols.loadFor(host.runtime_target) catch return error.NativeBackendUnavailable;
+    host.symbols = loaded;
+    errdefer {
+        if (host.symbols) |*symbols| {
+            symbols.deinit();
+            host.symbols = null;
+        }
+    }
+
+    const symbols = &host.symbols.?;
+    symbols.initToolkit();
+
+    const window_widget = symbols.newTopLevelWindow() orelse return error.NativeBackendUnavailable;
+    var should_destroy_window = true;
+    errdefer if (should_destroy_window) symbols.destroyWindow(window_widget);
+
+    const webview_widget = symbols.webkit_web_view_new() orelse return error.NativeBackendUnavailable;
+    const webview: *common.WebKitWebView = @ptrCast(webview_widget);
+
+    const title_z = try host.allocator.dupeZ(u8, host.title);
+    defer host.allocator.free(title_z);
+
+    const window: *common.GtkWindow = @ptrCast(window_widget);
+    symbols.gtk_window_set_title(window, title_z);
+
+    const width: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.width)) else default_width;
+    const height: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.height)) else default_height;
+    symbols.gtk_window_set_default_size(window, width, height);
+
+    const content_widget = symbols.addWindowChild(window_widget, webview_widget) orelse return error.NativeBackendUnavailable;
+
+    host.window_widget = window_widget;
+    host.content_widget = content_widget;
+    host.webview = webview;
+    host.ui_ready = true;
+    host.shutdown_requested = false;
+    host.closed.store(false, .release);
+
+    applyStyleUiThread(host, host.style);
+    connectWindowSignals(symbols, window_widget, host);
+
+    symbols.showWindow(window_widget, content_widget);
+    if (content_widget != webview_widget) {
+        symbols.gtk_widget_show(webview_widget);
+    }
+
+    should_destroy_window = false;
+}
 
 pub fn runtimeAvailableFor(target: RuntimeTarget) bool {
     const cache_ptr = switch (target) {
@@ -221,89 +253,6 @@ pub fn runtimeAvailableFor(target: RuntimeTarget) bool {
     return available;
 }
 
-fn threadMain(host: *Host) void {
-    const loaded = Symbols.loadFor(host.runtime_target) catch |err| {
-        failStartup(host, err);
-        return;
-    };
-
-    host.mutex.lock();
-    host.symbols = loaded;
-    host.mutex.unlock();
-
-    const symbols = &host.symbols.?;
-    symbols.initToolkit();
-
-    const window_widget = symbols.newTopLevelWindow() orelse {
-        failStartup(host, error.NativeBackendUnavailable);
-        return;
-    };
-    const webview_widget = symbols.webkit_web_view_new() orelse {
-        failStartup(host, error.NativeBackendUnavailable);
-        return;
-    };
-    const webview: *common.WebKitWebView = @ptrCast(webview_widget);
-
-    const title_z = host.allocator.dupeZ(u8, host.title) catch {
-        failStartup(host, error.OutOfMemory);
-        return;
-    };
-    defer host.allocator.free(title_z);
-
-    const window: *common.GtkWindow = @ptrCast(window_widget);
-    symbols.gtk_window_set_title(window, title_z);
-
-    const width: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.width)) else default_width;
-    const height: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.height)) else default_height;
-    symbols.gtk_window_set_default_size(window, width, height);
-    const content_widget = symbols.addWindowChild(window_widget, webview_widget) orelse {
-        failStartup(host, error.NativeBackendUnavailable);
-        return;
-    };
-
-    const main_loop = symbols.g_main_loop_new(null, 0) orelse {
-        failStartup(host, error.NativeBackendUnavailable);
-        return;
-    };
-
-    host.mutex.lock();
-    host.window_widget = window_widget;
-    host.content_widget = content_widget;
-    host.webview = webview;
-    host.main_loop = main_loop;
-    host.mutex.unlock();
-
-    applyStyleUiThread(host, host.style);
-    connectWindowSignals(symbols, window_widget, host);
-
-    symbols.showWindow(window_widget, content_widget);
-    if (content_widget != webview_widget) {
-        symbols.gtk_widget_show(webview_widget);
-    }
-
-    host.mutex.lock();
-    host.ui_ready = true;
-    host.startup_done = true;
-    host.cond.broadcast();
-    host.mutex.unlock();
-
-    if (host.main_loop) |loop_ptr| {
-        symbols.g_main_loop_run(loop_ptr);
-    }
-    // Allow GLib/WebKit deferred destroys to execute on the UI-affine thread
-    // before host teardown. This reduces shutdown-time aborts during process
-    // exit when windows are closed externally.
-    if (host.symbols) |syms| {
-        if (syms.g_main_context_iteration) |iterate| {
-            var spins: usize = 0;
-            while (spins < 128) : (spins += 1) {
-                if (iterate(null, 0) == 0) break;
-            }
-        }
-    }
-    finishThreadShutdown(host);
-}
-
 fn connectWindowSignals(symbols: *const Symbols, window_widget: *common.GtkWidget, host: *Host) void {
     _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "destroy", @ptrCast(&onDestroy), host, null, 0);
     // Keep realize callback for all GTK variants so style/transparency can be
@@ -314,81 +263,18 @@ fn connectWindowSignals(symbols: *const Symbols, window_widget: *common.GtkWidge
     }
 }
 
-fn failStartup(host: *Host, err: anyerror) void {
-    host.mutex.lock();
-    defer host.mutex.unlock();
-
-    if (host.symbols) |*symbols| {
-        symbols.deinit();
-        host.symbols = null;
-    }
-
-    host.drain_scheduled = false;
-    host.startup_error = err;
-    host.startup_done = true;
-    host.closed.store(true, .release);
-    host.cond.broadcast();
-}
-
-fn finishThreadShutdown(host: *Host) void {
-    host.mutex.lock();
-    defer host.mutex.unlock();
-
-    if (host.symbols) |symbols| {
-        disconnectHostSignals(host, &symbols);
-    }
-
-    host.closed.store(true, .release);
-    host.ui_ready = false;
-    host.drain_scheduled = false;
-    host.window_widget = null;
-    host.content_widget = null;
-    host.webview = null;
-    cleanupIconTempFile(host);
-    if (host.main_loop) |loop_ptr| {
-        if (host.symbols) |symbols| {
-            symbols.g_main_loop_unref(loop_ptr);
-        }
-    }
-    host.main_loop = null;
-
-    for (host.queue.items) |*cmd| cmd.deinit(host.allocator);
-    host.queue.clearRetainingCapacity();
-
-    if (host.symbols) |*symbols| {
-        symbols.deinit();
-    }
-    host.symbols = null;
-    host.cond.broadcast();
-}
-
-fn onIdleDrain(data: ?*anyopaque) callconv(.c) c_int {
-    const host = data orelse return 0;
-    const typed: *Host = @ptrCast(@alignCast(host));
-    drainCommandsUiThread(typed);
-
-    typed.mutex.lock();
-    typed.drain_scheduled = false;
-    typed.scheduleDrainLocked();
-    typed.mutex.unlock();
-
-    return 0;
-}
-
 fn onDestroy(_: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const host = data orelse return;
     const typed: *Host = @ptrCast(@alignCast(host));
-    // Destroy can be emitted while other UI callbacks are active.
-    // Never take a blocking lock here; just publish closed state and
-    // best-effort mark shutdown to avoid recursive-lock deadlocks.
+
+    typed.mutex.lock();
     typed.closed.store(true, .release);
-    if (typed.mutex.tryLock()) {
-        typed.shutdown_requested = true;
-        typed.mutex.unlock();
-    }
-    if (typed.symbols) |symbols| {
-        if (typed.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
-    }
+    typed.ui_ready = false;
+    typed.shutdown_requested = true;
+    typed.window_widget = null;
+    typed.content_widget = null;
+    typed.webview = null;
+    typed.mutex.unlock();
 }
 
 fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -459,11 +345,10 @@ fn executeUiCommand(host: *Host, command: *Command) void {
     const symbols = host.symbols;
     const webview = host.webview;
     const window_widget = host.window_widget;
-    const main_loop = host.main_loop;
     host.mutex.unlock();
 
-    if (is_closed) return;
     const syms = symbols orelse return;
+    if (is_closed and command.* != .shutdown) return;
 
     switch (command.*) {
         .navigate => |url| {
@@ -481,8 +366,12 @@ fn executeUiCommand(host: *Host, command: *Command) void {
 
             if (window_widget) |widget| {
                 syms.destroyWindow(widget);
+            } else {
+                host.mutex.lock();
+                host.closed.store(true, .release);
+                host.ui_ready = false;
+                host.mutex.unlock();
             }
-            if (main_loop) |loop| syms.g_main_loop_quit(loop);
         },
     }
 }
@@ -557,11 +446,8 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
             symbols.gtk_widget_show(window_widget);
         },
         .close => {
-            host.mutex.lock();
             host.shutdown_requested = true;
-            host.mutex.unlock();
             symbols.destroyWindow(window_widget);
-            if (host.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
         },
         .hide => symbols.gtk_widget_hide(window_widget),
         .show => symbols.gtk_widget_show(window_widget),
@@ -586,19 +472,6 @@ fn applyRoundedShape(symbols: *const Symbols, corner_radius: ?u16, window_widget
         symbols.gtk_widget_get_allocated_width(window_widget),
         symbols.gtk_widget_get_allocated_height(window_widget),
     );
-}
-
-fn disconnectHostSignals(host: *Host, symbols: *const Symbols) void {
-    const disconnect = symbols.g_signal_handlers_disconnect_by_data orelse return;
-    if (host.window_widget) |window_widget| {
-        _ = disconnect(@ptrCast(window_widget), host);
-    }
-    if (host.content_widget) |content_widget| {
-        _ = disconnect(@ptrCast(content_widget), host);
-    }
-    if (host.webview) |webview| {
-        _ = disconnect(@ptrCast(webview), host);
-    }
 }
 
 fn queueDrawTargets(host: *Host, symbols: *const Symbols, window_widget: *common.GtkWidget, clip_widget: *common.GtkWidget) void {
@@ -654,19 +527,4 @@ fn cleanupIconTempFile(host: *Host) void {
         host.allocator.free(path);
         host.icon_temp_path = null;
     }
-}
-
-test "onDestroy avoids recursive mutex deadlock when lock is already held" {
-    var host: Host = undefined;
-    host.mutex = .{};
-    host.closed = std.atomic.Value(bool).init(false);
-    host.shutdown_requested = false;
-    host.symbols = null;
-    host.main_loop = null;
-
-    host.mutex.lock();
-    defer host.mutex.unlock();
-    onDestroy(null, @ptrCast(&host));
-
-    try std.testing.expect(host.closed.load(.acquire));
 }

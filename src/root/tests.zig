@@ -103,12 +103,6 @@ fn runNativeCloseSmokeFlow() anyerror!void {
     }
 
     service.shutdown();
-
-    if (builtin.os.tag == .linux) {
-        // Linux examples exit via _exit in native-webview mode to avoid
-        // WebKitGTK teardown asserts during libc process-exit destructors.
-        std.posix.exit(0);
-    }
 }
 
 fn writeAllStream(stream: std.net.Stream, bytes: []const u8) !void {
