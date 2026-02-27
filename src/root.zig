@@ -66,6 +66,7 @@ pub const LaunchSurface = api_types.LaunchSurface;
 pub const LaunchPolicy = api_types.LaunchPolicy;
 pub const FallbackReason = api_types.FallbackReason;
 pub const RuntimeRenderState = api_types.RuntimeRenderState;
+pub const LinuxWebViewTarget = api_types.LinuxWebViewTarget;
 pub const DiagnosticCategory = api_types.DiagnosticCategory;
 pub const DiagnosticSeverity = api_types.DiagnosticSeverity;
 pub const Diagnostic = api_types.Diagnostic;
@@ -1198,6 +1199,7 @@ pub const Service = struct {
             .uses_web_url = launchPolicyContains(policy, .web_url),
             .app_mode_required = policy.app_mode_required,
             .native_backend_available = native_available,
+            .linux_webview_target = self.app.options.linux_webview_target,
         });
         for (reqs) |req| {
             if (req.required and !req.available) {

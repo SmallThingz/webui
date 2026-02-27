@@ -1825,6 +1825,43 @@ test "service requirement listing and probe are available before show" {
     try std.testing.expect(found_native);
 }
 
+test "linux webview target selection is reflected in runtime requirements" {
+    if (builtin.os.tag != .linux) return;
+
+    const rpc_methods = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var service = try Service.init(gpa.allocator(), rpc_methods, .{
+        .app = .{
+            .launch_policy = .{
+                .first = .native_webview,
+                .second = .web_url,
+                .third = null,
+            },
+            .linux_webview_target = .webkitgtk_6,
+        },
+    });
+    defer service.deinit();
+
+    const reqs = try service.listRuntimeRequirements(gpa.allocator());
+    defer gpa.allocator().free(reqs);
+
+    var found_linux_runtime_req = false;
+    for (reqs) |req| {
+        if (std.mem.eql(u8, req.name, "linux.webkitgtk6_runtime")) {
+            found_linux_runtime_req = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_linux_runtime_req);
+}
+
 test "rpc route returns value directly with threaded default dispatcher" {
     const DemoRpc = struct {
         pub fn delayedAdd(a: i64, b: i64, delay_ms: i64) i64 {

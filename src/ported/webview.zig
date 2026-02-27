@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const api_types = @import("../root/api_types.zig");
 const style_types = @import("../root/window_style.zig");
 const browser_discovery = @import("browser_discovery.zig");
 const browser_host = switch (builtin.os.tag) {
@@ -34,8 +35,14 @@ test "native backend selects platform or none" {
     try std.testing.expect(!fallback.isNative());
 }
 
+test "linux webview target defaults to compatibility runtime" {
+    const backend = NativeBackend.init(true);
+    try std.testing.expectEqual(api_types.LinuxWebViewTarget.webview, backend.linux_webview_target);
+}
+
 pub const PlatformWebView = struct {
     native_enabled: bool = false,
+    linux_webview_target: api_types.LinuxWebViewTarget = .webview,
     window_id: usize = 0,
     title: []const u8 = "",
     style: style_types.WindowStyle = .{},
@@ -49,6 +56,10 @@ pub const PlatformWebView = struct {
 
     pub fn init(enable_native: bool) PlatformWebView {
         return .{ .native_enabled = enable_native };
+    }
+
+    pub fn setLinuxWebViewTarget(self: *PlatformWebView, target: api_types.LinuxWebViewTarget) void {
+        self.linux_webview_target = target;
     }
 
     pub fn deinit(self: *PlatformWebView) void {
@@ -84,7 +95,7 @@ pub const PlatformWebView = struct {
         }
 
         if (self.host == null) {
-            self.host = platform_webview_host.Host.start(std.heap.page_allocator, title, style) catch {
+            self.host = self.startPlatformHost(title, style) catch {
                 self.native_host_ready = false;
                 return error.NativeBackendUnavailable;
             };
@@ -96,6 +107,20 @@ pub const PlatformWebView = struct {
         }
         self.native_host_ready = false;
         return error.NativeBackendUnavailable;
+    }
+
+    fn startPlatformHost(self: *PlatformWebView, title: []const u8, style: style_types.WindowStyle) !*platform_webview_host.Host {
+        return switch (builtin.os.tag) {
+            .linux => blk: {
+                const runtime_target = switch (self.linux_webview_target) {
+                    .webview => platform_webview_host.RuntimeTarget.webview,
+                    .webkitgtk_6 => platform_webview_host.RuntimeTarget.webkitgtk_6,
+                };
+                break :blk try platform_webview_host.Host.start(std.heap.page_allocator, title, style, runtime_target);
+            },
+            .windows, .macos => try platform_webview_host.Host.start(std.heap.page_allocator, title, style),
+            else => error.NativeBackendUnavailable,
+        };
     }
 
     pub fn showContent(self: *PlatformWebView, content: anytype) !void {

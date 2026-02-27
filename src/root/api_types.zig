@@ -12,6 +12,7 @@ pub const BuildFlags = struct {
     pub const enable_tls = build_options.enable_tls;
     pub const enable_webui_log = build_options.enable_webui_log;
     pub const run_mode = build_options.run_mode;
+    pub const linux_webview_target = build_options.linux_webview_target;
 };
 
 pub const DispatcherMode = enum {
@@ -70,6 +71,14 @@ pub const FallbackReason = enum {
     unsupported_style,
     launch_failed,
     dependency_missing,
+};
+
+pub const LinuxWebViewTarget = enum {
+    // Default target used by generic `webview` mode on Linux.
+    // Uses WebKit2GTK 4.1 with 4.0 fallback.
+    webview,
+    // Explicit opt-in target for GTK4/WebKitGTK 6.
+    webkitgtk_6,
 };
 
 pub const RuntimeRenderState = struct {
@@ -160,6 +169,7 @@ pub const RpcOptions = struct {
 
 pub const AppOptions = struct {
     launch_policy: LaunchPolicy = .{},
+    linux_webview_target: LinuxWebViewTarget = .webview,
     enable_tls: bool = build_options.enable_tls,
     tls: @import("../network/tls_runtime.zig").TlsOptions = .{
         .enabled = build_options.enable_tls,

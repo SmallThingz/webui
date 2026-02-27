@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const api_types = @import("api_types.zig");
 const linux_webview_host = if (builtin.os.tag == .linux)
     @import("../backends/linux_webview_host.zig")
 else
@@ -26,6 +27,7 @@ pub const ListOptions = struct {
     uses_web_url: bool,
     app_mode_required: bool,
     native_backend_available: bool,
+    linux_webview_target: api_types.LinuxWebViewTarget = .webview,
 };
 
 pub fn list(allocator: std.mem.Allocator, options: ListOptions) ![]RuntimeRequirement {
@@ -40,11 +42,21 @@ pub fn list(allocator: std.mem.Allocator, options: ListOptions) ![]RuntimeRequir
     });
 
     if (builtin.os.tag == .linux) {
+        const linux_target = switch (options.linux_webview_target) {
+            .webview => linux_webview_host.RuntimeTarget.webview,
+            .webkitgtk_6 => linux_webview_host.RuntimeTarget.webkitgtk_6,
+        };
         try out.append(.{
-            .name = "linux.gtk_webkit_runtime",
+            .name = switch (options.linux_webview_target) {
+                .webview => "linux.gtk_webkit_runtime",
+                .webkitgtk_6 => "linux.webkitgtk6_runtime",
+            },
             .required = options.uses_native_webview and options.app_mode_required,
-            .available = linux_webview_host.runtimeAvailable(),
-            .details = "In-process GTK/WebKit runtime shared libraries",
+            .available = linux_webview_host.runtimeAvailableFor(linux_target),
+            .details = switch (options.linux_webview_target) {
+                .webview => "In-process GTK3/WebKit2GTK 4.1/4.0 runtime shared libraries",
+                .webkitgtk_6 => "In-process GTK4/WebKitGTK 6 runtime shared libraries",
+            },
         });
 
         try out.append(.{

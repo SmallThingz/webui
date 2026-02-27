@@ -146,8 +146,12 @@ pub fn build(b: *Build) void {
     const minify_written_js = b.option(bool, "minify-written-js", "Minify written JS helper assets with pure Zig asset processing (default: false)") orelse false;
     const selected_example = b.option(ExampleChoice, "example", "Example to run with `zig build run` (default: all)") orelse .all;
     const run_mode = b.option([]const u8, "run-mode", "Runtime launch order for examples. Presets: `webview`, `browser` (app-window), `web-tab`, `web` (alias for web-tab), `web-url`. Or ordered tokens (`webview,browser,web-url`, `browser,webview`, etc). Default: webview,browser,web-url") orelse "webview,browser,web-url";
+    const linux_webview_target = b.option([]const u8, "linux-webview-target", "Linux native webview runtime target for examples: `webview` (WebKit2GTK 4.1/4.0, default) or `webkitgtk-6`") orelse "webview";
     if (!isValidRunMode(run_mode)) {
         @panic("invalid -Drun-mode value: use `webview`, `browser`, `web-tab`, `web`, `web-url`, or an ordered comma-separated combination");
+    }
+    if (!isValidLinuxWebviewTarget(linux_webview_target)) {
+        @panic("invalid -Dlinux-webview-target value: use `webview` or `webkitgtk-6`");
     }
 
     const runtime_helpers_assets = prepareRuntimeHelpersAssets(b, optimize, minify_embedded_js, minify_written_js);
@@ -157,6 +161,7 @@ pub fn build(b: *Build) void {
     build_opts.addOption(bool, "enable_tls", enable_tls);
     build_opts.addOption(bool, "enable_webui_log", enable_webui_log);
     build_opts.addOption([]const u8, "run_mode", run_mode);
+    build_opts.addOption([]const u8, "linux_webview_target", linux_webview_target);
     build_opts.addOption([]const u8, "runtime_helpers_embed_path", runtime_helpers_assets.embed_path);
     build_opts.addOption([]const u8, "runtime_helpers_written_path", runtime_helpers_assets.written_path);
 
@@ -577,6 +582,10 @@ fn isValidRunMode(mode: []const u8) bool {
     }
 
     return token_count > 0;
+}
+
+fn isValidLinuxWebviewTarget(value: []const u8) bool {
+    return std.mem.eql(u8, value, "webview") or std.mem.eql(u8, value, "webkitgtk-6");
 }
 
 fn pathExists(path: []const u8) bool {

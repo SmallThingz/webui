@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const webui = @import("webui");
 
 pub const ExampleKind = enum {
@@ -223,6 +224,12 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
         tagFor(kind),
         surfaceName(app_options.launch_policy.first),
     });
+    if (builtin.os.tag == .linux) {
+        std.debug.print("[{s}] linux native target: {s}\n", .{
+            tagFor(kind),
+            @tagName(app_options.linux_webview_target),
+        });
+    }
 
     const exit_ms = parseExitMs();
     if (exit_ms) |_| {
@@ -313,6 +320,7 @@ fn appOptionsFor(comptime kind: ExampleKind) webui.AppOptions {
 
     return .{
         .launch_policy = launch_policy,
+        .linux_webview_target = linuxWebViewTargetFromBuildFlag(),
         .enable_tls = webui.BuildFlags.enable_tls,
         .enable_webui_log = true,
         .public_network = kind == .public_network,
@@ -323,6 +331,12 @@ fn appOptionsFor(comptime kind: ExampleKind) webui.AppOptions {
         },
         .window_fallback_emulation = !native_first,
     };
+}
+
+fn linuxWebViewTargetFromBuildFlag() webui.LinuxWebViewTarget {
+    const value = webui.BuildFlags.linux_webview_target;
+    if (std.mem.eql(u8, value, "webkitgtk-6")) return .webkitgtk_6;
+    return .webview;
 }
 
 test "run-mode browser launch preference parser supports web-tab" {

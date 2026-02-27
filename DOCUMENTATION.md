@@ -25,6 +25,7 @@ Removed fields:
 
 Replacement:
 - `launch_policy: LaunchPolicy`
+- `linux_webview_target: LinuxWebViewTarget` (Linux only)
 
 ```zig
 pub const LaunchSurface = enum {
@@ -40,7 +41,17 @@ pub const LaunchPolicy = struct {
     allow_dual_surface: bool = false,
     app_mode_required: bool = true,
 };
+
+pub const LinuxWebViewTarget = enum {
+    webview,     // WebKit2GTK 4.1 with 4.0 fallback (default)
+    webkitgtk_6, // GTK4 + WebKitGTK 6 (explicit opt-in)
+};
 ```
+
+Linux target behavior:
+- Generic `webview` launch mode uses `.linux_webview_target = .webview` by default.
+- `.webkitgtk_6` is not used as an implicit fallback from `.webview`.
+- Native backend unavailability follows `LaunchPolicy` fallback order (browser/window/url surfaces).
 
 ## Service Signals + App Logging (New)
 
@@ -118,6 +129,7 @@ const rules = [_]webui.ProfileRule{
 
 .app = .{
     .launch_policy = webui.LaunchPolicy.webviewFirst(),
+    .linux_webview_target = .webview,
     .browser_launch = .{
         .surface_mode = .native_webview_host,
         .fallback_mode = .allow_system,
@@ -228,7 +240,7 @@ Runtime behavior:
 ## Notes
 
 - Existing warning log strings may still appear, but typed diagnostics are the authoritative integration surface.
-- For Linux packaging, validate helper/runtime presence through `listRuntimeRequirements`.
+- For Linux packaging, validate selected native runtime availability through `listRuntimeRequirements`.
 - Active examples are tracked under `examples/` and built from those paths directly.
 - JS asset generation is strict and deterministic in the active build path.
 

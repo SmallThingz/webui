@@ -7,10 +7,18 @@ const WindowStyle = common.WindowStyle;
 const WindowControl = common.WindowControl;
 const WindowIcon = common.WindowIcon;
 const Symbols = symbols_mod.Symbols;
+pub const RuntimeTarget = symbols_mod.RuntimeTarget;
 const Queue = std.array_list.Managed(Command);
 
 const default_width: c_int = 980;
 const default_height: c_int = 660;
+const ProbeCache = enum(u8) {
+    unknown = 0,
+    unavailable = 1,
+    available = 2,
+};
+var probe_cache_webview: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(ProbeCache.unknown));
+var probe_cache_webkitgtk6: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(ProbeCache.unknown));
 
 const Command = union(enum) {
     navigate: []u8,
@@ -30,6 +38,7 @@ pub const Host = struct {
     allocator: std.mem.Allocator,
     title: []u8,
     style: WindowStyle,
+    runtime_target: RuntimeTarget = .webview,
     thread: ?std.Thread = null,
 
     mutex: std.Thread.Mutex = .{},
@@ -49,7 +58,12 @@ pub const Host = struct {
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: bool = false,
 
-    pub fn start(allocator: std.mem.Allocator, title: []const u8, style: WindowStyle) !*Host {
+    pub fn start(
+        allocator: std.mem.Allocator,
+        title: []const u8,
+        style: WindowStyle,
+        runtime_target: RuntimeTarget,
+    ) !*Host {
         if (!hasDisplaySession()) return error.NativeBackendUnavailable;
 
         const host = try allocator.create(Host);
@@ -60,6 +74,7 @@ pub const Host = struct {
             .allocator = allocator,
             .title = try allocator.dupe(u8, title),
             .style = style,
+            .runtime_target = runtime_target,
             .queue = Queue.init(allocator),
         };
         var cleanup_title = true;
@@ -176,15 +191,34 @@ pub const Host = struct {
     }
 };
 
-pub fn runtimeAvailable() bool {
-    if (!hasDisplaySession()) return false;
-    var symbols = Symbols.load() catch return false;
-    symbols.deinit();
-    return true;
+pub fn runtimeAvailableFor(target: RuntimeTarget) bool {
+    const cache_ptr = switch (target) {
+        .webview => &probe_cache_webview,
+        .webkitgtk_6 => &probe_cache_webkitgtk6,
+    };
+    const cached = @as(ProbeCache, @enumFromInt(cache_ptr.load(.acquire)));
+    switch (cached) {
+        .available => return true,
+        .unavailable => return false,
+        .unknown => {},
+    }
+
+    const available = blk: {
+        if (!hasDisplaySession()) break :blk false;
+        var symbols = Symbols.loadFor(target) catch break :blk false;
+        symbols.deinit();
+        break :blk true;
+    };
+
+    cache_ptr.store(
+        @intFromEnum(if (available) ProbeCache.available else ProbeCache.unavailable),
+        .release,
+    );
+    return available;
 }
 
 fn threadMain(host: *Host) void {
-    const loaded = Symbols.load() catch |err| {
+    const loaded = Symbols.loadFor(host.runtime_target) catch |err| {
         failStartup(host, err);
         return;
     };

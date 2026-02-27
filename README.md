@@ -64,6 +64,12 @@ zig build run -Dexample=minimal -Drun-mode=webview,browser,web-url
 - `browser_window`: refreshing should not kill backend (grace + reconnect handling).
 - `web_url` / web-tab style workflows: closing tab should not kill backend by default.
 
+### Linux Native Target Selection
+
+- Generic `webview` mode defaults to WebKit2GTK `4.1` (fallback `4.0`), not WebKitGTK `6`.
+- WebKitGTK `6` is explicit opt-in via `AppOptions.linux_webview_target = .webkitgtk_6`.
+- If the selected native runtime is unavailable, launch policy falls back to browser/web-url surfaces.
+
 ## 🧩 Library API (At a Glance)
 
 ```zig
@@ -86,6 +92,7 @@ pub fn main() !void {
                 .second = .browser_window,
                 .third = .web_url,
             },
+            .linux_webview_target = .webview,
         },
         .window = .{ .title = "WebUI Zig" },
         .rpc = .{ .dispatcher_mode = .threaded },
@@ -139,6 +146,7 @@ Helpers:
 | `-Dminify-written-js=true` | `false` | Minify written runtime helper JS artifact. |
 | `-Dexample=<name>` | `all` | Select which demo `zig build run` executes. |
 | `-Drun-mode=<tokens>` | `webview,browser,web-url` | Example launch order/preset tokens. |
+| `-Dlinux-webview-target=<name>` | `webview` | Linux native target for examples: `webview` (WebKit2GTK 4.1/4.0) or `webkitgtk-6`. |
 | `-Dtarget=<triple>` | host | Cross-compile target. |
 
 ## 📦 Installation
@@ -190,6 +198,12 @@ Run one:
 zig build run -Dexample=translucent_rounded -Drun-mode=webview,browser,web-url
 ```
 
+Linux explicit WebKitGTK 6 run:
+
+```bash
+zig build run -Dexample=translucent_rounded -Drun-mode=webview -Dlinux-webview-target=webkitgtk-6
+```
+
 Available `-Dexample` values include:
 
 - `minimal`, `call_js_from_zig`, `call_zig_from_js`
@@ -230,8 +244,6 @@ In debug-safe builds, move-invariant diagnostics are emitted and fail fast to av
 ## 📚 Documentation
 
 - `DOCUMENTATION.md`
-- `MIGRATION.md`
-- `CHANGELOG.md`
 
 ## 📄 License
 

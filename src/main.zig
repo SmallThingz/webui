@@ -24,6 +24,7 @@ pub fn main() !void {
     var service = try webui.Service.init(allocator, rpc_methods, .{
         .app = .{
             .launch_policy = webui.LaunchPolicy.webviewFirst(),
+            .linux_webview_target = .webview,
             .window_fallback_emulation = true,
         },
         .window = .{

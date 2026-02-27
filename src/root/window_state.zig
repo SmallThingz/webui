@@ -376,6 +376,7 @@ pub const WindowState = struct {
             .close_requested = std.atomic.Value(bool).init(false),
         };
 
+        state.backend.setLinuxWebViewTarget(app_options.linux_webview_target);
         state.resolveActiveTransportLocked();
         state.native_capabilities = state.backend.capabilities();
         try state.setStyleOwned(allocator, options.style);

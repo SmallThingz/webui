@@ -6,6 +6,42 @@ pub const GtkApi = enum {
     gtk4,
 };
 
+pub const RuntimeTarget = enum {
+    // Stable/default native webview target: GTK3 + WebKit2GTK 4.1/4.0.
+    webview,
+    // Explicit opt-in target for GTK4 + WebKitGTK 6 runtime.
+    webkitgtk_6,
+};
+
+const DynLibSpec = struct {
+    api: GtkApi,
+    gtk_names: []const []const u8,
+    gdk_names: []const []const u8,
+    webkit_names: []const []const u8,
+};
+
+fn dynLibSpecForTarget(target: RuntimeTarget) DynLibSpec {
+    return switch (target) {
+        .webview => .{
+            .api = .gtk3,
+            .gtk_names = &.{ "libgtk-3.so.0", "libgtk-3.so" },
+            .gdk_names = &.{ "libgdk-3.so.0", "libgdk-3.so" },
+            .webkit_names = &.{ "libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.1.so", "libwebkit2gtk-4.0.so.37", "libwebkit2gtk-4.0.so" },
+        },
+        .webkitgtk_6 => .{
+            .api = .gtk4,
+            .gtk_names = &.{ "libgtk-4.so.1", "libgtk-4.so" },
+            // Some distros do not ship a separate libgdk-4 soname and expose
+            // GDK symbols via libgtk-4 instead.
+            .gdk_names = &.{ "libgdk-4.so.1", "libgdk-4.so", "libgtk-4.so.1", "libgtk-4.so" },
+            // NOTE: WebKitGTK 6.0 currently has a known workspace/focus redraw
+            // freeze issue on some environments. We intentionally avoid local
+            // backend hacks here and keep the provider behavior straightforward.
+            .webkit_names = &.{ "libwebkitgtk-6.0.so.4", "libwebkitgtk-6.0.so" },
+        },
+    };
+}
+
 pub const Symbols = struct {
     gtk: std.DynLib,
     gdk: std.DynLib,
@@ -109,9 +145,9 @@ pub const Symbols = struct {
     cairo_fill: ?*const fn (*common.cairo_t) callconv(.c) void = null,
     cairo_region_destroy: ?*const fn (*common.cairo_region_t) callconv(.c) void = null,
 
-    pub fn load() !Symbols {
+    pub fn loadFor(target: RuntimeTarget) !Symbols {
         var syms: Symbols = undefined;
-        try syms.loadDynLibs();
+        try syms.loadDynLibs(target);
         errdefer syms.deinit();
         try syms.loadFunctions();
         return syms;
@@ -425,29 +461,9 @@ pub const Symbols = struct {
         if (self.gtk_widget_input_shape_combine_region) |input_shape| input_shape(window_widget, region);
     }
 
-    fn loadDynLibs(self: *Symbols) !void {
-        // Prefer GTK4/WebKitGTK stack first for native webview mode.
-        // If that stack is unavailable or incomplete, automatically fall back
-        // to GTK3/WebKit2GTK compatibility libs.
-        if (self.loadDynLibsFor(
-            .gtk4,
-            &.{ "libgtk-4.so.1", "libgtk-4.so" },
-            // Some distros do not ship a separate libgdk-4 soname and expose
-            // GDK symbols via libgtk-4 instead.
-            &.{ "libgdk-4.so.1", "libgdk-4.so", "libgtk-4.so.1", "libgtk-4.so" },
-            // NOTE: WebKitGTK 6.0 currently has a known workspace/focus redraw
-            // freeze issue on some environments. We intentionally avoid local
-            // backend hacks here and keep the provider behavior straightforward.
-            &.{ "libwebkitgtk-6.0.so.4", "libwebkitgtk-6.0.so" },
-        )) return;
-
-        if (self.loadDynLibsFor(
-            .gtk3,
-            &.{ "libgtk-3.so.0", "libgtk-3.so" },
-            &.{ "libgdk-3.so.0", "libgdk-3.so" },
-            &.{ "libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.1.so", "libwebkit2gtk-4.0.so.37", "libwebkit2gtk-4.0.so" },
-        )) return;
-
+    fn loadDynLibs(self: *Symbols, target: RuntimeTarget) !void {
+        const spec = dynLibSpecForTarget(target);
+        if (self.loadDynLibsFor(spec.api, spec.gtk_names, spec.gdk_names, spec.webkit_names)) return;
         return error.MissingSharedLibrary;
     }
 
@@ -576,6 +592,18 @@ pub const Symbols = struct {
         if (self.gtk_api == .gtk4 and self.gtk_window_destroy == null and self.gtk_window_close == null and self.gtk_widget_destroy == null) return error.MissingDynamicSymbol;
     }
 };
+
+test "webview target remains on webkit2gtk stack" {
+    const spec = dynLibSpecForTarget(.webview);
+    try std.testing.expectEqual(GtkApi.gtk3, spec.api);
+    try std.testing.expect(std.mem.eql(u8, spec.webkit_names[0], "libwebkit2gtk-4.1.so.0"));
+}
+
+test "webkitgtk_6 target uses gtk4/webkitgtk6 stack" {
+    const spec = dynLibSpecForTarget(.webkitgtk_6);
+    try std.testing.expectEqual(GtkApi.gtk4, spec.api);
+    try std.testing.expect(std.mem.eql(u8, spec.webkit_names[0], "libwebkitgtk-6.0.so.4"));
+}
 
 fn lookupSym(lib: *std.DynLib, comptime T: type, name: [:0]const u8) !T {
     return lib.lookup(T, name) orelse error.MissingDynamicSymbol;
