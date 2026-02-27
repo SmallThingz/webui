@@ -70,8 +70,8 @@ pub const Symbols = struct {
     gtk_widget_set_opacity: ?*const fn (*common.GtkWidget, f64) callconv(.c) void = null,
     gtk_widget_get_native: ?*const fn (*common.GtkWidget) callconv(.c) ?*common.GtkNative = null,
     gtk_native_get_surface: ?*const fn (*common.GtkNative) callconv(.c) ?*common.GdkSurface = null,
-    gdk_surface_set_input_region: ?*const fn (*common.GdkSurface, ?*common.cairo_region_t) callconv(.c) void = null,
-    gdk_surface_set_opaque_region: ?*const fn (*common.GdkSurface, ?*common.cairo_region_t) callconv(.c) void = null,
+    gdk_surface_queue_render: ?*const fn (*common.GdkSurface) callconv(.c) void = null,
+    gdk_wayland_surface_force_next_commit: ?*const fn (*common.GdkSurface) callconv(.c) void = null,
     gdk_texture_new_from_filename: ?*const fn ([*:0]const u8, *?*common.GError) callconv(.c) ?*common.GdkTexture = null,
     gdk_toplevel_set_icon_list: ?*const fn (*common.GdkToplevel, ?*anyopaque) callconv(.c) void = null,
 
@@ -185,6 +185,33 @@ pub const Symbols = struct {
         if (self.gtk_widget_queue_draw) |queue_draw| queue_draw(widget);
     }
 
+    pub fn queueWidgetSurfaceRender(self: *const Symbols, widget: *common.GtkWidget) void {
+        if (self.gtk_api != .gtk4) return;
+        const get_native = self.gtk_widget_get_native orelse return;
+        const get_surface = self.gtk_native_get_surface orelse return;
+        const queue_render = self.gdk_surface_queue_render orelse return;
+        const native = get_native(widget) orelse return;
+        const surface = get_surface(native) orelse return;
+        queue_render(surface);
+    }
+
+    pub fn forceWidgetSurfaceNextCommit(self: *const Symbols, widget: *common.GtkWidget) void {
+        if (self.gtk_api != .gtk4) return;
+        if (std.process.getEnvVarOwned(std.heap.page_allocator, "WAYLAND_DISPLAY")) |value| {
+            defer std.heap.page_allocator.free(value);
+            if (value.len == 0) return;
+        } else |_| {
+            return;
+        }
+
+        const get_native = self.gtk_widget_get_native orelse return;
+        const get_surface = self.gtk_native_get_surface orelse return;
+        const force_commit = self.gdk_wayland_surface_force_next_commit orelse return;
+        const native = get_native(widget) orelse return;
+        const surface = get_surface(native) orelse return;
+        force_commit(surface);
+    }
+
     pub fn destroyWindow(self: *const Symbols, window_widget: *common.GtkWidget) void {
         switch (self.gtk_api) {
             .gtk3 => {
@@ -229,18 +256,6 @@ pub const Symbols = struct {
             },
             .gtk4 => {
                 if (self.gtk_widget_set_opacity) |set_opacity| set_opacity(window_widget, 1.0);
-                if (self.gtk_widget_get_native) |get_native| {
-                    if (get_native(window_widget)) |native| {
-                        if (self.gtk_native_get_surface) |native_surface| {
-                            if (native_surface(native)) |surface| {
-                                if (self.gdk_surface_set_opaque_region) |set_opaque_region| {
-                                    // Null region => compositor treats the surface as potentially translucent.
-                                    set_opaque_region(surface, null);
-                                }
-                            }
-                        }
-                    }
-                }
             },
         }
     }
@@ -293,83 +308,6 @@ pub const Symbols = struct {
             }
         }
 
-        self.applyGtk4RoundedSurface(window_widget, style.corner_radius, style.transparent);
-    }
-
-    pub fn applyGtk4RoundedSurface(
-        self: *const Symbols,
-        window_widget: *common.GtkWidget,
-        corner_radius: ?u16,
-        transparent: bool,
-    ) void {
-        if (self.gtk_api != .gtk4) return;
-        const get_native = self.gtk_widget_get_native orelse return;
-        const get_surface = self.gtk_native_get_surface orelse return;
-        const native = get_native(window_widget) orelse return;
-        const surface = get_surface(native) orelse return;
-
-        const width = self.gtk_widget_get_allocated_width(window_widget);
-        const height = self.gtk_widget_get_allocated_height(window_widget);
-        if (width <= 0 or height <= 0) return;
-
-        const radius_raw: u16 = corner_radius orelse 0;
-        const radius_i: c_int = @as(c_int, @intCast(radius_raw));
-        if (radius_i <= 0) {
-            if (self.gdk_surface_set_opaque_region) |set_opaque| {
-                if (transparent) set_opaque(surface, null);
-            }
-            return;
-        }
-
-        if (self.gdk_cairo_region_create_from_surface == null or
-            self.cairo_image_surface_create == null or
-            self.cairo_surface_destroy == null or
-            self.cairo_create == null or
-            self.cairo_destroy == null or
-            self.cairo_set_source_rgba == null or
-            self.cairo_paint == null or
-            self.cairo_new_path == null or
-            self.cairo_arc == null or
-            self.cairo_close_path == null or
-            self.cairo_rectangle == null or
-            self.cairo_fill == null or
-            self.cairo_region_destroy == null)
-        {
-            return;
-        }
-
-        const max_radius = @min(@divTrunc(width, 2), @divTrunc(height, 2));
-        const radius = @min(radius_i, max_radius);
-        if (radius <= 0) return;
-
-        const surface_img = self.cairo_image_surface_create.?(common.CAIRO_FORMAT_A8, width, height) orelse return;
-        defer self.cairo_surface_destroy.?(surface_img);
-        const cr = self.cairo_create.?(surface_img) orelse return;
-        defer self.cairo_destroy.?(cr);
-
-        self.cairo_set_source_rgba.?(cr, 0.0, 0.0, 0.0, 0.0);
-        self.cairo_paint.?(cr);
-        self.cairo_set_source_rgba.?(cr, 1.0, 1.0, 1.0, 1.0);
-
-        const w = @as(f64, @floatFromInt(width));
-        const h = @as(f64, @floatFromInt(height));
-        const r = @as(f64, @floatFromInt(radius));
-        const pi = std.math.pi;
-
-        self.cairo_new_path.?(cr);
-        self.cairo_arc.?(cr, w - r, r, r, -pi / 2.0, 0.0);
-        self.cairo_arc.?(cr, w - r, h - r, r, 0.0, pi / 2.0);
-        self.cairo_arc.?(cr, r, h - r, r, pi / 2.0, pi);
-        self.cairo_arc.?(cr, r, r, r, pi, pi * 1.5);
-        self.cairo_close_path.?(cr);
-        self.cairo_fill.?(cr);
-
-        const region = self.gdk_cairo_region_create_from_surface.?(surface_img) orelse return;
-        defer self.cairo_region_destroy.?(region);
-
-        if (self.gdk_surface_set_opaque_region) |set_opaque| {
-            if (transparent) set_opaque(surface, null) else set_opaque(surface, region);
-        }
     }
 
     pub fn minimizeWindow(self: *const Symbols, window: *common.GtkWindow) void {
@@ -627,8 +565,8 @@ pub const Symbols = struct {
         self.gtk_widget_set_opacity = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_opacity), "gtk_widget_set_opacity");
         self.gtk_widget_get_native = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_get_native), "gtk_widget_get_native");
         self.gtk_native_get_surface = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_native_get_surface), "gtk_native_get_surface");
-        self.gdk_surface_set_input_region = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_set_input_region), "gdk_surface_set_input_region");
-        self.gdk_surface_set_opaque_region = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_set_opaque_region), "gdk_surface_set_opaque_region");
+        self.gdk_surface_queue_render = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_queue_render), "gdk_surface_queue_render");
+        self.gdk_wayland_surface_force_next_commit = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_wayland_surface_force_next_commit), "gdk_wayland_surface_force_next_commit");
         self.gdk_texture_new_from_filename = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_texture_new_from_filename), "gdk_texture_new_from_filename");
         self.gdk_toplevel_set_icon_list = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_toplevel_set_icon_list), "gdk_toplevel_set_icon_list");
 
