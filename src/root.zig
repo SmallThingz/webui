@@ -291,7 +291,9 @@ pub const App = struct {
             self.next_window_id += 1;
         }
 
-        try self.windows.append(try WindowState.init(self.allocator, id, options, self.options, &self.diagnostic_callback));
+        var state = try WindowState.init(self.allocator, id, options, self.options, &self.diagnostic_callback);
+        errdefer state.deinit(self.allocator);
+        try self.windows.append(state);
         const idx = self.windows.items.len - 1;
 
         return .{

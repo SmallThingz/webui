@@ -375,6 +375,7 @@ pub const WindowState = struct {
             .server_listen_ok = false,
             .close_requested = std.atomic.Value(bool).init(false),
         };
+        errdefer state.deinit(allocator);
 
         state.backend.setLinuxWebViewTarget(app_options.linux_webview_target);
         state.resolveActiveTransportLocked();
