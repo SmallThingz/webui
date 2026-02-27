@@ -44,7 +44,7 @@ For example runs (`zig build run -Drun-mode=...`):
 
 - `webview`: native webview first
 - `browser`: external browser app-window
-- `web-tab` (or `web`): browser tab
+- `web-tab`: browser tab
 - `web-url`: serve URL only; do not auto-open browser
 - Ordered combinations are supported, e.g. `webview,browser,web-url`
 
@@ -54,7 +54,6 @@ Examples:
 zig build run -Dexample=minimal -Drun-mode=webview
 zig build run -Dexample=minimal -Drun-mode=browser
 zig build run -Dexample=minimal -Drun-mode=web-tab
-zig build run -Dexample=minimal -Drun-mode=web
 zig build run -Dexample=minimal -Drun-mode=webview,browser,web-url
 ```
 

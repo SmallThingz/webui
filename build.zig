@@ -145,10 +145,10 @@ pub fn build(b: *Build) void {
     const minify_embedded_js = b.option(bool, "minify-embedded-js", "Minify embedded JS helpers with pure Zig asset processing (default: true)") orelse true;
     const minify_written_js = b.option(bool, "minify-written-js", "Minify written JS helper assets with pure Zig asset processing (default: false)") orelse false;
     const selected_example = b.option(ExampleChoice, "example", "Example to run with `zig build run` (default: all)") orelse .all;
-    const run_mode = b.option([]const u8, "run-mode", "Runtime launch order for examples. Presets: `webview`, `browser` (app-window), `web-tab`, `web` (alias for web-tab), `web-url`. Or ordered tokens (`webview,browser,web-url`, `browser,webview`, etc). Default: webview,browser,web-url") orelse "webview,browser,web-url";
+    const run_mode = b.option([]const u8, "run-mode", "Runtime launch order for examples. Presets: `webview`, `browser` (app-window), `web-tab`, `web-url`. Or ordered tokens (`webview,browser,web-url`, `browser,webview`, etc). Default: webview,browser,web-url") orelse "webview,browser,web-url";
     const linux_webview_target = b.option([]const u8, "linux-webview-target", "Linux native webview runtime target for examples: `webview` (WebKit2GTK 4.1/4.0, default) or `webkitgtk-6`") orelse "webview";
     if (!isValidRunMode(run_mode)) {
-        @panic("invalid -Drun-mode value: use `webview`, `browser`, `web-tab`, `web`, `web-url`, or an ordered comma-separated combination");
+        @panic("invalid -Drun-mode value: use `webview`, `browser`, `web-tab`, `web-url`, or an ordered comma-separated combination");
     }
     if (!isValidLinuxWebviewTarget(linux_webview_target)) {
         @panic("invalid -Dlinux-webview-target value: use `webview` or `webkitgtk-6`");
@@ -549,7 +549,6 @@ fn isValidRunMode(mode: []const u8) bool {
     if (std.mem.eql(u8, mode, "webview") or std.mem.eql(u8, mode, "browser") or std.mem.eql(u8, mode, "web-tab") or std.mem.eql(u8, mode, "web-url")) {
         return true;
     }
-    if (std.mem.eql(u8, mode, "web")) return true;
 
     var token_count: usize = 0;
     var seen_webview = false;
@@ -568,7 +567,7 @@ fn isValidRunMode(mode: []const u8) bool {
             seen_webview = true;
             continue;
         }
-        if (std.mem.eql(u8, token, "browser") or std.mem.eql(u8, token, "web-tab") or std.mem.eql(u8, token, "web")) {
+        if (std.mem.eql(u8, token, "browser") or std.mem.eql(u8, token, "web-tab")) {
             if (seen_browser_surface) return false;
             seen_browser_surface = true;
             continue;

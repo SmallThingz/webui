@@ -55,6 +55,7 @@ pub const Host = struct {
     startup_done: bool = false,
     startup_error: ?anyerror = null,
     ui_ready: bool = false,
+    drain_scheduled: bool = false,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: bool = false,
 
@@ -184,9 +185,12 @@ pub const Host = struct {
     }
 
     fn scheduleDrainLocked(self: *Host) void {
-        if (!self.ui_ready) return;
+        if (!self.ui_ready or self.drain_scheduled or self.queue.items.len == 0) return;
         if (self.symbols) |symbols| {
-            _ = symbols.g_idle_add(&onIdleDrain, self);
+            self.drain_scheduled = true;
+            if (symbols.g_idle_add(&onIdleDrain, self) == 0) {
+                self.drain_scheduled = false;
+            }
         }
     }
 };
@@ -308,6 +312,7 @@ fn failStartup(host: *Host, err: anyerror) void {
         host.symbols = null;
     }
 
+    host.drain_scheduled = false;
     host.startup_error = err;
     host.startup_done = true;
     host.closed.store(true, .release);
@@ -320,6 +325,7 @@ fn finishThreadShutdown(host: *Host) void {
 
     host.closed.store(true, .release);
     host.ui_ready = false;
+    host.drain_scheduled = false;
     host.window_widget = null;
     host.content_widget = null;
     host.webview = null;
@@ -345,6 +351,12 @@ fn onIdleDrain(data: ?*anyopaque) callconv(.c) c_int {
     const host = data orelse return 0;
     const typed: *Host = @ptrCast(@alignCast(host));
     drainCommandsUiThread(typed);
+
+    typed.mutex.lock();
+    typed.drain_scheduled = false;
+    typed.scheduleDrainLocked();
+    typed.mutex.unlock();
+
     return 0;
 }
 
@@ -399,18 +411,28 @@ fn onSizeAllocate(widget: ?*anyopaque, allocation: ?*anyopaque, data: ?*anyopaqu
 }
 
 fn drainCommandsUiThread(host: *Host) void {
-    // Drain one command at a time so command execution does not hold queue lock.
+    // Swap queued work into a local batch so we keep lock hold-time short and
+    // avoid O(n^2) ordered-removal when command bursts arrive.
+    var batch = Queue.init(host.allocator);
+    defer batch.deinit();
+
     while (true) {
         host.mutex.lock();
         if (host.queue.items.len == 0) {
+            if (host.queue.capacity == 0 and batch.capacity > 0) {
+                std.mem.swap(Queue, &host.queue, &batch);
+            }
             host.mutex.unlock();
             break;
         }
-        var cmd = host.queue.orderedRemove(0);
+        std.mem.swap(Queue, &host.queue, &batch);
         host.mutex.unlock();
 
-        executeUiCommand(host, &cmd);
-        cmd.deinit(host.allocator);
+        for (batch.items) |*cmd| {
+            executeUiCommand(host, cmd);
+            cmd.deinit(host.allocator);
+        }
+        batch.clearRetainingCapacity();
     }
 }
 
