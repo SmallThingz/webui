@@ -41,7 +41,7 @@
     { "id": "build.static_guards", "status": "implemented", "tests": ["build step parity-local static guards"] },
     { "id": "ci.parity_report_gate", "status": "implemented", "tests": ["build step parity-report"] },
     { "id": "ci.examples_and_tests", "status": "implemented", "tests": ["github workflow ci.yml"] },
-    { "id": "docs.manual_gui_matrix", "status": "implemented", "tests": ["docs/manual_gui_checklist.md"] },
+    { "id": "docs.manual_gui_matrix", "status": "implemented", "tests": ["DOCUMENTATION.md#manual-gui-checklist"] },
 
     { "id": "examples.coverage", "status": "implemented", "tests": ["build step examples"] },
     { "id": "tests.integration.window_control_style", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },

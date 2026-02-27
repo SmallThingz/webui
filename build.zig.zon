@@ -44,6 +44,7 @@
         "tools",
         "webui",
         "README.md",
+        "DOCUMENTATION.md",
         "MIGRATION.md",
         "CHANGELOG.md",
         "docs",

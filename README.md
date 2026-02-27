@@ -1,39 +1,22 @@
-# WebUI Zig
+# 🚀 WebUI Zig
 
-Zig-first WebUI runtime: native webview when available, browser fallback when needed, and a comptime-generated RPC bridge that feels like calling local functions from JS.
+A Zig-first WebUI runtime with typed RPC, deterministic launch policy, native webview support, and browser/web fallbacks.
 
-- Zig: `0.15.2+` (`build.zig.zon` sets `.minimum_zig_version`)
-- CI: Linux/macOS/Windows via `.github/workflows/ci.yml`
+![Zig](https://img.shields.io/badge/Zig-0.15.2%2B-f7a41d)
+![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-2ea44f)
+![Mode](https://img.shields.io/badge/Transport-WebView%20%2B%20Browser%20%2B%20Web-0366d6)
 
-## Status (Parity Snapshot)
+## ⚡ Features
 
-This repo targets **behavioral parity with upstream `webui.c`**, but it is not yet 100% there.
+- 🧠 **Comptime RPC surface**: declare `pub const rpc_methods` once and generate JS/TS bridge clients.
+- 🎯 **Deterministic launch policy**: explicit, ordered surface selection via `LaunchPolicy`.
+- 🪟 **Window controls + style API**: `WindowStyle`, `WindowControl`, capability probing, close handlers.
+- 🔌 **WS-first runtime signaling**: reconnecting WebSocket channel for push events and script tasks.
+- 🌐 **Broad browser support**: aggressive browser discovery and cross-platform search paths.
+- 🧪 **Strong build gates**: tests, examples, parity checks, and OS matrix steps in `build.zig`.
+- 🧱 **Pure Zig active graph**: no `@cImport`, no `translate-c`, no active C runtime compilation path.
 
-Current snapshot (`zig build parity-local`):
-- `total=40`
-- `implemented=36`
-- `partial=4`
-- `missing=0`
-
-Partial areas (still require manual GUI validation and/or runtime completion):
-- `window.visual.transparency`
-- `window.visual.frameless`
-- `window.visual.corner_radius`
-- `server.tls_toggle`
-
-See `parity/status.json`, `docs/manual_gui_checklist.md`, and `docs/upstream_file_parity.md`.
-
-## What You Get
-
-- **Pure Zig active build graph**: no `@cImport`, no `translate-c`, no runtime C/C++/ObjC compilation in the active library.
-- **Dev-friendly API**: `App`, `Window`, `Service`, `WindowStyle`, `WindowControl`, typed `Event`s.
-- **Comptime RPC surface**: define `pub const rpc_methods = struct { ... }` once, generate JS/TS bridge from it.
-- **Push transport for scripts and RPC**: reconnecting WebSocket channel for runtime signaling.
-- **Aggressive browser discovery**: broad catalog + OS-specific search paths + env overrides.
-- **Tracked example tree**: active demos live under `examples/` (no untracked shadow example paths).
-- **Parity/test gates**: `zig build test`, `zig build examples`, `zig build parity-local`, `zig build os-matrix`.
-
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
 zig build
@@ -42,166 +25,46 @@ zig build examples
 zig build run
 ```
 
-Run a specific example:
+Run one example:
 
 ```bash
 zig build run -Dexample=fancy_window
 ```
 
-Force launch order for examples:
-
-```bash
-zig build run -Dexample=fancy_window -Drun-mode=webview
-zig build run -Dexample=fancy_window -Drun-mode=browser   # browser app-window
-zig build run -Dexample=fancy_window -Drun-mode=web-tab   # browser tab
-zig build run -Dexample=fancy_window -Drun-mode=web       # alias for web-tab
-zig build run -Dexample=fancy_window -Drun-mode=webview,browser,web-url
-```
-
-List steps and options:
+List all build steps/options:
 
 ```bash
 zig build -l
 zig build -h
 ```
 
-## Repository Hygiene
+## 🧭 Launch Modes (Clear Behavior)
 
-- Removed duplicate render-path logic in `Window.showHtml` / `Window.showFile`.
-- Removed unnecessary lifecycle unload signaling to reduce extra runtime traffic.
-- Profile launch semantics are strict and rule-based (`profile_rules`, first-match wins).
+For example runs (`zig build run -Drun-mode=...`):
 
-## Add To Your Project
+- `webview`: native webview first
+- `browser`: external browser app-window
+- `web-tab` (or `web`): browser tab
+- `web-url`: serve URL only; do not auto-open browser
+- Ordered combinations are supported, e.g. `webview,browser,web-url`
 
-This is a normal Zig package (`.name = "webui"` in `build.zig.zon`).
+Examples:
 
 ```bash
-zig fetch --save <git-or-tarball-url>
+zig build run -Dexample=minimal -Drun-mode=webview
+zig build run -Dexample=minimal -Drun-mode=browser
+zig build run -Dexample=minimal -Drun-mode=web-tab
+zig build run -Dexample=minimal -Drun-mode=web
+zig build run -Dexample=minimal -Drun-mode=webview,browser,web-url
 ```
 
-```zig
-// build.zig
-const webui_dep = b.dependency("webui", .{
-    .target = target,
-    .optimize = optimize,
-});
-const webui = webui_dep.module("webui");
+### Close/Refresh semantics
 
-exe.root_module.addImport("webui", webui);
-```
+- `browser_window`: closing the browser window should close backend.
+- `browser_window`: refreshing should not kill backend (grace + reconnect handling).
+- `web_url` / web-tab style workflows: closing tab should not kill backend by default.
 
-## Transport Model
-
-Browser fallback serves local HTTP and uses a WebSocket push channel for script tasks and lifecycle signaling. Native mode uses the platform webview backend when available.
-
-```mermaid
-flowchart LR
-  A["Zig app (Service/App)"] --> B["Local HTTP server (browser fallback)"]
-  B --> C["Browser tab/window"]
-  C -->|WS push| D["/webui/ws"]
-  C -->|HTTP RPC| E["/webui/rpc"]
-  A --> F["Native webview backend"]
-  F --> G["WebView window (OS)"]
-```
-
-## Launch Policy (Deterministic)
-
-`AppOptions` now uses a single deterministic policy object:
-
-```zig
-pub const LaunchSurface = enum {
-    native_webview, // native desktop webview window
-    browser_window, // runtime launches an external browser window/tab
-    web_url,        // runtime serves URL only; app/user opens it manually
-};
-
-pub const LaunchPolicy = struct {
-    first: LaunchSurface = .native_webview,
-    second: ?LaunchSurface = .browser_window,
-    third: ?LaunchSurface = .web_url,
-    allow_dual_surface: bool = false,
-    app_mode_required: bool = true,
-};
-```
-
-Resolution rules:
-- Launch surfaces are attempted in order: `first -> second -> third`.
-- First successful surface becomes active (`RuntimeRenderState.active_surface`).
-- `browser_window` launch failures continue to the next configured surface.
-- `web_url` is explicit URL-only fallback (no browser auto-launch).
-- `allow_dual_surface=true` allows opening browser alongside native webview when `browser_window` exists in the policy.
-
-Common presets:
-- `LaunchPolicy.webviewFirst()` -> `native_webview -> browser_window -> web_url`
-- `LaunchPolicy.browserFirst()` -> `browser_window -> web_url -> native_webview`
-- `LaunchPolicy.webUrlOnly()` -> `web_url` only
-
-## Profile Path Configuration (Explicit, Rule-Based)
-
-`BrowserLaunchOptions` now uses enums/unions instead of profile booleans:
-
-```zig
-pub const BrowserLaunchOptions = struct {
-    surface_mode: BrowserSurfaceMode = .tab,      // tab | app_window | native_webview_host
-    fallback_mode: BrowserFallbackMode = .allow_system, // allow_system | strict
-    profile_rules: []const ProfileRule = &.{},
-    // prompt_policy / extra_args / proxy_server ...
-};
-
-pub const ProfilePathSpec = union(enum) {
-    default,
-    ephemeral,
-    custom: []const u8,
-};
-
-pub const ProfileRuleTarget = union(enum) {
-    webview,
-    browser_any,
-    browser_kind: BrowserKind,
-};
-```
-
-Resolution behavior:
-- First matching rule wins (`profile_rules` order is authoritative).
-- Browser default profile is empty-path semantics: no `--user-data-dir`.
-- `custom: ""` for browser is normalized to browser default profile behavior.
-- Webview `default` uses OS-standard persistent path:
-  - Linux: `$XDG_CONFIG_HOME/webui/` or `$HOME/.config/webui/`
-  - macOS: `$HOME/Library/Application Support/webui/`
-  - Windows: `%LOCALAPPDATA%\\webui\\`
-
-Helpers:
-- `webui.browser_default_profile_path` (`""`)
-- `webui.profile_base_prefix_hint` (current OS hint with trailing separator)
-- `webui.resolveProfileBasePrefix(allocator) ![]u8`
-- `webui.defaultWebviewProfilePath(allocator) ![]u8`
-
-Example:
-
-```zig
-const rules = [_]webui.ProfileRule{
-    .{ .target = .webview, .path = .default },
-    .{ .target = .browser_any, .path = .{ .custom = webui.browser_default_profile_path } },
-};
-
-.app = .{
-    .launch_policy = webui.LaunchPolicy.webviewFirst(),
-    .browser_launch = .{
-        .surface_mode = .native_webview_host,
-        .fallback_mode = .allow_system,
-        .profile_rules = rules[0..],
-    },
-}
-```
-
-## API At A Glance
-
-Core flow:
-1. Declare `pub const rpc_methods = struct { ... }` (comptime).
-2. Initialize `Service` (or `App + Window`).
-3. `showHtml/showFile/showUrl` and `run`.
-
-Minimal service:
+## 🧩 Library API (At a Glance)
 
 ```zig
 const std = @import("std");
@@ -229,261 +92,146 @@ pub fn main() !void {
     });
     defer service.deinit();
 
-    try service.show(.{
-        .html =
-            "<!doctype html><html><head><meta charset=\"utf-8\"/>" ++
-            "<script type=\"module\" src=\"/webui_bridge.js\"></script></head>" ++
-            "<body><button id=\"b\">Ping</button><pre id=\"out\"></pre>" ++
-            "<script>document.getElementById('b').onclick=async()=>{" ++
-            "document.getElementById('out').textContent=" ++
-            "`ping=${await webuiRpc.ping()} add=${await webuiRpc.add(20,22)}`;};</script>" ++
-            "</body></html>",
-    });
+    try service.showHtml(
+        "<!doctype html><html><head><meta charset=\"utf-8\"/>" ++
+        "<script type=\"module\" src=\"/webui_bridge.js\"></script></head>" ++
+        "<body><button id=\"b\">Ping</button><pre id=\"out\"></pre>" ++
+        "<script>document.getElementById('b').onclick=async()=>{" ++
+        "document.getElementById('out').textContent=" ++
+        "`ping=${await webuiRpc.ping()} add=${await webuiRpc.add(20,22)}`;};</script>" ++
+        "</body></html>",
+    );
 
-    try service.run();
     while (!service.shouldExit()) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
         try service.run();
+        std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 }
 ```
 
-## Pinned Struct Move Safety
+## 🔐 Launch Policy + Profile Rules
 
-`App` and `Service` are move-sensitive once windows are created.
+`AppOptions` uses deterministic `LaunchPolicy` ordering.
 
-Rules:
-- Once an `App` owns windows, do not move/copy that initialized `App` by value.
-- Once a `Service` is initialized, do not move/copy that initialized `Service` by value.
+`BrowserLaunchOptions` uses explicit `profile_rules`:
 
-Unsafe patterns:
-- Returning/stashing an initialized `Service`/`App` through extra by-value copies.
-- Storing initialized `Service` values in relocating containers.
-- Assigning `var moved = service;` (or equivalent copies) after init.
+- `ProfilePathSpec`: `default | ephemeral | custom`
+- `ProfileRuleTarget`: `webview | browser_any | browser_kind`
+- Rule order is authoritative (first match wins).
+- Browser default profile semantics are empty path (`""`) and no forced `--user-data-dir`.
+- Webview default profile path uses OS-standard app-data/config locations.
 
-Safe patterns:
-- Initialize `App`/`Service` in its final storage location.
-- Pass pointers (`*App`, `*Service`) through helpers.
-- Keep initialized structs out of relocatable by-value containers.
+Helpers:
 
-Debug behavior:
-- In `Debug`/`ReleaseSafe`, when diagnostics are enabled via `onDiagnostic(...)`, the runtime checks callback-binding invariants and emits typed diagnostics:
-  - `lifecycle.pinned_struct_moved.app`
-  - `lifecycle.pinned_struct_moved.service`
-- After emitting the diagnostic, it fails fast to avoid latent crashes.
-- In `ReleaseFast`/`ReleaseSmall`, this guard is compiled out.
+- `webui.browser_default_profile_path`
+- `webui.profile_base_prefix_hint`
+- `webui.resolveProfileBasePrefix(allocator)`
+- `webui.defaultWebviewProfilePath(allocator)`
 
-This project intentionally documents and guards move-safety instead of forcing allocation-based pinning.
+## 🛠 Build Flags
 
-## Typed RPC + Bridge Generation
-
-Everything starts with a comptime method set:
-
-```zig
-pub const rpc_methods = struct {
-    pub fn ping() []const u8 { return "pong"; }
-    pub fn add(a: i64, b: i64) i64 { return a + b; }
-};
-```
-
-What you can generate:
-- Compile-time-generated JS client string: `Window.rpcClientScript()`
-- Comptime JS client string: `webui.Service.generatedClientScriptComptime(rpc_methods, .{})`
-- Comptime TypeScript declarations: `webui.Service.generatedTypeScriptDeclarationsComptime(rpc_methods, .{})`
-
-Bridge generation policy:
-- Runtime bridge regeneration is disabled.
-- The served `/webui_bridge.js` payload is the compile-time artifact produced from `rpc_methods`.
-- `RpcOptions.bridge_options` must stay at defaults (`webuiRpc`, `/webui_bridge.js`, `/webui/rpc`) when binding RPC.
-
-Dispatch modes:
-- `sync` (direct execution)
-- `threaded` (worker queue, default)
-- `custom` (hook dispatcher)
-
-RPC behavior:
-- JS calls are async (`Promise`) by default.
-- Backend dispatch is asynchronous by default via `dispatcher_mode = .threaded`.
-- `/webui/rpc` returns direct RPC result payloads (no job ids).
-- Use `dispatcher_mode = .sync` when strict in-thread execution is required.
-
-Runtime introspection and diagnostics:
-- `Window.runtimeRenderState()` / `Service.runtimeRenderState()`
-- `Window.probeCapabilities()` / `Service.probeCapabilities()`
-- `Service.listRuntimeRequirements(allocator)`
-- `App.onDiagnostic(...)` / `Service.onDiagnostic(...)`
-
-## Close Semantics (No Random Window Closes)
-
-Close is backend-authoritative:
-- The frontend closes **only** after receiving a backend `backend_close` push signal.
-- The backend sends the close signal and waits briefly for `close_ack` before tearing down.
-
-This is implemented in `src/root.zig` and `src/bridge/runtime_helpers.source.js`.
-
-## Browser Discovery Catalog
-
-The discovery catalog includes at least these families (and more):
-- Firefox, Chrome, Edge, Chromium, Yandex, Brave, Vivaldi
-- Epic, Safari, Opera
-- Arc, DuckDuckGo, Tor, LibreWolf, Mullvad, Sidekick, Shift, Opera GX, Pale Moon, SigmaOS, Lightpanda
-
-Overrides:
-- `WEBUI_BROWSER_PATH` (absolute path)
-- `WEBUI_BROWSER` (kind/name)
-- `BROWSER` (kind/name)
-
-## Runtime Helper JS Assets
-
-Runtime helpers live in `src/bridge/runtime_helpers.source.js` and are built into two variants:
-- `webui.runtime_helpers_js` (embedded; minified by default)
-- `webui.runtime_helpers_js_written` (written-file; not minified by default)
-
-Build outputs:
-- `zig-out/share/webui/runtime_helpers.embed.js`
-- `zig-out/share/webui/runtime_helpers.written.js`
-
-## Linux Runtime Requirements API
-
-You can query runtime packaging requirements before showing a window:
-
-```zig
-const reqs = try service.listRuntimeRequirements(allocator);
-defer allocator.free(reqs);
-for (reqs) |req| {
-    std.debug.print("{s}: required={any} available={any}\n", .{
-        req.name, req.required, req.available,
-    });
-}
-```
-
-On Linux this reports helper/runtime expectations such as:
-- `webui_linux_webview_host`
-- `webui_linux_browser_host`
-
-## Build Flags
-
-| Flag | Default | What it does |
+| Flag | Default | Effect |
 |---|---:|---|
-| `-Ddynamic=true` | `false` | Builds/installs `webui` as a shared library (`.so`/`.dylib`/`.dll`) instead of a static archive. |
-| `-Denable-tls=true` | `false` | Enables TLS defaults in runtime options/API state (transport completion still tracked as partial). |
-| `-Denable-webui-log=true` | `false` | Enables runtime logging defaults (prints RPC/control/lifecycle diagnostics). |
-| `-Dminify-embedded-js=true` | `true` | Minifies the embedded runtime helper JS asset at build time. |
-| `-Dminify-written-js=true` | `false` | Minifies the written runtime helper JS output artifact. |
-| `-Dexample=<name>` | `all` | Selects which demo `zig build run` executes. |
-| `-Drun-mode=<launch-order>` | `webview,browser,web-url` | Example launch order. Presets: `webview`, `browser` (app-window), `web-tab`, `web` (alias for `web-tab`), `web-url`. Also supports explicit order (`webview,browser,web-url`, `browser,webview`, `web-url`). |
-| `-Dtarget=<triple>` | host | Cross-compiles the library/examples for another target. |
+| `-Ddynamic=true` | `false` | Build shared library (`.so`/`.dylib`/`.dll`) instead of static archive. |
+| `-Denable-tls=true` | `false` | Enable TLS option defaults/runtime TLS state. |
+| `-Denable-webui-log=true` | `false` | Enable runtime logging defaults. |
+| `-Dminify-embedded-js=true` | `true` | Minify embedded runtime helper JS at build time. |
+| `-Dminify-written-js=true` | `false` | Minify written runtime helper JS artifact. |
+| `-Dexample=<name>` | `all` | Select which demo `zig build run` executes. |
+| `-Drun-mode=<tokens>` | `webview,browser,web-url` | Example launch order/preset tokens. |
+| `-Dtarget=<triple>` | host | Cross-compile target. |
 
-## Signals And Logging Hooks
+## 📦 Installation
 
-`Service` installs/uses process-signal handling by default. You can disable it:
+Add as dependency:
 
-```zig
-var service = try webui.Service.init(allocator, rpc_methods, .{
-    .process_signals = false, // default is true
-});
+```bash
+zig fetch --save <git-or-tarball-url>
 ```
 
-`AppOptions` also accepts a custom log sink. Pass any comptime function object (or a no-op logger):
+`build.zig`:
 
 ```zig
-const MyLog = struct {
-    fn sink(_: ?*anyopaque, level: webui.LogLevel, msg: []const u8) void {
-        _ = level;
-        std.debug.print("webui: {s}\n", .{msg});
-    }
-};
-
-var service = try webui.Service.init(allocator, rpc_methods, .{
-    .app = .{
-        .enable_webui_log = true,
-        .log_sink = webui.logSink(MyLog.sink, null),
-    },
+const webui_dep = b.dependency("webui", .{
+    .target = target,
+    .optimize = optimize,
 });
+exe.root_module.addImport("webui", webui_dep.module("webui"));
 ```
 
-Exported compile-time values:
-- `webui.BuildFlags.dynamic`
-- `webui.BuildFlags.enable_tls`
-- `webui.BuildFlags.enable_webui_log`
-- `webui.BuildFlags.run_mode`
+## 🧪 Testing and Validation
 
-## Useful Build Steps
+```bash
+zig build test
+zig build examples
+zig build parity-local
+zig build os-matrix
+```
 
-- `zig build` (install)
-- `zig build test`
-- `zig build dispatcher-stress`
-- `zig build examples`
-- `zig build run`
-- `zig build bridge`
-- `zig build runtime-helpers`
-- `zig build vfs-gen`
-- `zig build parity-report`
-- `zig build parity-local`
-- `zig build os-matrix`
+Useful additional steps:
 
-## Examples
+```bash
+zig build dispatcher-stress
+zig build bridge
+zig build runtime-helpers
+```
 
-Run all demos:
+## 🖼 Examples
+
+Run all:
 
 ```bash
 zig build run
 ```
 
-Run one demo:
+Run one:
 
 ```bash
 zig build run -Dexample=translucent_rounded -Drun-mode=webview,browser,web-url
 ```
 
-All demos share the same runtime harness but now expose scenario-specific controls/flows (for example `call_js_from_zig` performs a backend-driven script update, while data-centric demos expose `word_count` and `save_note` actions).
+Available `-Dexample` values include:
 
-Available `-Dexample=` values:
-- `minimal`
-- `call_js_from_zig`
-- `call_zig_from_js`
-- `serve_folder`
-- `vfs`
-- `public_network`
-- `multi_client`
-- `chatgpt_api`
-- `custom_web_server`
-- `react`
-- `frameless`
-- `fancy_window`
-- `translucent_rounded`
-- `text_editor`
-- `minimal_oop`
-- `call_js_oop`
-- `call_oop_from_js`
-- `serve_folder_oop`
-- `vfs_oop`
-- `all`
+- `minimal`, `call_js_from_zig`, `call_zig_from_js`
+- `serve_folder`, `vfs`, `public_network`, `multi_client`
+- `chatgpt_api`, `custom_web_server`, `react`
+- `frameless`, `fancy_window`, `translucent_rounded`, `text_editor`
+- `minimal_oop`, `call_js_oop`, `call_oop_from_js`, `serve_folder_oop`, `vfs_oop`
 
-## Production Notes
+## 📌 Production Notes
 
-Strong now:
-- Typed RPC + generated bridge tooling.
-- Browser discovery breadth and fallback control.
-- Push messaging for script execution (WebSocket).
-- Parity/test gates and static build guards.
+Current strengths:
 
-Still tracked as partial for strict upstream parity:
-- End-to-end HTTPS transport (`server.tls_toggle`).
-- Visual parity items require manual GUI smoke on real desktops.
+- Typed RPC + generated bridge tooling
+- Deterministic launch behavior and runtime introspection
+- WS-first signaling and fallback surface control
+- Multi-OS build/test/parity gates
 
-Manual GUI validation checklist: `docs/manual_gui_checklist.md`.
+Still tracked for strict upstream behavioral parity:
 
-## Layout
+- Full end-to-end HTTPS transport parity path
+- Visual/window parity items requiring manual GUI verification on real desktops
 
-- `src/` - active Zig runtime + public API (`src/root.zig`)
-- `examples/` - tracked Zig example entrypoints + shared demo runner
-- `tools/` - build-time generators (bridge/VFS/assets)
-- `docs/` - parity audit + manual validation checklists
-- `parity/` - parity status + report definitions
+See:
 
-## Docs
+- `parity/status.json`
+- `DOCUMENTATION.md`
 
-- `docs/migration.md`
+## ⚠️ Move Safety (Important)
+
+`App` and `Service` are move-sensitive after window initialization.
+
+- Do not copy/move initialized `App`/`Service` values by value.
+- Keep them in final storage and pass pointers (`*App`, `*Service`).
+
+In debug-safe builds, move-invariant diagnostics are emitted and fail fast to avoid latent crashes.
+
+## 📚 Documentation
+
+- `DOCUMENTATION.md`
+- `MIGRATION.md`
 - `CHANGELOG.md`
-- `docs/upstream_file_parity.md`
+
+## 📄 License
+
+See `LICENSE`.
