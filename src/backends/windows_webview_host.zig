@@ -16,6 +16,8 @@ const WM_SIZE: u32 = 0x0005;
 const WM_MOVE: u32 = 0x0003;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DESTROY: u32 = 0x0002;
+const WM_SETICON: u32 = 0x0080;
+const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_NCCREATE: u32 = 0x0081;
 const WM_QUIT: u32 = 0x0012;
 
@@ -49,6 +51,7 @@ const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_FRAMECHANGED: u32 = 0x0020;
+const SWP_SHOWWINDOW: u32 = 0x0040;
 
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
 const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
@@ -56,6 +59,10 @@ const webview2_bg_env_name = std.unicode.utf8ToUtf16LeStringLiteral("WEBVIEW2_DE
 const webview2_bg_env_zero = std.unicode.utf8ToUtf16LeStringLiteral("0");
 
 const window_class_name = std.unicode.utf8ToUtf16LeStringLiteral("WebUiZigHost");
+const ICON_SMALL: usize = 0;
+const ICON_BIG: usize = 1;
+const LR_DEFAULTCOLOR: u32 = 0x0000;
+const LR_DEFAULTSIZE: u32 = 0x0040;
 
 const Command = union(enum) {
     navigate: []u8,
@@ -74,6 +81,14 @@ const Command = union(enum) {
 const POINT = extern struct {
     x: i32,
     y: i32,
+};
+
+const MINMAXINFO = extern struct {
+    ptReserved: POINT,
+    ptMaxSize: POINT,
+    ptMaxPosition: POINT,
+    ptMinTrackSize: POINT,
+    ptMaxTrackSize: POINT,
 };
 
 const MSG = extern struct {
@@ -154,9 +169,12 @@ extern "user32" fn GetWindowLongPtrW(win.HWND, i32) callconv(.winapi) win.LONG_P
 extern "user32" fn SetWindowLongW(win.HWND, i32, i32) callconv(.winapi) i32;
 extern "user32" fn GetWindowLongW(win.HWND, i32) callconv(.winapi) i32;
 extern "user32" fn PostMessageW(win.HWND, u32, win.WPARAM, win.LPARAM) callconv(.winapi) win.BOOL;
+extern "user32" fn SendMessageW(win.HWND, u32, win.WPARAM, win.LPARAM) callconv(.winapi) win.LRESULT;
 extern "user32" fn SetWindowTextW(win.HWND, win.LPCWSTR) callconv(.winapi) win.BOOL;
 extern "user32" fn GetWindowRect(win.HWND, *win.RECT) callconv(.winapi) win.BOOL;
 extern "user32" fn SetWindowRgn(win.HWND, ?*anyopaque, win.BOOL) callconv(.winapi) i32;
+extern "user32" fn CreateIconFromResourceEx(?[*]u8, u32, win.BOOL, u32, i32, i32, u32) callconv(.winapi) ?win.HICON;
+extern "user32" fn DestroyIcon(win.HICON) callconv(.winapi) win.BOOL;
 extern "gdi32" fn CreateRoundRectRgn(i32, i32, i32, i32, i32, i32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) win.BOOL;
 
@@ -179,6 +197,7 @@ pub const Host = struct {
     instance: ?win.HINSTANCE = null,
     class_registered: bool = false,
     hwnd: ?win.HWND = null,
+    window_icon: ?win.HICON = null,
 
     symbols: ?wv2.Symbols = null,
     com_initialized: bool = false,
@@ -485,6 +504,11 @@ fn cleanupUiThread(host: *Host) void {
         host.environment = null;
     }
 
+    if (host.window_icon) |icon| {
+        _ = DestroyIcon(icon);
+        host.window_icon = null;
+    }
+
     host.mutex.lock();
     if (host.pending_url) |url| {
         host.allocator.free(url);
@@ -572,6 +596,15 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         _ = SetWindowPos(hwnd, null, pos.x, pos.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     }
 
+    if (style.kiosk) {
+        const hwnd_topmost: ?win.HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+        _ = SetWindowPos(hwnd, hwnd_topmost, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        _ = ShowWindow(hwnd, SW_MAXIMIZE);
+    } else {
+        const hwnd_not_topmost: ?win.HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+        _ = SetWindowPos(hwnd, hwnd_not_topmost, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+
     if (style.hidden) {
         _ = ShowWindow(hwnd, SW_HIDE);
     } else {
@@ -579,6 +612,7 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     }
 
     applyWindowCornerRadius(hwnd, style.corner_radius);
+    applyWindowIcon(host, hwnd, style.icon);
     updateControllerBounds(host);
     applyControllerBackgroundColor(host);
 }
@@ -616,6 +650,9 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
 }
 
 fn computeWindowStyle(style: WindowStyle) u32 {
+    if (style.kiosk) {
+        return WS_POPUP | WS_VISIBLE;
+    }
     if (style.frameless) {
         var out: u32 = WS_POPUP | WS_VISIBLE;
         if (style.resizable) out |= WS_THICKFRAME;
@@ -684,6 +721,36 @@ fn applyWindowCornerRadius(hwnd: win.HWND, radius: ?u16) void {
     _ = SetWindowRgn(hwnd, null, 1);
 }
 
+fn applyWindowIcon(host: *Host, hwnd: win.HWND, icon: ?window_style_types.WindowIcon) void {
+    if (host.window_icon) |old_icon| {
+        _ = SendMessageW(hwnd, WM_SETICON, ICON_SMALL, 0);
+        _ = SendMessageW(hwnd, WM_SETICON, ICON_BIG, 0);
+        _ = DestroyIcon(old_icon);
+        host.window_icon = null;
+    }
+
+    const source = icon orelse return;
+    if (source.bytes.len == 0) return;
+
+    // Best-effort icon decode using Win32 resource parser.
+    const bytes_copy = host.allocator.dupe(u8, source.bytes) catch return;
+    defer host.allocator.free(bytes_copy);
+
+    const created = CreateIconFromResourceEx(
+        bytes_copy.ptr,
+        @as(u32, @intCast(bytes_copy.len)),
+        1,
+        0x00030000,
+        0,
+        0,
+        LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
+    ) orelse return;
+
+    host.window_icon = created;
+    _ = SendMessageW(hwnd, WM_SETICON, ICON_SMALL, @as(win.LPARAM, @intCast(@intFromPtr(created))));
+    _ = SendMessageW(hwnd, WM_SETICON, ICON_BIG, @as(win.LPARAM, @intCast(@intFromPtr(created))));
+}
+
 fn applyControllerBackgroundColor(host: *Host) void {
     const controller = host.controller orelse return;
 
@@ -698,10 +765,15 @@ fn applyControllerBackgroundColor(host: *Host) void {
     const controller2: *wv2.ICoreWebView2Controller2 = @ptrCast(@alignCast(typed_raw));
     defer _ = controller2.lpVtbl.Release(controller2);
 
-    const color = if (host.style.transparent)
-        wv2.COREWEBVIEW2_COLOR{ .A = 0, .R = 0, .G = 0, .B = 0 }
-    else
-        wv2.COREWEBVIEW2_COLOR{ .A = 255, .R = 255, .G = 255, .B = 255 };
+    const color = blk: {
+        if (host.style.high_contrast) |high| {
+            if (high) break :blk wv2.COREWEBVIEW2_COLOR{ .A = 255, .R = 0, .G = 0, .B = 0 };
+        }
+        if (host.style.transparent) {
+            break :blk wv2.COREWEBVIEW2_COLOR{ .A = 0, .R = 0, .G = 0, .B = 0 };
+        }
+        break :blk wv2.COREWEBVIEW2_COLOR{ .A = 255, .R = 255, .G = 255, .B = 255 };
+    };
 
     _ = controller2.lpVtbl.put_DefaultBackgroundColor(controller2, color);
 }
@@ -978,6 +1050,16 @@ fn wndProc(hwnd: win.HWND, msg: u32, wparam: win.WPARAM, lparam: win.LPARAM) cal
         WM_MOVE => {
             if (host) |h| updateControllerBounds(h);
             return 0;
+        },
+        WM_GETMINMAXINFO => {
+            if (host) |h| {
+                if (h.style.min_size) |min_size| {
+                    const mmi: *MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    mmi.ptMinTrackSize.x = @as(i32, @intCast(min_size.width));
+                    mmi.ptMinTrackSize.y = @as(i32, @intCast(min_size.height));
+                    return 0;
+                }
+            }
         },
         WM_CLOSE => {
             if (host) |h| {

@@ -33,6 +33,10 @@ pub const Symbols = struct {
     gtk_window_move: ?*const fn (*common.GtkWindow, c_int, c_int) callconv(.c) void = null,
     gtk_window_iconify: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
     gtk_window_minimize: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
+    gtk_window_fullscreen: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
+    gtk_window_unfullscreen: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
+    gtk_window_set_icon_from_file: ?*const fn (*common.GtkWindow, [*:0]const u8, *?*common.GError) callconv(.c) c_int = null,
+    gtk_window_set_icon_name: ?*const fn (*common.GtkWindow, ?[*:0]const u8) callconv(.c) void = null,
     gtk_window_maximize: *const fn (*common.GtkWindow) callconv(.c) void,
     gtk_window_unmaximize: *const fn (*common.GtkWindow) callconv(.c) void,
 
@@ -43,7 +47,17 @@ pub const Symbols = struct {
 
     gtk_widget_get_allocated_width: *const fn (*common.GtkWidget) callconv(.c) c_int,
     gtk_widget_get_allocated_height: *const fn (*common.GtkWidget) callconv(.c) c_int,
+    gtk_widget_set_size_request: ?*const fn (*common.GtkWidget, c_int, c_int) callconv(.c) void = null,
+    gtk_widget_get_style_context: ?*const fn (*common.GtkWidget) callconv(.c) ?*common.GtkStyleContext = null,
+    gtk_style_context_add_class: ?*const fn (*common.GtkStyleContext, [*:0]const u8) callconv(.c) void = null,
+    gtk_style_context_remove_class: ?*const fn (*common.GtkStyleContext, [*:0]const u8) callconv(.c) void = null,
+    gtk_widget_add_css_class: ?*const fn (*common.GtkWidget, [*:0]const u8) callconv(.c) void = null,
+    gtk_widget_remove_css_class: ?*const fn (*common.GtkWidget, [*:0]const u8) callconv(.c) void = null,
     gtk_container_add: ?*const fn (*common.GtkContainer, *common.GtkWidget) callconv(.c) void = null,
+    gtk_css_provider_new: ?*const fn () callconv(.c) ?*common.GtkCssProvider = null,
+    gtk_css_provider_load_from_data: ?*const fn (*common.GtkCssProvider, [*:0]const u8, isize) callconv(.c) void = null,
+    gtk_style_context_add_provider_for_display: ?*const fn (*common.GdkDisplay, *anyopaque, c_uint) callconv(.c) void = null,
+    gdk_display_get_default: ?*const fn () callconv(.c) ?*common.GdkDisplay = null,
     gtk_widget_shape_combine_region: ?*const fn (*common.GtkWidget, ?*common.cairo_region_t) callconv(.c) void = null,
     gtk_widget_input_shape_combine_region: ?*const fn (*common.GtkWidget, ?*common.cairo_region_t) callconv(.c) void = null,
     gtk_widget_show: *const fn (*common.GtkWidget) callconv(.c) void,
@@ -57,10 +71,12 @@ pub const Symbols = struct {
     gtk_native_get_surface: ?*const fn (*common.GtkNative) callconv(.c) ?*common.GdkSurface = null,
     gdk_surface_set_input_region: ?*const fn (*common.GdkSurface, ?*common.cairo_region_t) callconv(.c) void = null,
     gdk_surface_set_opaque_region: ?*const fn (*common.GdkSurface, ?*common.cairo_region_t) callconv(.c) void = null,
+    gdk_texture_new_from_filename: ?*const fn ([*:0]const u8, *?*common.GError) callconv(.c) ?*common.GdkTexture = null,
+    gdk_toplevel_set_icon_list: ?*const fn (*common.GdkToplevel, ?*anyopaque) callconv(.c) void = null,
 
     webkit_web_view_new: *const fn () callconv(.c) ?*common.GtkWidget,
     webkit_web_view_load_uri: *const fn (*common.WebKitWebView, [*:0]const u8) callconv(.c) void,
-    webkit_web_view_set_background_color: *const fn (*common.WebKitWebView, *const common.GdkRGBA) callconv(.c) void,
+    webkit_web_view_set_background_color: *const fn (*common.WebKitWebView, *const anyopaque) callconv(.c) void,
 
     g_signal_connect_data: *const fn (
         *anyopaque,
@@ -75,6 +91,9 @@ pub const Symbols = struct {
     g_main_loop_run: *const fn (*common.GMainLoop) callconv(.c) void,
     g_main_loop_quit: *const fn (*common.GMainLoop) callconv(.c) void,
     g_main_loop_unref: *const fn (*common.GMainLoop) callconv(.c) void,
+    g_error_free: ?*const fn (?*common.GError) callconv(.c) void = null,
+    g_list_append: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) ?*anyopaque = null,
+    g_list_free: ?*const fn (?*anyopaque) callconv(.c) void = null,
     g_object_unref: ?*const fn (?*anyopaque) callconv(.c) void = null,
 
     gdk_cairo_region_create_from_surface: ?*const fn (*common.cairo_surface_t) callconv(.c) ?*common.cairo_region_t = null,
@@ -325,6 +344,120 @@ pub const Symbols = struct {
         if (self.gtk_window_minimize) |minimize| minimize(window);
     }
 
+    pub fn setWindowMinSize(self: *const Symbols, window_widget: *common.GtkWidget, min_size: ?common.Size) void {
+        const set_size = self.gtk_widget_set_size_request orelse return;
+        if (min_size) |size| {
+            set_size(window_widget, @as(c_int, @intCast(size.width)), @as(c_int, @intCast(size.height)));
+        } else {
+            set_size(window_widget, -1, -1);
+        }
+    }
+
+    pub fn setWindowKiosk(self: *const Symbols, window: *common.GtkWindow, enabled: bool) void {
+        if (enabled) {
+            if (self.gtk_window_fullscreen) |fullscreen| fullscreen(window);
+        } else {
+            if (self.gtk_window_unfullscreen) |unfullscreen| unfullscreen(window);
+        }
+    }
+
+    pub fn setWindowHighContrast(
+        self: *const Symbols,
+        window_widget: *common.GtkWidget,
+        content_widget: ?*common.GtkWidget,
+        enabled: ?bool,
+    ) void {
+        const set_css_class = struct {
+            fn apply(syms: *const Symbols, widget: *common.GtkWidget, on: bool) void {
+                if (syms.gtk_widget_add_css_class != null and syms.gtk_widget_remove_css_class != null) {
+                    if (on) {
+                        syms.gtk_widget_add_css_class.?(widget, "high-contrast");
+                    } else {
+                        syms.gtk_widget_remove_css_class.?(widget, "high-contrast");
+                    }
+                    return;
+                }
+                if (syms.gtk_widget_get_style_context) |get_ctx| {
+                    if (get_ctx(widget)) |ctx| {
+                        if (on) {
+                            if (syms.gtk_style_context_add_class) |add| add(ctx, "high-contrast");
+                        } else {
+                            if (syms.gtk_style_context_remove_class) |remove| remove(ctx, "high-contrast");
+                        }
+                    }
+                }
+            }
+        }.apply;
+
+        if (enabled) |on| {
+            set_css_class(self, window_widget, on);
+            if (content_widget) |content| set_css_class(self, content, on);
+        } else {
+            set_css_class(self, window_widget, false);
+            if (content_widget) |content| set_css_class(self, content, false);
+        }
+    }
+
+    pub fn setWindowIconFromPath(self: *const Symbols, window_widget: *common.GtkWidget, path_z: [*:0]const u8) void {
+        const window: *common.GtkWindow = @ptrCast(window_widget);
+
+        if (self.gtk_api == .gtk3) {
+            if (self.gtk_window_set_icon_from_file) |set_icon_file| {
+                var err_ptr: ?*common.GError = null;
+                _ = set_icon_file(window, path_z, &err_ptr);
+                if (err_ptr) |err| {
+                    if (self.g_error_free) |free_err| free_err(err);
+                }
+                return;
+            }
+            if (self.gtk_window_set_icon_name) |set_icon_name| {
+                set_icon_name(window, "applications-internet");
+            }
+            return;
+        }
+
+        const new_texture = self.gdk_texture_new_from_filename orelse return;
+        const get_native = self.gtk_widget_get_native orelse return;
+        const get_surface = self.gtk_native_get_surface orelse return;
+        const set_icon_list = self.gdk_toplevel_set_icon_list orelse return;
+        const list_append = self.g_list_append orelse return;
+        const list_free = self.g_list_free orelse return;
+
+        var err_ptr: ?*common.GError = null;
+        const texture = new_texture(path_z, &err_ptr) orelse {
+            if (err_ptr) |err| if (self.g_error_free) |free_err| free_err(err);
+            return;
+        };
+        defer if (self.g_object_unref) |unref| unref(texture);
+        if (err_ptr) |err| if (self.g_error_free) |free_err| free_err(err);
+
+        const native = get_native(window_widget) orelse return;
+        const surface = get_surface(native) orelse return;
+        const list = list_append(null, texture) orelse return;
+        defer list_free(list);
+
+        set_icon_list(@ptrCast(surface), list);
+    }
+
+    pub fn clearWindowIcon(self: *const Symbols, window_widget: *common.GtkWidget) void {
+        const window: *common.GtkWindow = @ptrCast(window_widget);
+
+        if (self.gtk_api == .gtk3) {
+            if (self.gtk_window_set_icon_name) |set_icon_name| {
+                set_icon_name(window, null);
+            }
+            return;
+        }
+
+        const get_native = self.gtk_widget_get_native orelse return;
+        const get_surface = self.gtk_native_get_surface orelse return;
+        const set_icon_list = self.gdk_toplevel_set_icon_list orelse return;
+
+        const native = get_native(window_widget) orelse return;
+        const surface = get_surface(native) orelse return;
+        set_icon_list(@ptrCast(surface), null);
+    }
+
     pub fn supportsRoundedShape(self: *const Symbols) bool {
         return self.gtk_widget_shape_combine_region != null and
             self.gtk_widget_input_shape_combine_region != null and
@@ -421,6 +554,10 @@ pub const Symbols = struct {
         self.gtk_window_move = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_move), "gtk_window_move");
         self.gtk_window_iconify = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_iconify), "gtk_window_iconify");
         self.gtk_window_minimize = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_minimize), "gtk_window_minimize");
+        self.gtk_window_fullscreen = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_fullscreen), "gtk_window_fullscreen");
+        self.gtk_window_unfullscreen = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_unfullscreen), "gtk_window_unfullscreen");
+        self.gtk_window_set_icon_from_file = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_set_icon_from_file), "gtk_window_set_icon_from_file");
+        self.gtk_window_set_icon_name = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_set_icon_name), "gtk_window_set_icon_name");
         self.gtk_window_maximize = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_maximize), "gtk_window_maximize");
         self.gtk_window_unmaximize = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_unmaximize), "gtk_window_unmaximize");
 
@@ -431,6 +568,16 @@ pub const Symbols = struct {
 
         self.gtk_widget_get_allocated_width = try lookupSym(&self.gtk, @TypeOf(self.gtk_widget_get_allocated_width), "gtk_widget_get_allocated_width");
         self.gtk_widget_get_allocated_height = try lookupSym(&self.gtk, @TypeOf(self.gtk_widget_get_allocated_height), "gtk_widget_get_allocated_height");
+        self.gtk_widget_set_size_request = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_size_request), "gtk_widget_set_size_request");
+        self.gtk_widget_get_style_context = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_get_style_context), "gtk_widget_get_style_context");
+        self.gtk_style_context_add_class = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_style_context_add_class), "gtk_style_context_add_class");
+        self.gtk_style_context_remove_class = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_style_context_remove_class), "gtk_style_context_remove_class");
+        self.gtk_widget_add_css_class = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_add_css_class), "gtk_widget_add_css_class");
+        self.gtk_widget_remove_css_class = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_remove_css_class), "gtk_widget_remove_css_class");
+        self.gtk_css_provider_new = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_css_provider_new), "gtk_css_provider_new");
+        self.gtk_css_provider_load_from_data = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_css_provider_load_from_data), "gtk_css_provider_load_from_data");
+        self.gtk_style_context_add_provider_for_display = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_style_context_add_provider_for_display), "gtk_style_context_add_provider_for_display");
+        self.gdk_display_get_default = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_display_get_default), "gdk_display_get_default");
         self.gtk_container_add = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_container_add), "gtk_container_add");
         self.gtk_widget_shape_combine_region = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_shape_combine_region), "gtk_widget_shape_combine_region");
         self.gtk_widget_input_shape_combine_region = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_input_shape_combine_region), "gtk_widget_input_shape_combine_region");
@@ -445,6 +592,8 @@ pub const Symbols = struct {
         self.gtk_native_get_surface = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_native_get_surface), "gtk_native_get_surface");
         self.gdk_surface_set_input_region = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_set_input_region), "gdk_surface_set_input_region");
         self.gdk_surface_set_opaque_region = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_set_opaque_region), "gdk_surface_set_opaque_region");
+        self.gdk_texture_new_from_filename = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_texture_new_from_filename), "gdk_texture_new_from_filename");
+        self.gdk_toplevel_set_icon_list = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_toplevel_set_icon_list), "gdk_toplevel_set_icon_list");
 
         self.webkit_web_view_new = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_new), "webkit_web_view_new");
         self.webkit_web_view_load_uri = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_load_uri), "webkit_web_view_load_uri");
@@ -457,6 +606,9 @@ pub const Symbols = struct {
         self.g_main_loop_run = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_run), "g_main_loop_run");
         self.g_main_loop_quit = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_quit), "g_main_loop_quit");
         self.g_main_loop_unref = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_unref), "g_main_loop_unref");
+        self.g_error_free = lookupOptionalSym(&self.glib, @TypeOf(self.g_error_free), "g_error_free");
+        self.g_list_append = lookupOptionalSym(&self.glib, @TypeOf(self.g_list_append), "g_list_append");
+        self.g_list_free = lookupOptionalSym(&self.glib, @TypeOf(self.g_list_free), "g_list_free");
 
         self.gdk_cairo_region_create_from_surface = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_cairo_region_create_from_surface), "gdk_cairo_region_create_from_surface");
         self.cairo_image_surface_create = lookupOptionalSym(&self.cairo, @TypeOf(self.cairo_image_surface_create), "cairo_image_surface_create");

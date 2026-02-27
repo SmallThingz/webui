@@ -5,9 +5,9 @@ const rounded_shape = @import("linux_webview/rounded_shape.zig");
 
 const WindowStyle = common.WindowStyle;
 const WindowControl = common.WindowControl;
+const WindowIcon = common.WindowIcon;
 const Symbols = symbols_mod.Symbols;
 const Queue = std.array_list.Managed(Command);
-const log = std.log.scoped(.webui_linux_webview);
 
 const default_width: c_int = 980;
 const default_height: c_int = 660;
@@ -41,6 +41,7 @@ pub const Host = struct {
     content_widget: ?*common.GtkWidget = null,
     webview: ?*common.WebKitWebView = null,
     main_loop: ?*common.GMainLoop = null,
+    icon_temp_path: ?[]u8 = null,
 
     startup_done: bool = false,
     startup_error: ?anyerror = null,
@@ -116,6 +117,7 @@ pub const Host = struct {
         self.mutex.lock();
         for (self.queue.items) |*cmd| cmd.deinit(self.allocator);
         self.queue.clearRetainingCapacity();
+        cleanupIconTempFile(self);
         if (self.symbols) |*symbols| {
             symbols.deinit();
             self.symbols = null;
@@ -183,7 +185,6 @@ pub fn runtimeAvailable() bool {
 
 fn threadMain(host: *Host) void {
     const loaded = Symbols.load() catch |err| {
-        log.err("symbol load failed: {s}", .{@errorName(err)});
         failStartup(host, err);
         return;
     };
@@ -196,12 +197,10 @@ fn threadMain(host: *Host) void {
     symbols.initToolkit();
 
     const window_widget = symbols.newTopLevelWindow() orelse {
-        log.err("gtk_window_new returned null", .{});
         failStartup(host, error.NativeBackendUnavailable);
         return;
     };
     const webview_widget = symbols.webkit_web_view_new() orelse {
-        log.err("webkit_web_view_new returned null", .{});
         failStartup(host, error.NativeBackendUnavailable);
         return;
     };
@@ -225,7 +224,6 @@ fn threadMain(host: *Host) void {
     };
 
     const main_loop = symbols.g_main_loop_new(null, 0) orelse {
-        log.err("g_main_loop_new returned null", .{});
         failStartup(host, error.NativeBackendUnavailable);
         return;
     };
@@ -268,7 +266,6 @@ fn connectWindowSignals(symbols: *const Symbols, window_widget: *common.GtkWidge
 }
 
 fn failStartup(host: *Host, err: anyerror) void {
-    log.err("startup failed: {s}", .{@errorName(err)});
     host.mutex.lock();
     defer host.mutex.unlock();
 
@@ -292,6 +289,7 @@ fn finishThreadShutdown(host: *Host) void {
     host.window_widget = null;
     host.content_widget = null;
     host.webview = null;
+    cleanupIconTempFile(host);
     if (host.main_loop) |loop_ptr| {
         if (host.symbols) |symbols| {
             symbols.g_main_loop_unref(loop_ptr);
@@ -417,6 +415,7 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     if (style.size) |size| {
         symbols.gtk_window_set_default_size(window, @as(c_int, @intCast(size.width)), @as(c_int, @intCast(size.height)));
     }
+    symbols.setWindowMinSize(window_widget, style.min_size);
 
     if (style.center or style.position == null) {
         symbols.setWindowPositionCenter(window);
@@ -429,17 +428,28 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     }
 
     if (host.webview) |webview| {
-        const bg = if (style.transparent)
-            common.GdkRGBA{ .red = 0.0, .green = 0.0, .blue = 0.0, .alpha = 0.0 }
-        else
-            common.GdkRGBA{ .red = 1.0, .green = 1.0, .blue = 1.0, .alpha = 1.0 };
-        symbols.webkit_web_view_set_background_color(webview, &bg);
+        if (symbols.gtk_api == .gtk4) {
+            const bg = if (style.transparent)
+                common.GdkRGBA4{ .red = 0.0, .green = 0.0, .blue = 0.0, .alpha = 0.0 }
+            else
+                common.GdkRGBA4{ .red = 1.0, .green = 1.0, .blue = 1.0, .alpha = 1.0 };
+            symbols.webkit_web_view_set_background_color(webview, @ptrCast(&bg));
+        } else {
+            const bg = if (style.transparent)
+                common.GdkRGBA3{ .red = 0.0, .green = 0.0, .blue = 0.0, .alpha = 0.0 }
+            else
+                common.GdkRGBA3{ .red = 1.0, .green = 1.0, .blue = 1.0, .alpha = 1.0 };
+            symbols.webkit_web_view_set_background_color(webview, @ptrCast(&bg));
+        }
         symbols.applyGtk4WindowStyle(window_widget, host.content_widget orelse @ptrCast(webview), style);
     } else {
         symbols.applyGtk4WindowStyle(window_widget, host.content_widget orelse window_widget, style);
     }
 
     applyRoundedShape(&symbols, style.corner_radius, window_widget);
+    symbols.setWindowKiosk(window, style.kiosk);
+    symbols.setWindowHighContrast(window_widget, host.content_widget, style.high_contrast);
+    applyWindowIconUiThread(host, &symbols, window_widget, style.icon);
 
     if (style.hidden) {
         symbols.gtk_widget_hide(window_widget);
@@ -488,4 +498,53 @@ fn applyRoundedShape(symbols: *const Symbols, corner_radius: ?u16, window_widget
         symbols.gtk_widget_get_allocated_width(window_widget),
         symbols.gtk_widget_get_allocated_height(window_widget),
     );
+}
+
+fn applyWindowIconUiThread(host: *Host, symbols: *const Symbols, window_widget: *common.GtkWidget, icon: ?WindowIcon) void {
+    if (icon) |window_icon| {
+        const icon_path = writeIconTempFile(host, window_icon) catch return;
+        const icon_path_z = host.allocator.dupeZ(u8, icon_path) catch return;
+        defer host.allocator.free(icon_path_z);
+        symbols.setWindowIconFromPath(window_widget, icon_path_z);
+        return;
+    }
+    cleanupIconTempFile(host);
+    symbols.clearWindowIcon(window_widget);
+}
+
+fn writeIconTempFile(host: *Host, icon: WindowIcon) ![]u8 {
+    cleanupIconTempFile(host);
+
+    const ext = iconExtensionForMime(icon.mime_type);
+    const name = try std.fmt.allocPrint(host.allocator, "webui-icon-{d}{s}", .{ std.time.nanoTimestamp(), ext });
+    defer host.allocator.free(name);
+
+    const dir_path = std.process.getEnvVarOwned(host.allocator, "XDG_RUNTIME_DIR") catch try host.allocator.dupe(u8, "/tmp");
+    defer host.allocator.free(dir_path);
+
+    const full_path = try std.fs.path.join(host.allocator, &.{ dir_path, name });
+    errdefer host.allocator.free(full_path);
+
+    var file = try std.fs.createFileAbsolute(full_path, .{ .truncate = true, .read = false });
+    defer file.close();
+    try file.writeAll(icon.bytes);
+
+    host.icon_temp_path = full_path;
+    return full_path;
+}
+
+fn iconExtensionForMime(mime_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, mime_type, "image/png")) return ".png";
+    if (std.mem.eql(u8, mime_type, "image/jpeg") or std.mem.eql(u8, mime_type, "image/jpg")) return ".jpg";
+    if (std.mem.eql(u8, mime_type, "image/x-icon") or std.mem.eql(u8, mime_type, "image/vnd.microsoft.icon")) return ".ico";
+    if (std.mem.eql(u8, mime_type, "image/webp")) return ".webp";
+    return ".img";
+}
+
+fn cleanupIconTempFile(host: *Host) void {
+    if (host.icon_temp_path) |path| {
+        std.fs.deleteFileAbsolute(path) catch {};
+        host.allocator.free(path);
+        host.icon_temp_path = null;
+    }
 }

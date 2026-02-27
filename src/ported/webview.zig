@@ -191,6 +191,7 @@ pub const PlatformWebView = struct {
                 .native_corner_radius,
                 .native_positioning,
                 .native_minmax,
+                .native_icon,
                 .native_kiosk,
             };
         }

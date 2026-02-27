@@ -74,6 +74,8 @@ pub const Host = struct {
     ns_app: ?*anyopaque = null,
     ns_window: ?*anyopaque = null,
     wk_webview: ?*anyopaque = null,
+    app_icon_image: ?*anyopaque = null,
+    kiosk_active: bool = false,
 
     explicit_hidden: bool = false,
 
@@ -332,6 +334,11 @@ fn createWindowAndWebView(host: *Host) bool {
 }
 
 fn cleanupUiThread(host: *Host) void {
+    if (host.app_icon_image) |icon_image| {
+        msgSendVoid(host, icon_image, sel(host, "release"));
+        host.app_icon_image = null;
+    }
+
     if (host.wk_webview) |webview| {
         msgSendVoid(host, webview, sel(host, "release"));
         host.wk_webview = null;
@@ -410,6 +417,14 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         const ns_size = NSSize{ .width = @floatFromInt(size.width), .height = @floatFromInt(size.height) };
         msgSendVoidSize(host, window, sel(host, "setContentSize:"), ns_size);
     }
+    if (style.min_size) |min_size| {
+        msgSendVoidSize(host, window, sel(host, "setContentMinSize:"), .{
+            .width = @floatFromInt(min_size.width),
+            .height = @floatFromInt(min_size.height),
+        });
+    } else {
+        msgSendVoidSize(host, window, sel(host, "setContentMinSize:"), .{ .width = 1, .height = 1 });
+    }
 
     if (style.center) {
         msgSendVoid(host, window, sel(host, "center"));
@@ -458,6 +473,9 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     }
 
     applyCornerRadius(host, style.corner_radius);
+    applyHighContrastAppearance(host, style.high_contrast);
+    applyWindowIcon(host, style.icon);
+    applyKioskMode(host, style.kiosk);
 
     if (style.hidden) {
         host.explicit_hidden = true;
@@ -492,6 +510,53 @@ fn applyCornerRadius(host: *Host, radius: ?u16) void {
             msgSendVoidBool(host, frame_layer, sel(host, "setMasksToBounds:"), true);
         }
     }
+}
+
+fn applyHighContrastAppearance(host: *Host, enabled: ?bool) void {
+    const window = host.ns_window orelse return;
+
+    const should_enable = enabled orelse false;
+    if (!should_enable) {
+        msgSendVoidId(host, window, sel(host, "setAppearance:"), null);
+        if (host.wk_webview) |webview| msgSendVoidId(host, webview, sel(host, "setAppearance:"), null);
+        return;
+    }
+
+    const appearance_class = objcClass(host, "NSAppearance") orelse return;
+    const appearance_name = nsString(host, "NSAppearanceNameAccessibilityHighContrastAqua") orelse return;
+    const appearance = msgSendIdId(host, appearance_class, sel(host, "appearanceNamed:"), appearance_name) orelse return;
+    msgSendVoidId(host, window, sel(host, "setAppearance:"), appearance);
+    if (host.wk_webview) |webview| msgSendVoidId(host, webview, sel(host, "setAppearance:"), appearance);
+}
+
+fn applyWindowIcon(host: *Host, icon: ?window_style_types.WindowIcon) void {
+    if (host.app_icon_image) |old_icon| {
+        msgSendVoid(host, old_icon, sel(host, "release"));
+        host.app_icon_image = null;
+    }
+
+    const icon_value = icon orelse {
+        if (host.ns_app) |app| msgSendVoidId(host, app, sel(host, "setApplicationIconImage:"), null);
+        if (host.ns_window) |window| msgSendVoidId(host, window, sel(host, "setMiniwindowImage:"), null);
+        return;
+    };
+    if (icon_value.bytes.len == 0) return;
+
+    const data = nsData(host, icon_value.bytes) orelse return;
+    const image_class = objcClass(host, "NSImage") orelse return;
+    const image_alloc = msgSendId(host, image_class, sel(host, "alloc")) orelse return;
+    const image = msgSendIdId(host, image_alloc, sel(host, "initWithData:"), data) orelse return;
+
+    host.app_icon_image = image;
+    if (host.ns_app) |app| msgSendVoidId(host, app, sel(host, "setApplicationIconImage:"), image);
+    if (host.ns_window) |window| msgSendVoidId(host, window, sel(host, "setMiniwindowImage:"), image);
+}
+
+fn applyKioskMode(host: *Host, enabled: bool) void {
+    if (enabled == host.kiosk_active) return;
+    const window = host.ns_window orelse return;
+    host.kiosk_active = enabled;
+    msgSendVoidId(host, window, sel(host, "toggleFullScreen:"), null);
 }
 
 fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
@@ -595,6 +660,14 @@ fn nsString(host: *Host, value: []const u8) ?*anyopaque {
     defer host.allocator.free(z);
 
     return msgSendIdCString(host, cls, sel(host, "stringWithUTF8String:"), z.ptr);
+}
+
+fn nsData(host: *Host, value: []const u8) ?*anyopaque {
+    const cls = objcClass(host, "NSData") orelse return null;
+    if (value.len == 0) return null;
+    const Fn = *const fn (?*anyopaque, objc.SEL, ?*const anyopaque, usize) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(cls, sel(host, "dataWithBytes:length:"), value.ptr, value.len);
 }
 
 fn objcClass(host: *Host, name: [*:0]const u8) ?*anyopaque {
