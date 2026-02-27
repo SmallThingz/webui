@@ -33,9 +33,9 @@ pub fn main() !void {
                 .resizable = true,
             },
         },
+        .process_signals = true,
     });
     defer service.deinit();
-    webui.process_signals.install();
 
     const script = service.rpcClientScript();
     const script_comptime = webui.Service.generatedClientScriptComptime(rpc_methods, .{});
@@ -66,12 +66,6 @@ pub fn main() !void {
     std.debug.print("WebUI running. Press Ctrl+C to exit.\n", .{});
 
     while (!service.shouldExit()) {
-        if (webui.process_signals.stopRequested()) {
-            const sig = webui.process_signals.caughtSignal();
-            std.debug.print("Signal received ({d}), shutting down UI now.\n", .{sig});
-            service.shutdown();
-            webui.process_signals.terminateProcess();
-        }
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
     service.shutdown();

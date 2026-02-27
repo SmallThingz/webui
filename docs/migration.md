@@ -1,6 +1,6 @@
-# Migration Guide: Launch Order + Async RPC Jobs
+# Migration Guide: Launch Order + Runtime API Cleanup
 
-This guide covers the hard API replacement in `AppOptions` and the new async RPC job APIs.
+This guide covers the hard API replacement in `AppOptions` and current runtime API behavior.
 
 ## AppOptions Launch Fields (Hard Replace)
 

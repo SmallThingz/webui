@@ -28,7 +28,7 @@ See `parity/status.json`, `docs/manual_gui_checklist.md`, and `docs/upstream_fil
 - **Pure Zig active build graph**: no `@cImport`, no `translate-c`, no runtime C/C++/ObjC compilation in the active library.
 - **Dev-friendly API**: `App`, `Window`, `Service`, `WindowStyle`, `WindowControl`, typed `Event`s.
 - **Comptime RPC surface**: define `pub const rpc_methods = struct { ... }` once, generate JS/TS bridge from it.
-- **Push transport for scripts/jobs**: reconnecting WebSocket channel with WS-only wait/cancel/response flows.
+- **Push transport for scripts and RPC**: reconnecting WebSocket channel for runtime signaling.
 - **Aggressive browser discovery**: broad catalog + OS-specific search paths + env overrides.
 - **Tracked example tree**: active demos live under `examples/` (no untracked shadow example paths).
 - **Parity/test gates**: `zig build test`, `zig build examples`, `zig build parity-local`, `zig build os-matrix`.
@@ -54,7 +54,6 @@ Force launch order for examples:
 zig build run -Dexample=fancy_window -Drun-mode=webview
 zig build run -Dexample=fancy_window -Drun-mode=browser   # browser app-window
 zig build run -Dexample=fancy_window -Drun-mode=web-tab   # browser tab
-zig build run -Dexample=fancy_window -Drun-mode=web       # alias for web-tab
 zig build run -Dexample=fancy_window -Drun-mode=webview,browser,web-url
 ```
 
@@ -371,7 +370,7 @@ On Linux this reports helper/runtime expectations such as:
 | `-Dminify-embedded-js=true` | `true` | Minifies the embedded runtime helper JS asset at build time. |
 | `-Dminify-written-js=true` | `false` | Minifies the written runtime helper JS output artifact. |
 | `-Dexample=<name>` | `all` | Selects which demo `zig build run` executes. |
-| `-Drun-mode=<launch-order>` | `webview,browser,web-url` | Example launch order. Presets: `webview`, `browser` (app-window), `web-tab`, `web` (alias for `web-tab`), `web-url`. Also supports explicit order (`webview,browser,web-url`, `browser,webview`, `web-url`). |
+| `-Drun-mode=<launch-order>` | `webview,browser,web-url` | Example launch order. Presets: `webview`, `browser` (app-window), `web-tab`, `web-url`. Also supports explicit order (`webview,browser,web-url`, `browser,webview`, `web-url`). |
 | `-Dtarget=<triple>` | host | Cross-compiles the library/examples for another target. |
 
 ## Signals And Logging Hooks
