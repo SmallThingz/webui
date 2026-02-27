@@ -6,8 +6,8 @@ const bridge_runtime_helpers = @import("bridge/runtime_helpers.zig");
 const core_runtime = @import("ported/webui.zig");
 const civetweb = @import("network/civetweb.zig");
 const tls_runtime = @import("network/tls_runtime.zig");
-pub const process_signals = @import("process_signals.zig");
-const window_style_types = @import("window_style.zig");
+pub const process_signals = @import("root/process_signals.zig");
+const window_style_types = @import("root/window_style.zig");
 const api_types = @import("root/api_types.zig");
 const launch_policy = @import("root/launch_policy.zig");
 const rpc_reflect = @import("root/rpc_reflect.zig");
@@ -15,7 +15,8 @@ const rpc_runtime = @import("root/rpc_runtime.zig");
 const root_utils = @import("root/utils.zig");
 const net_io = @import("root/net_io.zig");
 const window_state = @import("root/window_state.zig");
-const runtime_requirements = @import("runtime_requirements.zig");
+const runtime_requirements = @import("root/runtime_requirements.zig");
+const logging_types = @import("root/logging.zig");
 
 pub const runtime = core_runtime;
 pub const http = civetweb;
@@ -34,6 +35,13 @@ pub const browser_default_profile_path = core_runtime.browser_default_profile_pa
 pub const profile_base_prefix_hint = core_runtime.profile_base_prefix_hint;
 pub const TlsOptions = tls_runtime.TlsOptions;
 pub const TlsInfo = tls_runtime.TlsInfo;
+pub const LogLevel = logging_types.Level;
+pub const LogHandler = logging_types.Handler;
+pub const LogSink = logging_types.Sink;
+
+pub fn logSink(comptime handler: LogHandler, context: ?*anyopaque) LogSink {
+    return .{ .handler = handler, .context = context };
+}
 
 pub fn resolveProfileBasePrefix(allocator: std.mem.Allocator) ![]u8 {
     return core_runtime.resolveProfileBasePrefix(allocator);
@@ -131,8 +139,11 @@ pub const App = struct {
 
         core_runtime.initializeRuntime(resolved_options.tls.enabled, resolved_options.enable_webui_log);
         const tls_state = try tls_runtime.Runtime.init(allocator, resolved_options.tls);
-        if (resolved_options.tls.enabled and resolved_options.enable_webui_log) {
-            std.debug.print(
+        if (resolved_options.tls.enabled) {
+            logging_types.emitf(
+                resolved_options.log_sink,
+                resolved_options.enable_webui_log,
+                .warn,
                 "[webui.warning] TLS certificates/runtime state are configured, but active HTTP transport remains plaintext in this build.\n",
                 .{},
             );
@@ -427,9 +438,7 @@ pub const Window = struct {
                 win_state.setLaunchedBrowserLaunch(self.app.allocator, launch);
             } else |err| {
                 _ = win_state.resolveAfterBrowserLaunchFailure(win_state.runtime_render_state.active_surface);
-                if (win_state.rpc_state.log_enabled) {
-                    std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
-                }
+                win_state.rpc_state.logf(.warn, "[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 if (win_state.runtime_render_state.active_surface == .browser_window and win_state.launch_policy.app_mode_required) return err;
             }
         }
@@ -760,6 +769,7 @@ pub const Service = struct {
     app: App,
     window_index: usize,
     window_id: usize,
+    process_signals_enabled: bool,
 
     pub inline fn init(allocator: std.mem.Allocator, comptime rpc_methods: type, options: ServiceOptions) !Service {
         var service: Service = undefined;
@@ -771,6 +781,10 @@ pub const Service = struct {
 
         service.window_index = main_window.index;
         service.window_id = main_window.id;
+        service.process_signals_enabled = options.process_signals;
+        if (service.process_signals_enabled) {
+            process_signals.install();
+        }
         return service;
     }
 
@@ -796,7 +810,7 @@ pub const Service = struct {
     }
 
     pub fn shouldExit(self: *Service) bool {
-        if (process_signals.stopRequested()) {
+        if (self.process_signals_enabled and process_signals.stopRequested()) {
             self.app.shutdown();
             return true;
         }
@@ -810,6 +824,11 @@ pub const Service = struct {
         // for native-webview-first mode. Browser/web modes only detach PID tracking.
         state.reconcileChildExit(self.app.allocator);
         return state.close_requested.load(.acquire);
+    }
+
+    pub fn setProcessSignalsEnabled(self: *Service, enabled: bool) void {
+        self.process_signals_enabled = enabled;
+        if (enabled) process_signals.install();
     }
 
     pub fn shutdown(self: *Service) void {

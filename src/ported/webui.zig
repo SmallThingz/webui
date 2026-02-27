@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const browser_discovery = @import("browser_discovery.zig");
-const window_style_types = @import("../window_style.zig");
+const window_style_types = @import("../root/window_style.zig");
 
 const linux_webview_host_name = "webui_linux_webview_host";
 const linux_browser_host_name = "webui_linux_browser_host";

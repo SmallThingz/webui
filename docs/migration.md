@@ -28,6 +28,20 @@ pub const LaunchPolicy = struct {
 };
 ```
 
+## Service Signals + App Logging (New)
+
+New `ServiceOptions` field:
+- `process_signals: bool = true`
+
+When `true`, `Service.init(...)` installs and checks signal handlers automatically in `shouldExit()`.
+Set `process_signals = false` if your host runtime owns signal handling.
+
+New `AppOptions` field:
+- `log_sink: webui.LogSink = .{}`
+
+All runtime `[webui.*]` logs route through this sink when `enable_webui_log=true`.  
+Use `webui.logSink(MyLogger.sink, ctx)` to pass a comptime function object.
+
 ## Browser/Profile Launch Options (Hard Replace)
 
 Removed `BrowserLaunchOptions` fields:

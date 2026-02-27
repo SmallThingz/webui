@@ -1,6 +1,7 @@
 const std = @import("std");
 const bridge_template = @import("../bridge/template.zig");
 const api_types = @import("api_types.zig");
+const logging = @import("logging.zig");
 
 pub const HandlerEntry = struct {
     name: []u8,
@@ -36,6 +37,11 @@ const Task = struct {
 };
 
 pub const State = struct {
+    pub const LogConfig = struct {
+        enabled: bool = false,
+        sink: logging.Sink = .{},
+    };
+
     handlers: std.array_list.Managed(HandlerEntry),
     generated_script: []const u8,
     generated_typescript: []const u8,
@@ -53,8 +59,9 @@ pub const State = struct {
     worker_stop: std.atomic.Value(bool),
     worker_lifecycle_mutex: std.Thread.Mutex,
     log_enabled: bool,
+    log_sink: logging.Sink,
 
-    pub fn init(allocator: std.mem.Allocator, log_enabled: bool) State {
+    pub fn init(allocator: std.mem.Allocator, log_config: LogConfig) State {
         return .{
             .handlers = std.array_list.Managed(HandlerEntry).init(allocator),
             .generated_script = bridge_template.default_script,
@@ -71,8 +78,13 @@ pub const State = struct {
             .worker_thread = null,
             .worker_stop = std.atomic.Value(bool).init(false),
             .worker_lifecycle_mutex = .{},
-            .log_enabled = log_enabled,
+            .log_enabled = log_config.enabled,
+            .log_sink = log_config.sink,
         };
+    }
+
+    pub inline fn logf(self: *const State, level: logging.Level, comptime fmt: []const u8, args: anytype) void {
+        logging.emitf(self.log_sink, self.log_enabled, level, fmt, args);
     }
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
@@ -225,15 +237,13 @@ pub const State = struct {
         if (self.log_enabled) {
             const args_json = try std.json.Stringify.valueAlloc(allocator, args_value, .{});
             defer allocator.free(args_json);
-            std.debug.print("[webui.rpc] recv name={s} args={s}\n", .{ function_name, args_json });
+            self.logf(.debug, "[webui.rpc] recv name={s} args={s}\n", .{ function_name, args_json });
         }
 
         const encoded_value = try self.invokeSync(allocator, function_name, args_value.array.items);
         defer allocator.free(encoded_value);
 
-        if (self.log_enabled) {
-            std.debug.print("[webui.rpc] send name={s} value={s}\n", .{ function_name, encoded_value });
-        }
+        self.logf(.debug, "[webui.rpc] send name={s} value={s}\n", .{ function_name, encoded_value });
 
         var out = std.array_list.Managed(u8).init(allocator);
         errdefer out.deinit();

@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const style_types = @import("../window_style.zig");
+const style_types = @import("../root/window_style.zig");
 const browser_discovery = @import("browser_discovery.zig");
 const core_runtime = @import("webui.zig");
 

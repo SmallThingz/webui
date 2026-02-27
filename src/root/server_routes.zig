@@ -2,7 +2,7 @@ const std = @import("std");
 
 const net_io = @import("net_io.zig");
 const api_types = @import("api_types.zig");
-const window_style_types = @import("../window_style.zig");
+const window_style_types = @import("window_style.zig");
 
 pub fn handleConnection(
     state: anytype,
@@ -37,15 +37,13 @@ fn wsConnectionThreadMain(state: anytype, stream: std.net.Stream, connection_id:
         stream.close();
         state.emitDiagnostic("websocket.disconnected", .websocket, .info, "WebSocket client disconnected");
 
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.ws] disconnected connection_id={d}\n", .{connection_id});
-        }
+        state.rpc_state.logf(.info, "[webui.ws] disconnected connection_id={d}\n", .{connection_id});
     }
 
     while (!state.server_stop.load(.acquire)) {
         const frame = net_io.readWsInboundFrameAlloc(state.allocator, stream, 8 * 1024 * 1024) catch |err| {
-            if (state.rpc_state.log_enabled and err != error.Closed) {
-                std.debug.print("[webui.ws] read failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
+            if (err != error.Closed) {
+                state.rpc_state.logf(.warn, "[webui.ws] read failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
             }
             if (err != error.Closed) {
                 state.emitDiagnostic("websocket.read_error", .websocket, .warn, @errorName(err));
@@ -57,9 +55,7 @@ fn wsConnectionThreadMain(state: anytype, stream: std.net.Stream, connection_id:
         switch (frame.kind) {
             .text, .binary => {
                 state.handleWebSocketClientMessage(connection_id, frame.payload) catch |err| {
-                    if (state.rpc_state.log_enabled) {
-                        std.debug.print("[webui.ws] message handling failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
-                    }
+                    state.rpc_state.logf(.warn, "[webui.ws] message handling failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
                 };
             },
             .ping => {
@@ -129,9 +125,7 @@ fn handleWebSocketUpgradeRoute(
     }
     state.state_mutex.unlock();
 
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.ws] connected connection_id={d}\n", .{connection_id});
-    }
+    state.rpc_state.logf(.info, "[webui.ws] connected connection_id={d}\n", .{connection_id});
     state.emitDiagnostic("websocket.connected", .websocket, .info, "WebSocket client connected");
 
     const thread = try std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, stream, connection_id });
@@ -169,9 +163,7 @@ fn handleRpcRoute(
     if (!std.mem.eql(u8, method, "POST")) return false;
     if (!std.mem.eql(u8, path_only, state.rpc_state.bridge_options.rpc_route)) return false;
 
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.rpc] raw body={s}\n", .{body});
-    }
+    state.rpc_state.logf(.debug, "[webui.rpc] raw body={s}\n", .{body});
 
     const client_token = net_io.httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
     state.state_mutex.lock();
@@ -184,18 +176,14 @@ fn handleRpcRoute(
         state.emitDiagnostic("rpc.dispatch.error", .rpc, .warn, @errorName(err));
         const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
         defer allocator.free(err_body);
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.rpc] error={s}\n", .{@errorName(err)});
-        }
+        state.rpc_state.logf(.warn, "[webui.rpc] error={s}\n", .{@errorName(err)});
         try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_body);
         return true;
     };
     state.rpc_state.invoke_mutex.unlock();
     defer allocator.free(payload);
 
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.rpc] http response={s}\n", .{payload});
-    }
+    state.rpc_state.logf(.debug, "[webui.rpc] http response={s}\n", .{payload});
 
     if (state.event_callback.handler) |handler| {
         const event = api_types.Event{
@@ -253,31 +241,25 @@ fn handleWindowControlRoute(
         return true;
     };
 
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.window] control cmd={s}\n", .{@tagName(cmd)});
-    }
+    state.rpc_state.logf(.debug, "[webui.window] control cmd={s}\n", .{@tagName(cmd)});
 
     state.state_mutex.lock();
     const result = state.control(cmd) catch |err| {
         state.state_mutex.unlock();
         const err_payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
         defer allocator.free(err_payload);
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.window] control error={s}\n", .{@errorName(err)});
-        }
+        state.rpc_state.logf(.warn, "[webui.window] control error={s}\n", .{@errorName(err)});
         try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_payload);
         return true;
     };
     state.state_mutex.unlock();
 
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.window] control result success={any} emulation={s} closed={any} warning={s}\n", .{
-            result.success,
-            result.emulation orelse "",
-            result.closed,
-            result.warning orelse "",
-        });
-    }
+    state.rpc_state.logf(.debug, "[webui.window] control result success={any} emulation={s} closed={any} warning={s}\n", .{
+        result.success,
+        result.emulation orelse "",
+        result.closed,
+        result.warning orelse "",
+    });
 
     const payload = try std.json.Stringify.valueAlloc(allocator, .{
         .success = result.success,
@@ -323,22 +305,18 @@ fn handleWindowStyleRoute(
         state.state_mutex.unlock();
         const err_payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
         defer allocator.free(err_payload);
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.window] style error={s}\n", .{@errorName(err)});
-        }
+        state.rpc_state.logf(.warn, "[webui.window] style error={s}\n", .{@errorName(err)});
         try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_payload);
         return true;
     };
     const style = state.current_style;
     state.state_mutex.unlock();
 
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.window] style applied frameless={any} transparent={any} corner_radius={any}\n", .{
-            style.frameless,
-            style.transparent,
-            style.corner_radius,
-        });
-    }
+    state.rpc_state.logf(.debug, "[webui.window] style applied frameless={any} transparent={any} corner_radius={any}\n", .{
+        style.frameless,
+        style.transparent,
+        style.corner_radius,
+    });
 
     const payload = try std.json.Stringify.valueAlloc(allocator, style, .{});
     defer allocator.free(payload);

@@ -374,6 +374,34 @@ On Linux this reports helper/runtime expectations such as:
 | `-Drun-mode=<launch-order>` | `webview,browser,web-url` | Example launch order. Presets: `webview`, `browser` (app-window), `web-tab`, `web` (alias for `web-tab`), `web-url`. Also supports explicit order (`webview,browser,web-url`, `browser,webview`, `web-url`). |
 | `-Dtarget=<triple>` | host | Cross-compiles the library/examples for another target. |
 
+## Signals And Logging Hooks
+
+`Service` installs/uses process-signal handling by default. You can disable it:
+
+```zig
+var service = try webui.Service.init(allocator, rpc_methods, .{
+    .process_signals = false, // default is true
+});
+```
+
+`AppOptions` also accepts a custom log sink. Pass any comptime function object (or a no-op logger):
+
+```zig
+const MyLog = struct {
+    fn sink(_: ?*anyopaque, level: webui.LogLevel, msg: []const u8) void {
+        _ = level;
+        std.debug.print("webui: {s}\n", .{msg});
+    }
+};
+
+var service = try webui.Service.init(allocator, rpc_methods, .{
+    .app = .{
+        .enable_webui_log = true,
+        .log_sink = webui.logSink(MyLog.sink, null),
+    },
+});
+```
+
 Exported compile-time values:
 - `webui.BuildFlags.dynamic`
 - `webui.BuildFlags.enable_tls`

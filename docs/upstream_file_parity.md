@@ -39,7 +39,7 @@ Status: **Partial**
 Mapped runtime:
 - `src/root.zig`
 - `src/ported/webui.zig`
-- `src/window_style.zig`
+- `src/root/window_style.zig`
 - `src/ported/browser_discovery.zig`
 
 Implemented capability groups:

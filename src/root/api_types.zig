@@ -3,7 +3,9 @@ const build_options = @import("build_options");
 
 const browser_discovery = @import("../ported/browser_discovery.zig");
 const core_runtime = @import("../ported/webui.zig");
-const runtime_requirements = @import("../runtime_requirements.zig");
+const runtime_requirements = @import("runtime_requirements.zig");
+const window_style_types = @import("window_style.zig");
+const logging = @import("logging.zig");
 
 pub const BuildFlags = struct {
     pub const dynamic = build_options.dynamic;
@@ -163,6 +165,7 @@ pub const AppOptions = struct {
         .enabled = build_options.enable_tls,
     },
     enable_webui_log: bool = build_options.enable_webui_log,
+    log_sink: logging.Sink = .{},
     public_network: bool = false,
     browser_launch: core_runtime.BrowserLaunchOptions = .{},
     window_fallback_emulation: bool = true,
@@ -171,7 +174,7 @@ pub const AppOptions = struct {
 pub const WindowOptions = struct {
     window_id: ?usize = null,
     title: []const u8 = "WebUI Zig",
-    style: @import("../window_style.zig").WindowStyle = .{},
+    style: window_style_types.WindowStyle = .{},
 };
 
 pub const WindowContent = union(enum) {
@@ -220,4 +223,5 @@ pub const ServiceOptions = struct {
     app: AppOptions = .{},
     window: WindowOptions = .{},
     rpc: RpcOptions = .{},
+    process_signals: bool = true,
 };

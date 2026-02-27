@@ -4,7 +4,7 @@ const websocket = @import("websocket");
 const core_runtime = @import("../ported/webui.zig");
 const browser_discovery = @import("../ported/browser_discovery.zig");
 const webview_backend = @import("../ported/webview.zig");
-const window_style_types = @import("../window_style.zig");
+const window_style_types = @import("window_style.zig");
 const api_types = @import("api_types.zig");
 const launch_policy = @import("launch_policy.zig");
 const rpc_runtime = @import("rpc_runtime.zig");
@@ -236,7 +236,10 @@ pub const WindowState = struct {
             .event_callback = .{},
             .raw_callback = .{},
             .close_callback = .{},
-            .rpc_state = RpcRegistryState.init(allocator, app_options.enable_webui_log),
+            .rpc_state = RpcRegistryState.init(allocator, .{
+                .enabled = app_options.enable_webui_log,
+                .sink = app_options.log_sink,
+            }),
             .backend = webview_backend.NativeBackend.init(launchPolicyContains(app_options.launch_policy, .native_webview)),
             .native_capabilities = &.{},
             .current_style = .{},
@@ -288,17 +291,13 @@ pub const WindowState = struct {
                         };
                     }
                 }
-                if (state.rpc_state.log_enabled) {
-                    if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
-                        std.debug.print("[webui.warning] window={d} {s}\n", .{ state.id, warning });
-                    }
+                if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
+                    state.rpc_state.logf(.warn, "[webui.warning] window={d} {s}\n", .{ state.id, warning });
                 }
             };
             state.backend.applyStyle(state.current_style) catch |err| {
-                if (state.rpc_state.log_enabled) {
-                    if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
-                        std.debug.print("[webui.warning] window={d} {s}\n", .{ state.id, warning });
-                    }
+                if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
+                    state.rpc_state.logf(.warn, "[webui.warning] window={d} {s}\n", .{ state.id, warning });
                 }
             };
         }
@@ -414,9 +413,7 @@ pub const WindowState = struct {
 
     pub fn setWarning(self: *WindowState, message: []const u8) void {
         self.last_warning = message;
-        if (self.rpc_state.log_enabled) {
-            std.debug.print("[webui.warning] window={d} {s}\n", .{ self.id, message });
-        }
+        self.rpc_state.logf(.warn, "[webui.warning] window={d} {s}\n", .{ self.id, message });
         self.emit(.window_state, "warning", message);
     }
 
@@ -542,14 +539,12 @@ pub const WindowState = struct {
         if (launch.pid) |pid| {
             if (self.launched_browser_pid) |existing| {
                 if (existing != pid) {
-                    if (self.rpc_state.log_enabled) {
-                        std.debug.print("[webui.browser] replacing tracked pid old={d} new={d}\n", .{ existing, pid });
-                    }
+                    self.rpc_state.logf(.info, "[webui.browser] replacing tracked pid old={d} new={d}\n", .{ existing, pid });
                     core_runtime.terminateBrowserProcess(allocator, existing);
                 }
             }
-            if (self.rpc_state.log_enabled and self.launched_browser_pid == null) {
-                std.debug.print("[webui.browser] tracking launched browser pid={d} kind={s}\n", .{
+            if (self.launched_browser_pid == null) {
+                self.rpc_state.logf(.info, "[webui.browser] tracking launched browser pid={d} kind={s}\n", .{
                     pid,
                     if (launch.kind) |kind| @tagName(kind) else "unknown",
                 });
@@ -557,9 +552,7 @@ pub const WindowState = struct {
             self.launched_browser_pid = pid;
         } else {
             if (self.launched_browser_pid) |existing| {
-                if (self.rpc_state.log_enabled) {
-                    std.debug.print("[webui.browser] replacing tracked pid old={d} with untracked browser launch\n", .{existing});
-                }
+                self.rpc_state.logf(.info, "[webui.browser] replacing tracked pid old={d} with untracked browser launch\n", .{existing});
                 core_runtime.terminateBrowserProcess(allocator, existing);
             }
             self.launched_browser_pid = null;
@@ -580,8 +573,8 @@ pub const WindowState = struct {
         else
             null;
 
-        if (self.rpc_state.log_enabled and launch.used_system_fallback) {
-            std.debug.print("[webui.browser] system fallback launcher was used (tab-style window may appear)\n", .{});
+        if (launch.used_system_fallback) {
+            self.rpc_state.logf(.warn, "[webui.browser] system fallback launcher was used (tab-style window may appear)\n", .{});
         }
 
         self.backend.attachBrowserProcess(launch.kind, launch.pid, launch.is_child_process);
@@ -680,9 +673,7 @@ pub const WindowState = struct {
     pub fn requestLifecycleCloseFromFrontend(self: *WindowState) void {
         if (self.launched_browser_pid) |pid| {
             if (core_runtime.isProcessAlive(pid)) {
-                if (self.rpc_state.log_enabled) {
-                    std.debug.print("[webui.lifecycle] ignoring close while tracked pid is alive pid={d}\n", .{pid});
-                }
+                self.rpc_state.logf(.debug, "[webui.lifecycle] ignoring close while tracked pid is alive pid={d}\n", .{pid});
                 return;
             }
         }
@@ -694,12 +685,11 @@ pub const WindowState = struct {
         const should_terminate = self.shouldTerminateTrackedBrowserProcess();
         if (self.launched_browser_pid) |pid| {
             if (should_terminate) {
-                if (self.rpc_state.log_enabled) {
-                    std.debug.print("[webui.browser] terminating tracked browser pid={d}\n", .{pid});
-                }
+                self.rpc_state.logf(.info, "[webui.browser] terminating tracked browser pid={d}\n", .{pid});
                 core_runtime.terminateBrowserProcess(allocator, pid);
-            } else if (self.rpc_state.log_enabled) {
-                std.debug.print(
+            } else {
+                self.rpc_state.logf(
+                    .debug,
                     "[webui.browser] leaving tracked browser pid={d} alive (browser/web mode shutdown)\n",
                     .{pid},
                 );
@@ -786,9 +776,7 @@ pub const WindowState = struct {
                 self.setLaunchedBrowserLaunch(allocator, launch);
             } else |err| {
                 _ = self.resolveAfterBrowserLaunchFailure(self.runtime_render_state.active_surface);
-                if (self.rpc_state.log_enabled) {
-                    std.debug.print("[webui.browser] launch failed error={s}\n", .{@errorName(err)});
-                }
+                self.rpc_state.logf(.warn, "[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 if (self.runtime_render_state.active_surface != .browser_window) return;
                 if (self.launch_policy.app_mode_required) return err;
             }
@@ -959,12 +947,11 @@ pub const WindowState = struct {
             defer self.allocator.free(payload);
 
             self.sendWsTextLocked(entry.stream, payload) catch |err| {
-                if (self.rpc_state.log_enabled) {
-                    std.debug.print(
-                        "[webui.ws] send failed connection_id={d} err={s}\n",
-                        .{ entry.connection_id, @errorName(err) },
-                    );
-                }
+                self.rpc_state.logf(
+                    .warn,
+                    "[webui.ws] send failed connection_id={d} err={s}\n",
+                    .{ entry.connection_id, @errorName(err) },
+                );
                 self.closeWsConnectionLocked(entry.connection_id);
                 idx += 1;
                 continue;
@@ -1002,12 +989,11 @@ pub const WindowState = struct {
         while (idx < self.ws_connections.items.len) {
             const entry = self.ws_connections.items[idx];
             self.sendWsTextLocked(entry.stream, payload) catch |err| {
-                if (self.rpc_state.log_enabled) {
-                    std.debug.print(
-                        "[webui.ws] close signal write failed connection_id={d} err={s}\n",
-                        .{ entry.connection_id, @errorName(err) },
-                    );
-                }
+                self.rpc_state.logf(
+                    .warn,
+                    "[webui.ws] close signal write failed connection_id={d} err={s}\n",
+                    .{ entry.connection_id, @errorName(err) },
+                );
                 self.closeWsConnectionLocked(entry.connection_id);
                 continue;
             };
@@ -1038,12 +1024,11 @@ pub const WindowState = struct {
         if (signal_id == 0) return;
 
         const acked = self.waitForCloseAckLocked(signal_id, timeout_ms);
-        if (self.rpc_state.log_enabled) {
-            std.debug.print(
-                "[webui.ws] close signal id={d} acked={any}\n",
-                .{ signal_id, acked },
-            );
-        }
+        self.rpc_state.logf(
+            .debug,
+            "[webui.ws] close signal id={d} acked={any}\n",
+            .{ signal_id, acked },
+        );
     }
 
     pub fn removeScriptPendingLocked(self: *WindowState, task: *ScriptTask) bool {
