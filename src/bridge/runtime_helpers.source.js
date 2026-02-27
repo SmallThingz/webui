@@ -255,6 +255,7 @@ let webuiSocket = null;
 let webuiSocketOpen = false;
 let webuiSocketStopped = false;
 let webuiSocketReconnectDelayMs = 120;
+const webuiFrontendHandlers = new Map();
 
 function webuiSocketUrl() {
   try {
@@ -329,9 +330,88 @@ function webuiHandleSocketMessage(raw) {
     webuiHandleBackendClose(message);
     return;
   }
+  if (message.type === "frontend_rpc_request") {
+    void webuiHandleFrontendRpcRequest(message);
+    return;
+  }
   if (message.type !== "script_task") return;
   if (typeof message.script !== "string") return;
   void webuiExecuteScriptTask(message);
+}
+
+function webuiRegisterFrontendHandler(name, handler) {
+  if (typeof name !== "string" || !name) throw new Error("handler name must be a non-empty string");
+  if (typeof handler !== "function") throw new Error("handler must be a function");
+  webuiFrontendHandlers.set(name, handler);
+  return true;
+}
+
+function webuiUnregisterFrontendHandler(name) {
+  if (typeof name !== "string" || !name) return false;
+  return webuiFrontendHandlers.delete(name);
+}
+
+function webuiHasFrontendHandler(name) {
+  if (typeof name !== "string" || !name) return false;
+  return webuiFrontendHandlers.has(name);
+}
+
+async function webuiHandleFrontendRpcRequest(message) {
+  const id = Number(message && message.id);
+  const expectResult = !!(message && message.expect_result);
+  const name = message && typeof message.name === "string" ? message.name : "";
+  const argsRaw = message && Object.prototype.hasOwnProperty.call(message, "args") ? message.args : [];
+  const args = Array.isArray(argsRaw) ? argsRaw : [argsRaw];
+
+  let js_error = false;
+  let value = null;
+  let error_message = null;
+
+  const sendResponse = async () => {
+    if (!expectResult) return;
+    if (!Number.isFinite(id) || id <= 0) return;
+    const responsePayload = {
+      type: "frontend_rpc_response",
+      id: Math.trunc(id),
+      js_error,
+      value,
+      error_message,
+      client_id: webuiClientId,
+      connection_id: message && message.connection_id,
+    };
+    try {
+      await webuiSendObjectWithBackoff(
+        responsePayload,
+        webuiSocketConnectTimeoutMs,
+        `frontend rpc response ${Math.trunc(id)}`
+      );
+    } catch (_) {}
+  };
+
+  const handler = webuiFrontendHandlers.get(name);
+  if (typeof handler !== "function") {
+    js_error = true;
+    error_message = `frontend handler not found: ${name}`;
+    await sendResponse();
+    return;
+  }
+
+  try {
+    const result = await handler(...args);
+    value = typeof result === "undefined" ? null : result;
+  } catch (err) {
+    js_error = true;
+    error_message = String(err);
+    if (!expectResult) {
+      try {
+        if (typeof console !== "undefined" && console && typeof console.error === "function") {
+          console.error("[webui.frontend-rpc]", err);
+        }
+      } catch (_) {}
+    }
+  }
+
+  await sendResponse();
 }
 
 function webuiConnectPushSocket() {
@@ -440,4 +520,9 @@ async function webuiExecuteScriptTask(task) {
   globalThis.webuiWindowStyle = webuiWindowStyle;
   globalThis.webuiGetWindowStyle = webuiGetWindowStyle;
   globalThis.webuiGetWindowCapabilities = webuiGetWindowCapabilities;
+  globalThis.webuiFrontend = {
+    register: webuiRegisterFrontendHandler,
+    unregister: webuiUnregisterFrontendHandler,
+    has: webuiHasFrontendHandler,
+  };
 })();

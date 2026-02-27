@@ -131,7 +131,6 @@ fn handleWebSocketUpgradeRoute(
         const client_ref = try state.findOrCreateClientSessionLocked(token);
         connection_id = client_ref.connection_id;
         try state.registerWsConnectionLocked(connection_id, conn);
-        try state.dispatchPendingScriptTasksLocked();
     }
     state.state_mutex.unlock();
 

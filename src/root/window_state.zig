@@ -136,6 +136,50 @@ pub const ScriptTask = struct {
     }
 };
 
+pub const FrontendRpcTask = struct {
+    allocator: std.mem.Allocator,
+    id: u64,
+    target_connection: ?usize,
+    function_name: []u8,
+    args_json: []u8,
+    expect_result: bool,
+    done: bool = false,
+    timed_out: bool = false,
+    js_error: bool = false,
+    value_json: ?[]u8 = null,
+    error_message: ?[]u8 = null,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        id: u64,
+        function_name: []const u8,
+        args_json: []const u8,
+        target_connection: ?usize,
+        expect_result: bool,
+    ) !*FrontendRpcTask {
+        const task = try allocator.create(FrontendRpcTask);
+        task.* = .{
+            .allocator = allocator,
+            .id = id,
+            .target_connection = target_connection,
+            .function_name = try allocator.dupe(u8, function_name),
+            .args_json = try allocator.dupe(u8, args_json),
+            .expect_result = expect_result,
+        };
+        return task;
+    }
+
+    pub fn deinit(self: *FrontendRpcTask) void {
+        self.allocator.free(self.function_name);
+        self.allocator.free(self.args_json);
+        if (self.value_json) |value| self.allocator.free(value);
+        if (self.error_message) |msg| self.allocator.free(msg);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const default_client_token = "default-client";
 
 pub const WsTransport = union(enum) {
@@ -218,6 +262,9 @@ pub const WindowState = struct {
     next_script_id: u64,
     script_pending: std.array_list.Managed(*ScriptTask),
     script_inflight: std.array_list.Managed(*ScriptTask),
+    next_frontend_rpc_id: u64,
+    frontend_rpc_pending: std.array_list.Managed(*FrontendRpcTask),
+    frontend_rpc_inflight: std.array_list.Managed(*FrontendRpcTask),
     next_close_signal_id: u64,
     last_close_ack_id: u64,
     close_ack_cond: std.Thread.Condition,
@@ -307,6 +354,9 @@ pub const WindowState = struct {
             .next_script_id = 1,
             .script_pending = std.array_list.Managed(*ScriptTask).init(allocator),
             .script_inflight = std.array_list.Managed(*ScriptTask).init(allocator),
+            .next_frontend_rpc_id = 1,
+            .frontend_rpc_pending = std.array_list.Managed(*FrontendRpcTask).init(allocator),
+            .frontend_rpc_inflight = std.array_list.Managed(*FrontendRpcTask).init(allocator),
             .next_close_signal_id = 1,
             .last_close_ack_id = 0,
             .close_ack_cond = .{},
@@ -923,6 +973,28 @@ pub const WindowState = struct {
         return task;
     }
 
+    pub fn queueFrontendRpcLocked(
+        self: *WindowState,
+        allocator: std.mem.Allocator,
+        function_name: []const u8,
+        args_json: []const u8,
+        target_connection: ?usize,
+        expect_result: bool,
+    ) !*FrontendRpcTask {
+        const task = try FrontendRpcTask.init(
+            allocator,
+            self.next_frontend_rpc_id,
+            function_name,
+            args_json,
+            target_connection,
+            expect_result,
+        );
+        self.next_frontend_rpc_id += 1;
+        try self.frontend_rpc_pending.append(task);
+        try self.dispatchPendingFrontendRpcTasksLocked();
+        return task;
+    }
+
     pub fn sendWsTextLocked(_: *WindowState, transport: *WsTransport, payload: []const u8) !void {
         try net_io.writeWsFrameAny(transport, .text, payload);
     }
@@ -941,12 +1013,16 @@ pub const WindowState = struct {
             if (entry.connection_id != connection_id) continue;
             entry.transport.shutdown();
             entry.transport = transport;
+            try self.dispatchPendingScriptTasksLocked();
+            try self.dispatchPendingFrontendRpcTasksLocked();
             return;
         }
         try self.ws_connections.append(.{
             .connection_id = connection_id,
             .transport = transport,
         });
+        try self.dispatchPendingScriptTasksLocked();
+        try self.dispatchPendingFrontendRpcTasksLocked();
     }
 
     pub fn unregisterWsConnectionLocked(self: *WindowState, connection_id: usize) void {
@@ -1046,6 +1122,81 @@ pub const WindowState = struct {
 
             if (task.expect_result) {
                 try self.script_inflight.append(task);
+            } else {
+                task.mutex.lock();
+                task.done = true;
+                task.cond.signal();
+                task.mutex.unlock();
+                task.deinit();
+            }
+        }
+    }
+
+    fn buildFrontendRpcRequestPayload(
+        self: *WindowState,
+        task: *FrontendRpcTask,
+        connection_id: usize,
+        client_id: usize,
+    ) ![]u8 {
+        const fn_name_json = try std.json.Stringify.valueAlloc(self.allocator, task.function_name, .{});
+        defer self.allocator.free(fn_name_json);
+
+        var payload = std.array_list.Managed(u8).init(self.allocator);
+        errdefer payload.deinit();
+        const writer = payload.writer();
+
+        try writer.writeAll("{\"type\":\"frontend_rpc_request\",\"id\":");
+        try writer.print("{d}", .{task.id});
+        try writer.writeAll(",\"name\":");
+        try writer.writeAll(fn_name_json);
+        try writer.writeAll(",\"args\":");
+        try writer.writeAll(task.args_json);
+        try writer.writeAll(",\"expect_result\":");
+        try writer.writeAll(if (task.expect_result) "true" else "false");
+        try writer.writeAll(",\"client_id\":");
+        try writer.print("{d}", .{client_id});
+        try writer.writeAll(",\"connection_id\":");
+        try writer.print("{d}", .{connection_id});
+        try writer.writeAll("}");
+
+        return payload.toOwnedSlice();
+    }
+
+    pub fn dispatchPendingFrontendRpcTasksLocked(self: *WindowState) !void {
+        var idx: usize = 0;
+        while (idx < self.frontend_rpc_pending.items.len) {
+            const task = self.frontend_rpc_pending.items[idx];
+
+            const ws_entry = if (task.target_connection) |target_connection|
+                self.findWsConnectionByIdLocked(target_connection)
+            else
+                self.firstWsConnectionLocked();
+
+            if (ws_entry == null) {
+                idx += 1;
+                continue;
+            }
+
+            const entry = ws_entry.?;
+            const client_id = self.clientIdForConnectionLocked(entry.connection_id) orelse 0;
+            const payload = try self.buildFrontendRpcRequestPayload(task, entry.connection_id, client_id);
+            defer self.allocator.free(payload);
+
+            self.sendWsTextLocked(&entry.transport, payload) catch |err| {
+                self.rpc_state.logf(
+                    .warn,
+                    "[webui.ws] frontend rpc send failed connection_id={d} err={s}\n",
+                    .{ entry.connection_id, @errorName(err) },
+                );
+                self.closeWsConnectionLocked(entry.connection_id);
+                idx += 1;
+                continue;
+            };
+
+            _ = self.frontend_rpc_pending.orderedRemove(idx);
+
+            if (task.expect_result) {
+                try self.frontend_rpc_inflight.append(task);
             } else {
                 task.mutex.lock();
                 task.done = true;
@@ -1222,6 +1373,72 @@ pub const WindowState = struct {
         task.mutex.unlock();
     }
 
+    pub fn removeFrontendRpcPendingLocked(self: *WindowState, task: *FrontendRpcTask) bool {
+        for (self.frontend_rpc_pending.items, 0..) |pending, idx| {
+            if (pending != task) continue;
+            _ = self.frontend_rpc_pending.orderedRemove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeFrontendRpcInflightLocked(self: *WindowState, task: *FrontendRpcTask) bool {
+        for (self.frontend_rpc_inflight.items, 0..) |inflight, idx| {
+            if (inflight != task) continue;
+            _ = self.frontend_rpc_inflight.orderedRemove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn completeFrontendRpcTaskLocked(
+        self: *WindowState,
+        task_id: u64,
+        js_error: bool,
+        value_json: ?[]const u8,
+        error_message: ?[]const u8,
+    ) !bool {
+        for (self.frontend_rpc_inflight.items, 0..) |task, idx| {
+            if (task.id != task_id) continue;
+            _ = self.frontend_rpc_inflight.orderedRemove(idx);
+
+            task.mutex.lock();
+            defer task.mutex.unlock();
+
+            if (task.value_json) |buf| {
+                task.allocator.free(buf);
+                task.value_json = null;
+            }
+            if (task.error_message) |buf| {
+                task.allocator.free(buf);
+                task.error_message = null;
+            }
+
+            if (value_json) |value| {
+                task.value_json = try task.allocator.dupe(u8, value);
+            }
+            if (error_message) |msg| {
+                task.error_message = try task.allocator.dupe(u8, msg);
+            }
+
+            task.js_error = js_error;
+            task.done = true;
+            task.cond.signal();
+            return true;
+        }
+        return false;
+    }
+
+    pub fn markFrontendRpcTimedOutLocked(self: *WindowState, task: *FrontendRpcTask) void {
+        _ = self.removeFrontendRpcPendingLocked(task);
+        _ = self.removeFrontendRpcInflightLocked(task);
+        task.mutex.lock();
+        task.timed_out = true;
+        task.done = true;
+        task.cond.signal();
+        task.mutex.unlock();
+    }
+
     pub fn handleWebSocketClientMessage(self: *WindowState, _: usize, data: []const u8) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
         defer parsed.deinit();
@@ -1254,6 +1471,42 @@ pub const WindowState = struct {
 
             self.state_mutex.lock();
             self.requestLifecycleCloseFromFrontend();
+            self.state_mutex.unlock();
+            return;
+        }
+
+        if (std.mem.eql(u8, msg_type_value.string, "frontend_rpc_response")) {
+            const id_value = parsed.value.object.get("id") orelse return;
+            const task_id: u64 = switch (id_value) {
+                .integer => |v| @as(u64, @intCast(v)),
+                .float => |v| @as(u64, @intFromFloat(v)),
+                else => return,
+            };
+
+            const js_error = if (parsed.value.object.get("js_error")) |err_val|
+                switch (err_val) {
+                    .bool => |b| b,
+                    else => false,
+                }
+            else
+                false;
+
+            const value_json = if (parsed.value.object.get("value")) |value|
+                try std.json.Stringify.valueAlloc(self.allocator, value, .{})
+            else
+                null;
+            defer if (value_json) |buf| self.allocator.free(buf);
+
+            const error_message = if (parsed.value.object.get("error_message")) |err_msg|
+                switch (err_msg) {
+                    .string => |msg| msg,
+                    else => null,
+                }
+            else
+                null;
+
+            self.state_mutex.lock();
+            _ = try self.completeFrontendRpcTaskLocked(task_id, js_error, value_json, error_message);
             self.state_mutex.unlock();
             return;
         }
@@ -1320,6 +1573,19 @@ pub const WindowState = struct {
             task.deinit();
         }
         self.script_inflight.deinit();
+
+        for (self.frontend_rpc_pending.items) |task| task.deinit();
+        self.frontend_rpc_pending.deinit();
+
+        for (self.frontend_rpc_inflight.items) |task| {
+            task.mutex.lock();
+            task.timed_out = true;
+            task.done = true;
+            task.cond.broadcast();
+            task.mutex.unlock();
+            task.deinit();
+        }
+        self.frontend_rpc_inflight.deinit();
         self.ws_connections.deinit();
 
         self.terminateLaunchedBrowser(allocator);

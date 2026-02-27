@@ -113,6 +113,7 @@ pub const DiagnosticHandler = window_state.DiagnosticHandler;
 const DiagnosticCallbackState = window_state.DiagnosticCallbackState;
 const WindowState = window_state.WindowState;
 const ScriptTask = window_state.ScriptTask;
+const FrontendRpcTask = window_state.FrontendRpcTask;
 
 const PinnedStructOwner = enum {
     app,
@@ -516,9 +517,23 @@ pub const Window = struct {
         if (function_name.len == 0) return error.EmptyFrontendFunctionName;
         const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
         defer self.app.allocator.free(args_json);
-        const script = try self.buildFrontendInvokeScript(function_name, args_json, true);
-        defer self.app.allocator.free(script);
-        return self.evalScript(allocator, script, options);
+
+        const win_state = self.state();
+        win_state.state_mutex.lock();
+        const target_connection: ?usize = switch (options.target) {
+            .window_default => null,
+            .client_connection => |connection_id| connection_id,
+        };
+        const task = try win_state.queueFrontendRpcLocked(
+            self.app.allocator,
+            function_name,
+            args_json,
+            target_connection,
+            true,
+        );
+        win_state.state_mutex.unlock();
+
+        return self.awaitFrontendRpcTaskResult(allocator, win_state, task, options.timeout_ms);
     }
 
     pub fn callFrontendFireAndForget(
@@ -530,9 +545,21 @@ pub const Window = struct {
         if (function_name.len == 0) return error.EmptyFrontendFunctionName;
         const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
         defer self.app.allocator.free(args_json);
-        const script = try self.buildFrontendInvokeScript(function_name, args_json, false);
-        defer self.app.allocator.free(script);
-        try self.runScript(script, options);
+
+        const win_state = self.state();
+        win_state.state_mutex.lock();
+        defer win_state.state_mutex.unlock();
+        const target_connection: ?usize = switch (options.target) {
+            .window_default => null,
+            .client_connection => |connection_id| connection_id,
+        };
+        _ = try win_state.queueFrontendRpcLocked(
+            self.app.allocator,
+            function_name,
+            args_json,
+            target_connection,
+            false,
+        );
     }
 
     pub fn callFrontendOnConnections(
@@ -546,14 +573,18 @@ pub const Window = struct {
 
         const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
         defer self.app.allocator.free(args_json);
-        const script = try self.buildFrontendInvokeScript(function_name, args_json, false);
-        defer self.app.allocator.free(script);
 
         const win_state = self.state();
         win_state.state_mutex.lock();
         defer win_state.state_mutex.unlock();
         for (connection_ids) |connection_id| {
-            _ = try win_state.queueScriptLocked(self.app.allocator, script, connection_id, false);
+            _ = try win_state.queueFrontendRpcLocked(
+                self.app.allocator,
+                function_name,
+                args_json,
+                connection_id,
+                false,
+            );
         }
     }
 
@@ -576,11 +607,9 @@ pub const Window = struct {
 
         const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
         defer self.app.allocator.free(args_json);
-        const script = try self.buildFrontendInvokeScript(function_name, args_json, true);
-        defer self.app.allocator.free(script);
 
         const win_state = self.state();
-        const tasks = try allocator.alloc(*ScriptTask, connection_ids.len);
+        const tasks = try allocator.alloc(*FrontendRpcTask, connection_ids.len);
         defer allocator.free(tasks);
 
         win_state.state_mutex.lock();
@@ -588,14 +617,20 @@ pub const Window = struct {
         errdefer {
             while (queued > 0) : (queued -= 1) {
                 const task = tasks[queued - 1];
-                _ = win_state.removeScriptPendingLocked(task);
-                _ = win_state.removeScriptInflightLocked(task);
+                _ = win_state.removeFrontendRpcPendingLocked(task);
+                _ = win_state.removeFrontendRpcInflightLocked(task);
                 task.deinit();
             }
             win_state.state_mutex.unlock();
         }
         for (connection_ids, 0..) |connection_id, idx| {
-            tasks[idx] = try win_state.queueScriptLocked(self.app.allocator, script, connection_id, true);
+            tasks[idx] = try win_state.queueFrontendRpcLocked(
+                self.app.allocator,
+                function_name,
+                args_json,
+                connection_id,
+                true,
+            );
             queued += 1;
         }
         win_state.state_mutex.unlock();
@@ -611,7 +646,7 @@ pub const Window = struct {
         }
 
         for (connection_ids, 0..) |connection_id, idx| {
-            const result = try self.awaitScriptTaskResult(allocator, win_state, tasks[idx], timeout_ms);
+            const result = try self.awaitFrontendRpcTaskResult(allocator, win_state, tasks[idx], timeout_ms);
             results[idx] = .{
                 .connection_id = connection_id,
                 .result = result,
@@ -709,6 +744,60 @@ pub const Window = struct {
         return result;
     }
 
+    fn awaitFrontendRpcTaskResult(
+        self: *Window,
+        allocator: std.mem.Allocator,
+        win_state: *WindowState,
+        task: *FrontendRpcTask,
+        timeout_ms: ?u32,
+    ) !ScriptEvalResult {
+        var timed_out = false;
+        task.mutex.lock();
+
+        if (timeout_ms) |timeout| {
+            const timeout_ns: u64 = @as(u64, timeout) * std.time.ns_per_ms;
+            const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
+            while (!task.done) {
+                const now = std.time.nanoTimestamp();
+                if (now >= deadline) {
+                    timed_out = true;
+                    break;
+                }
+                const remaining = @as(u64, @intCast(deadline - now));
+                task.cond.timedWait(&task.mutex, remaining) catch {};
+            }
+        } else {
+            while (!task.done) task.cond.wait(&task.mutex);
+        }
+        const finished = task.done;
+        task.mutex.unlock();
+
+        if (timed_out and !finished) {
+            win_state.state_mutex.lock();
+            win_state.markFrontendRpcTimedOutLocked(task);
+            win_state.state_mutex.unlock();
+        }
+
+        task.mutex.lock();
+        const result = ScriptEvalResult{
+            .ok = !task.js_error and !timed_out,
+            .timed_out = timed_out or task.timed_out,
+            .js_error = task.js_error,
+            .value = if (task.value_json) |value| try allocator.dupe(u8, value) else null,
+            .error_message = if (task.error_message) |msg| try allocator.dupe(u8, msg) else null,
+        };
+        task.mutex.unlock();
+
+        win_state.state_mutex.lock();
+        _ = win_state.removeFrontendRpcPendingLocked(task);
+        _ = win_state.removeFrontendRpcInflightLocked(task);
+        win_state.state_mutex.unlock();
+        task.deinit();
+
+        _ = self;
+        return result;
+    }
+
     fn snapshotConnectedConnectionIds(self: *Window, allocator: std.mem.Allocator) ![]usize {
         const win_state = self.state();
         win_state.state_mutex.lock();
@@ -719,36 +808,6 @@ pub const Window = struct {
             ids[idx] = entry.connection_id;
         }
         return ids;
-    }
-
-    fn buildFrontendInvokeScript(
-        self: *Window,
-        function_name: []const u8,
-        args_json: []const u8,
-        expect_result: bool,
-    ) ![]u8 {
-        const function_name_json = try std.json.Stringify.valueAlloc(self.app.allocator, function_name, .{});
-        defer self.app.allocator.free(function_name_json);
-
-        var out = std.array_list.Managed(u8).init(self.app.allocator);
-        errdefer out.deinit();
-        const writer = out.writer();
-
-        try writer.writeAll("const webuiPath=");
-        try writer.writeAll(function_name_json);
-        try writer.writeAll(";\nconst webuiArgsRaw=");
-        try writer.writeAll(args_json);
-        try writer.writeAll(";\nconst webuiArgs=Array.isArray(webuiArgsRaw)?webuiArgsRaw:[webuiArgsRaw];\n");
-        try writer.writeAll("let webuiFn=globalThis;\nfor(const segment of webuiPath.split('.')){if(!segment)continue;webuiFn=webuiFn?.[segment];}\n");
-        try writer.writeAll("if(typeof webuiFn!=='function'){throw new Error('frontend function not found: '+webuiPath);}\n");
-        if (expect_result) {
-            try writer.writeAll("return await webuiFn(...webuiArgs);\n");
-        } else {
-            try writer.writeAll(
-                "try{await webuiFn(...webuiArgs);}catch(webuiErr){if(typeof console!=='undefined'&&console&&typeof console.error==='function'){console.error('[webui.frontend]',webuiErr);}}\n",
-            );
-        }
-        return out.toOwnedSlice();
     }
 
     pub fn sendRaw(self: *Window, bytes: []const u8) !void {

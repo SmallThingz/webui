@@ -189,6 +189,24 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
     try service.run();
 
     if (kind == .call_js_from_zig or kind == .call_js_oop) {
+        try service.callFrontendFireAndForget("demo.setStatus", .{"Updated by Zig frontend RPC"}, .{});
+        const frontend_result = try service.callFrontend(
+            allocator,
+            "demo.pingFront",
+            .{"from-zig"},
+            .{ .timeout_ms = 2000 },
+        );
+        defer {
+            if (frontend_result.value) |value| allocator.free(value);
+            if (frontend_result.error_message) |msg| allocator.free(msg);
+        }
+        std.debug.print("[{s}] frontend ping result ok={any} value={s} err={s}\n", .{
+            tagFor(kind),
+            frontend_result.ok,
+            frontend_result.value orelse "",
+            frontend_result.error_message orelse "",
+        });
+    } else {
         try service.runScript(
             \\const status = document.getElementById("status");
             \\if (status) status.textContent = "Updated by Zig runScript()";
@@ -486,6 +504,10 @@ const COMMON_SCRIPT =
     "document.getElementById('wc')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='word_count => '+await webuiRpcCall('word_count',msg);}catch(e){out.textContent='word_count failed: '+e;}});" ++
     "document.getElementById('save')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='save_note => '+await webuiRpcCall('save_note',msg);}catch(e){out.textContent='save_note failed: '+e;}});" ++
     "document.getElementById('echo')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='echo => '+await webuiRpcCall('echo',msg);}catch(e){out.textContent='echo failed: '+e;}});" ++
+    "if(globalThis.webuiFrontend&&typeof globalThis.webuiFrontend.register==='function'){" ++
+    "webuiFrontend.register('demo.setStatus',(message)=>{const statusEl=document.getElementById('status');if(statusEl)statusEl.textContent=String(message??'');return true;});" ++
+    "webuiFrontend.register('demo.pingFront',async(source)=>{return 'frontend-ack:'+String(source??'');});" ++
+    "}" ++
     "(async()=>{try{status.textContent='Backend: '+await webuiRpcCall('ping');}catch(e){status.textContent='Backend unavailable: '+e;}})();";
 
 const HTML_FRAMELESS =
@@ -523,6 +545,7 @@ test "common example script resolves rpc bridge robustly" {
     try std.testing.expect(std.mem.indexOf(u8, COMMON_SCRIPT, "webuiRpcClient") != null);
     try std.testing.expect(std.mem.indexOf(u8, COMMON_SCRIPT, "typeof webuiRpc!=='undefined'?webuiRpc:undefined") != null);
     try std.testing.expect(std.mem.indexOf(u8, COMMON_SCRIPT, "webuiRpcCall('ping')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, COMMON_SCRIPT, "webuiFrontend.register('demo.setStatus'") != null);
 }
 
 test "text editor script handles missing globalThis bridge binding" {

@@ -1354,11 +1354,13 @@ test "comptime bridge generation" {
     try std.testing.expect(std.mem.indexOf(u8, dts, "sum(...args: unknown[]): Promise<unknown>;") != null);
 }
 
-test "runtime helper exposes window style/control helpers" {
+test "runtime helper exposes window style/control and frontend rpc helpers" {
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webui-window-rounded") == null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webui-transparent") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webuiWindowStyle") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webuiGetWindowStyle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webuiFrontend") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "frontend_rpc_request") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webui_style_scaffold") == null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webuiRefreshAppRegions") == null);
 }
@@ -1408,7 +1410,7 @@ test "evalScript times out when no client is polling" {
     try std.testing.expect(result.value == null);
 }
 
-test "callFrontend fire-and-forget queues targeted ws task" {
+test "callFrontend fire-and-forget queues targeted ws frontend rpc task" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -1426,11 +1428,12 @@ test "callFrontend fire-and-forget queues targeted ws task" {
     state.state_mutex.lock();
     defer state.state_mutex.unlock();
 
-    try std.testing.expectEqual(@as(usize, 1), state.script_pending.items.len);
-    const task = state.script_pending.items[0];
+    try std.testing.expectEqual(@as(usize, 1), state.frontend_rpc_pending.items.len);
+    const task = state.frontend_rpc_pending.items[0];
     try std.testing.expect(!task.expect_result);
     try std.testing.expectEqual(@as(?usize, 77), task.target_connection);
-    try std.testing.expect(std.mem.indexOf(u8, task.script, "ui.echo") != null);
+    try std.testing.expectEqualStrings("ui.echo", task.function_name);
+    try std.testing.expect(std.mem.indexOf(u8, task.args_json, "\"hello\"") != null);
 }
 
 test "callFrontend await on selected connections returns per-connection results" {
@@ -1519,6 +1522,46 @@ test "script response websocket message completes queued eval task" {
     try std.testing.expect(done);
     try std.testing.expect(value != null);
     try std.testing.expect(std.mem.eql(u8, value.?, "42"));
+
+    task.deinit();
+}
+
+test "frontend rpc response websocket message completes queued frontend task" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "FrontendRpcQueue" });
+    try win.showHtml("<html><body>frontend-rpc-route</body></html>");
+    try app.run();
+
+    const state = win.state();
+    state.state_mutex.lock();
+    const task = try state.queueFrontendRpcLocked(gpa.allocator(), "ui.echo", "[\"abc\"]", null, true);
+    const moved = state.removeFrontendRpcPendingLocked(task);
+    try std.testing.expect(moved);
+    try state.frontend_rpc_inflight.append(task);
+    state.state_mutex.unlock();
+
+    const completion_msg = try std.fmt.allocPrint(
+        gpa.allocator(),
+        "{{\"type\":\"frontend_rpc_response\",\"id\":{d},\"js_error\":false,\"value\":\"ok\"}}",
+        .{task.id},
+    );
+    defer gpa.allocator().free(completion_msg);
+    try state.handleWebSocketClientMessage(1, completion_msg);
+
+    task.mutex.lock();
+    const done = task.done;
+    const value = task.value_json;
+    task.mutex.unlock();
+    try std.testing.expect(done);
+    try std.testing.expect(value != null);
+    try std.testing.expect(std.mem.eql(u8, value.?, "\"ok\""));
 
     task.deinit();
 }
