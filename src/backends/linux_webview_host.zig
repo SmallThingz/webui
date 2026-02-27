@@ -47,9 +47,9 @@ pub const Host = struct {
     startup_error: ?anyerror = null,
     ui_ready: bool = false,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    // Wayland remap callbacks can arrive while style/control paths hold the
-    // mutex. Track deferred repaint requests so we don't drop a refresh.
-    remap_refresh_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    active_refresh_restore_width: c_int = 0,
+    active_refresh_restore_height: c_int = 0,
+    active_refresh_restore_pending: bool = false,
     shutdown_requested: bool = false,
 
     pub fn start(allocator: std.mem.Allocator, title: []const u8, style: WindowStyle) !*Host {
@@ -263,11 +263,16 @@ fn connectWindowSignals(symbols: *const Symbols, window_widget: *common.GtkWidge
     // Keep realize callback for all GTK variants so style/transparency can be
     // re-applied once the native surface exists. GTK4 size-allocate ABI differs.
     _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "realize", @ptrCast(&onRealize), host, null, 0);
-    // Workspace switches/remaps can leave stale presented content until the
-    // next surface render is queued.
-    _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "map", @ptrCast(&onMap), host, null, 0);
-    // Wayland focus transitions can remap surfaces without a full map cycle.
-    _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "notify::is-active", @ptrCast(&onNotifyIsActive), host, null, 0);
+    if (symbols.gtk_api == .gtk4 and symbols.isWebKitGtk6()) {
+        _ = symbols.g_signal_connect_data(
+            @ptrCast(window_widget),
+            "notify::is-active",
+            @ptrCast(&onWindowActiveChanged),
+            host,
+            null,
+            0,
+        );
+    }
     if (symbols.gtk_api == .gtk3) {
         _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "size-allocate", @ptrCast(&onSizeAllocate), host, null, 0);
     }
@@ -293,7 +298,6 @@ fn finishThreadShutdown(host: *Host) void {
     defer host.mutex.unlock();
 
     host.closed.store(true, .release);
-    host.remap_refresh_requested.store(false, .release);
     host.ui_ready = false;
     host.window_widget = null;
     host.content_widget = null;
@@ -352,25 +356,80 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     if (host.style.transparent) symbols.applyTransparentVisual(window_widget);
     symbols.applyGtk4WindowStyle(window_widget, clip_widget, host.style);
     applyRoundedShape(&symbols, host.style.corner_radius, window_widget);
-    symbols.forceWidgetSurfaceNextCommit(window_widget);
-    symbols.forceWidgetSurfaceNextCommit(clip_widget);
     symbols.queueWidgetDraw(window_widget);
     symbols.queueWidgetDraw(clip_widget);
-    symbols.queueWidgetSurfaceRender(window_widget);
-    symbols.queueWidgetSurfaceRender(clip_widget);
     if (host.webview) |webview| symbols.queueWidgetDraw(@ptrCast(webview));
 }
 
-fn onMap(_: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+fn onWindowActiveChanged(widget: ?*anyopaque, _: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    _ = widget;
     const raw_host = data orelse return;
     const host: *Host = @ptrCast(@alignCast(raw_host));
-    refreshSurfaceAfterRemap(host);
+    if (!host.mutex.tryLock()) {
+        if (host.symbols) |symbols| _ = symbols.g_idle_add(&onWindowActiveRetryIdle, host);
+        return;
+    }
+    defer host.mutex.unlock();
+    _ = applyWindowActiveRefreshLocked(host);
 }
 
-fn onNotifyIsActive(_: ?*anyopaque, _: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
-    const raw_host = data orelse return;
+fn onWindowActiveRetryIdle(data: ?*anyopaque) callconv(.c) c_int {
+    const raw_host = data orelse return 0;
     const host: *Host = @ptrCast(@alignCast(raw_host));
-    refreshSurfaceAfterRemap(host);
+    if (!host.mutex.tryLock()) return 1;
+    defer host.mutex.unlock();
+    _ = applyWindowActiveRefreshLocked(host);
+    return 0;
+}
+
+fn applyWindowActiveRefreshLocked(host: *Host) bool {
+    if (host.closed.load(.acquire) or host.shutdown_requested) return false;
+    const symbols = host.symbols orelse return false;
+    const window_widget = host.window_widget orelse return false;
+    const window: *common.GtkWindow = @ptrCast(window_widget);
+    if (!symbols.windowIsActive(window)) return false;
+
+    const width = symbols.gtk_widget_get_allocated_width(window_widget);
+    const height = symbols.gtk_widget_get_allocated_height(window_widget);
+    if (width > 0 and height > 0) {
+        const nudged_width = if (width > 1) width - 1 else width;
+        const nudged_height = if (height > 1) height - 1 else height;
+        if (nudged_width != width or nudged_height != height) {
+            host.active_refresh_restore_width = width;
+            host.active_refresh_restore_height = height;
+            host.active_refresh_restore_pending = true;
+            symbols.gtk_window_set_default_size(window, nudged_width, nudged_height);
+        } else {
+            host.active_refresh_restore_pending = false;
+        }
+    }
+
+    const webview = host.webview orelse return false;
+    symbols.gtk_widget_hide(@ptrCast(webview));
+    _ = symbols.g_idle_add(&onUnhideWebViewIdle, host);
+    return true;
+}
+
+fn onUnhideWebViewIdle(data: ?*anyopaque) callconv(.c) c_int {
+    const raw_host = data orelse return 0;
+    const host: *Host = @ptrCast(@alignCast(raw_host));
+    if (!host.mutex.tryLock()) return 1;
+    defer host.mutex.unlock();
+
+    if (host.closed.load(.acquire) or host.shutdown_requested) return 0;
+    const symbols = host.symbols orelse return 0;
+    const webview = host.webview orelse return 0;
+    if (host.active_refresh_restore_pending) {
+        if (host.window_widget) |window_widget| {
+            const window: *common.GtkWindow = @ptrCast(window_widget);
+            symbols.gtk_window_set_default_size(window, host.active_refresh_restore_width, host.active_refresh_restore_height);
+        }
+        host.active_refresh_restore_pending = false;
+    }
+    symbols.gtk_widget_show(@ptrCast(webview));
+    symbols.queueWidgetDraw(@ptrCast(webview));
+    if (host.window_widget) |window_widget| symbols.queueWidgetDraw(window_widget);
+    return 0;
 }
 
 fn onSizeAllocate(widget: ?*anyopaque, allocation: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -496,10 +555,8 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         symbols.gtk_widget_show(window_widget);
     }
     const clip_widget = host.content_widget orelse window_widget;
-    symbols.forceWidgetSurfaceNextCommit(window_widget);
     symbols.queueWidgetDraw(window_widget);
     symbols.queueWidgetDraw(clip_widget);
-    symbols.queueWidgetSurfaceRender(window_widget);
     if (host.webview) |webview| symbols.queueWidgetDraw(@ptrCast(webview));
 }
 
@@ -557,49 +614,6 @@ fn applyWindowIconUiThread(host: *Host, symbols: *const Symbols, window_widget: 
     }
     cleanupIconTempFile(host);
     symbols.clearWindowIcon(window_widget);
-}
-
-fn refreshSurfaceAfterRemap(host: *Host) void {
-    // Signal callbacks may fire while style/control paths hold the lock.
-    // Use tryLock to avoid callback-induced lock inversions. If the lock is
-    // busy, queue a retry on the UI loop so remap repaint is never dropped.
-    if (!host.mutex.tryLock()) {
-        requestDeferredRemapRefresh(host);
-        return;
-    }
-    defer host.mutex.unlock();
-    host.remap_refresh_requested.store(false, .release);
-
-    const symbols = host.symbols orelse return;
-    const window_widget = host.window_widget orelse return;
-    const clip_widget = host.content_widget orelse window_widget;
-
-    if (host.style.transparent) symbols.applyTransparentVisual(window_widget);
-    symbols.applyGtk4WindowStyle(window_widget, clip_widget, host.style);
-    applyRoundedShape(&symbols, host.style.corner_radius, window_widget);
-    symbols.forceWidgetSurfaceNextCommit(window_widget);
-    symbols.forceWidgetSurfaceNextCommit(clip_widget);
-    symbols.queueWidgetDraw(window_widget);
-    symbols.queueWidgetDraw(clip_widget);
-    symbols.queueWidgetSurfaceRender(window_widget);
-    symbols.queueWidgetSurfaceRender(clip_widget);
-    if (host.webview) |webview| symbols.queueWidgetDraw(@ptrCast(webview));
-}
-
-fn requestDeferredRemapRefresh(host: *Host) void {
-    if (host.remap_refresh_requested.swap(true, .acq_rel)) return;
-    if (host.symbols) |symbols| {
-        _ = symbols.g_idle_add(&onDeferredRemapRefresh, host);
-        return;
-    }
-    host.remap_refresh_requested.store(false, .release);
-}
-
-fn onDeferredRemapRefresh(data: ?*anyopaque) callconv(.c) c_int {
-    const raw_host = data orelse return 0;
-    const host: *Host = @ptrCast(@alignCast(raw_host));
-    refreshSurfaceAfterRemap(host);
-    return 0;
 }
 
 fn writeIconTempFile(host: *Host, icon: WindowIcon) ![]u8 {

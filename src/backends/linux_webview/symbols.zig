@@ -6,6 +6,11 @@ pub const GtkApi = enum {
     gtk4,
 };
 
+pub const WebKitRuntime = enum {
+    webkitgtk_6,
+    webkit2gtk_4x,
+};
+
 pub const Symbols = struct {
     gtk: std.DynLib,
     gdk: std.DynLib,
@@ -14,6 +19,7 @@ pub const Symbols = struct {
     glib: std.DynLib,
     cairo: std.DynLib,
     gtk_api: GtkApi,
+    webkit_runtime: WebKitRuntime = .webkit2gtk_4x,
 
     gtk_init_gtk3: ?*const fn (?*c_int, ?*anyopaque) callconv(.c) void = null,
     gtk_init_gtk4: ?*const fn () callconv(.c) void = null,
@@ -37,6 +43,7 @@ pub const Symbols = struct {
     gtk_window_unfullscreen: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
     gtk_window_set_icon_from_file: ?*const fn (*common.GtkWindow, [*:0]const u8, *?*common.GError) callconv(.c) c_int = null,
     gtk_window_set_icon_name: ?*const fn (*common.GtkWindow, ?[*:0]const u8) callconv(.c) void = null,
+    gtk_window_is_active: ?*const fn (*common.GtkWindow) callconv(.c) c_int = null,
     gtk_window_maximize: *const fn (*common.GtkWindow) callconv(.c) void,
     gtk_window_unmaximize: *const fn (*common.GtkWindow) callconv(.c) void,
 
@@ -70,8 +77,6 @@ pub const Symbols = struct {
     gtk_widget_set_opacity: ?*const fn (*common.GtkWidget, f64) callconv(.c) void = null,
     gtk_widget_get_native: ?*const fn (*common.GtkWidget) callconv(.c) ?*common.GtkNative = null,
     gtk_native_get_surface: ?*const fn (*common.GtkNative) callconv(.c) ?*common.GdkSurface = null,
-    gdk_surface_queue_render: ?*const fn (*common.GdkSurface) callconv(.c) void = null,
-    gdk_wayland_surface_force_next_commit: ?*const fn (*common.GdkSurface) callconv(.c) void = null,
     gdk_texture_new_from_filename: ?*const fn ([*:0]const u8, *?*common.GError) callconv(.c) ?*common.GdkTexture = null,
     gdk_toplevel_set_icon_list: ?*const fn (*common.GdkToplevel, ?*anyopaque) callconv(.c) void = null,
 
@@ -185,31 +190,13 @@ pub const Symbols = struct {
         if (self.gtk_widget_queue_draw) |queue_draw| queue_draw(widget);
     }
 
-    pub fn queueWidgetSurfaceRender(self: *const Symbols, widget: *common.GtkWidget) void {
-        if (self.gtk_api != .gtk4) return;
-        const get_native = self.gtk_widget_get_native orelse return;
-        const get_surface = self.gtk_native_get_surface orelse return;
-        const queue_render = self.gdk_surface_queue_render orelse return;
-        const native = get_native(widget) orelse return;
-        const surface = get_surface(native) orelse return;
-        queue_render(surface);
+    pub fn isWebKitGtk6(self: *const Symbols) bool {
+        return self.webkit_runtime == .webkitgtk_6;
     }
 
-    pub fn forceWidgetSurfaceNextCommit(self: *const Symbols, widget: *common.GtkWidget) void {
-        if (self.gtk_api != .gtk4) return;
-        if (std.process.getEnvVarOwned(std.heap.page_allocator, "WAYLAND_DISPLAY")) |value| {
-            defer std.heap.page_allocator.free(value);
-            if (value.len == 0) return;
-        } else |_| {
-            return;
-        }
-
-        const get_native = self.gtk_widget_get_native orelse return;
-        const get_surface = self.gtk_native_get_surface orelse return;
-        const force_commit = self.gdk_wayland_surface_force_next_commit orelse return;
-        const native = get_native(widget) orelse return;
-        const surface = get_surface(native) orelse return;
-        force_commit(surface);
+    pub fn windowIsActive(self: *const Symbols, window: *common.GtkWindow) bool {
+        const is_active = self.gtk_window_is_active orelse return false;
+        return is_active(window) != 0;
     }
 
     pub fn destroyWindow(self: *const Symbols, window_widget: *common.GtkWidget) void {
@@ -461,6 +448,7 @@ pub const Symbols = struct {
         // to GTK3/WebKit2GTK compatibility libs.
         if (self.loadDynLibsFor(
             .gtk4,
+            .webkitgtk_6,
             &.{ "libgtk-4.so.1", "libgtk-4.so" },
             // Some distros do not ship a separate libgdk-4 soname and expose
             // GDK symbols via libgtk-4 instead.
@@ -470,6 +458,7 @@ pub const Symbols = struct {
 
         if (self.loadDynLibsFor(
             .gtk3,
+            .webkit2gtk_4x,
             &.{ "libgtk-3.so.0", "libgtk-3.so" },
             &.{ "libgdk-3.so.0", "libgdk-3.so" },
             &.{ "libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.1.so", "libwebkit2gtk-4.0.so.37", "libwebkit2gtk-4.0.so" },
@@ -481,6 +470,7 @@ pub const Symbols = struct {
     fn loadDynLibsFor(
         self: *Symbols,
         api: GtkApi,
+        runtime: WebKitRuntime,
         gtk_names: []const []const u8,
         gdk_names: []const []const u8,
         webkit_names: []const []const u8,
@@ -506,6 +496,7 @@ pub const Symbols = struct {
         self.glib = glib;
         self.cairo = cairo;
         self.gtk_api = api;
+        self.webkit_runtime = runtime;
         return true;
     }
 
@@ -532,6 +523,7 @@ pub const Symbols = struct {
         self.gtk_window_unfullscreen = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_unfullscreen), "gtk_window_unfullscreen");
         self.gtk_window_set_icon_from_file = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_set_icon_from_file), "gtk_window_set_icon_from_file");
         self.gtk_window_set_icon_name = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_set_icon_name), "gtk_window_set_icon_name");
+        self.gtk_window_is_active = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_is_active), "gtk_window_is_active");
         self.gtk_window_maximize = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_maximize), "gtk_window_maximize");
         self.gtk_window_unmaximize = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_unmaximize), "gtk_window_unmaximize");
 
@@ -565,8 +557,6 @@ pub const Symbols = struct {
         self.gtk_widget_set_opacity = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_opacity), "gtk_widget_set_opacity");
         self.gtk_widget_get_native = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_get_native), "gtk_widget_get_native");
         self.gtk_native_get_surface = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_native_get_surface), "gtk_native_get_surface");
-        self.gdk_surface_queue_render = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_queue_render), "gdk_surface_queue_render");
-        self.gdk_wayland_surface_force_next_commit = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_wayland_surface_force_next_commit), "gdk_wayland_surface_force_next_commit");
         self.gdk_texture_new_from_filename = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_texture_new_from_filename), "gdk_texture_new_from_filename");
         self.gdk_toplevel_set_icon_list = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_toplevel_set_icon_list), "gdk_toplevel_set_icon_list");
 
