@@ -424,9 +424,37 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         if (clear) |clear_color| msgSendVoidId(host, window, sel(host, "setBackgroundColor:"), clear_color);
         if (host.wk_webview) |webview| {
             msgSendVoidBool(host, webview, sel(host, "setOpaque:"), false);
+            if (clear) |clear_color| {
+                const under_page_sel = sel(host, "setUnderPageBackgroundColor:");
+                if (msgSendBoolSel(host, webview, sel(host, "respondsToSelector:"), under_page_sel)) {
+                    msgSendVoidId(host, webview, under_page_sel, clear_color);
+                }
+            }
+            // WKWebView still paints an opaque backing layer unless drawsBackground is disabled.
+            const draws_background_key = nsString(host, "drawsBackground");
+            const ns_number_class = objcClass(host, "NSNumber");
+            if (draws_background_key != null and ns_number_class != null) {
+                const disabled = msgSendIdBool(host, ns_number_class, sel(host, "numberWithBool:"), false);
+                if (disabled) |v| msgSendVoidIdId(host, webview, sel(host, "setValue:forKey:"), v, draws_background_key);
+            }
         }
     } else {
         msgSendVoidBool(host, window, sel(host, "setOpaque:"), true);
+        const ns_color_class = objcClass(host, "NSColor");
+        if (ns_color_class) |klass| {
+            if (msgSendId(host, klass, sel(host, "windowBackgroundColor"))) |window_color| {
+                msgSendVoidId(host, window, sel(host, "setBackgroundColor:"), window_color);
+            }
+        }
+        if (host.wk_webview) |webview| {
+            msgSendVoidBool(host, webview, sel(host, "setOpaque:"), true);
+            const draws_background_key = nsString(host, "drawsBackground");
+            const ns_number_class = objcClass(host, "NSNumber");
+            if (draws_background_key != null and ns_number_class != null) {
+                const enabled = msgSendIdBool(host, ns_number_class, sel(host, "numberWithBool:"), true);
+                if (enabled) |v| msgSendVoidIdId(host, webview, sel(host, "setValue:forKey:"), v, draws_background_key);
+            }
+        }
     }
 
     applyCornerRadius(host, style.corner_radius);
@@ -443,9 +471,11 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
 fn applyCornerRadius(host: *Host, radius: ?u16) void {
     const window = host.ns_window orelse return;
     const content_view = msgSendId(host, window, sel(host, "contentView")) orelse return;
+    const frame_view = msgSendId(host, content_view, sel(host, "superview"));
 
     if (radius == null) {
         msgSendVoidBool(host, content_view, sel(host, "setWantsLayer:"), false);
+        if (frame_view) |fv| msgSendVoidBool(host, fv, sel(host, "setWantsLayer:"), false);
         return;
     }
 
@@ -454,6 +484,14 @@ fn applyCornerRadius(host: *Host, radius: ?u16) void {
 
     msgSendVoidF64(host, layer, sel(host, "setCornerRadius:"), @floatFromInt(radius.?));
     msgSendVoidBool(host, layer, sel(host, "setMasksToBounds:"), true);
+
+    if (frame_view) |fv| {
+        msgSendVoidBool(host, fv, sel(host, "setWantsLayer:"), true);
+        if (msgSendId(host, fv, sel(host, "layer"))) |frame_layer| {
+            msgSendVoidF64(host, frame_layer, sel(host, "setCornerRadius:"), @floatFromInt(radius.?));
+            msgSendVoidBool(host, frame_layer, sel(host, "setMasksToBounds:"), true);
+        }
+    }
 }
 
 fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
@@ -620,6 +658,12 @@ fn msgSendVoidId(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: 
     f(receiver, selector, value);
 }
 
+fn msgSendVoidIdId(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, first: ?*anyopaque, second: ?*anyopaque) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, ?*anyopaque, ?*anyopaque) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, first, second);
+}
+
 fn msgSendVoidPoint(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: NSPoint) void {
     const Fn = *const fn (?*anyopaque, objc.SEL, NSPoint) callconv(.c) void;
     const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
@@ -642,6 +686,18 @@ fn msgSendIdCString(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, arg:
     const Fn = *const fn (?*anyopaque, objc.SEL, [*:0]const u8) callconv(.c) ?*anyopaque;
     const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
     return f(receiver, selector, arg);
+}
+
+fn msgSendIdBool(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: bool) ?*anyopaque {
+    const Fn = *const fn (?*anyopaque, objc.SEL, ObjcBool) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector, asBool(value));
+}
+
+fn msgSendBoolSel(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, arg: objc.SEL) bool {
+    const Fn = *const fn (?*anyopaque, objc.SEL, objc.SEL) callconv(.c) ObjcBool;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector, arg) != 0;
 }
 
 fn msgSendIdRect(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, rect: NSRect) ?*anyopaque {

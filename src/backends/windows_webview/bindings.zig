@@ -8,6 +8,13 @@ pub const EventRegistrationToken = extern struct {
     value: i64,
 };
 
+pub const COREWEBVIEW2_COLOR = extern struct {
+    A: u8,
+    R: u8,
+    G: u8,
+    B: u8,
+};
+
 pub const IUnknown = extern struct {
     lpVtbl: *const IUnknownVtbl,
 };
@@ -28,6 +35,10 @@ pub const ICoreWebView2Settings = extern struct {
 
 pub const ICoreWebView2Controller = extern struct {
     lpVtbl: *const ICoreWebView2ControllerVtbl,
+};
+
+pub const ICoreWebView2Controller2 = extern struct {
+    lpVtbl: *const ICoreWebView2Controller2Vtbl,
 };
 
 pub const ICoreWebView2Environment = extern struct {
@@ -105,6 +116,37 @@ pub const ICoreWebView2ControllerVtbl = extern struct {
     NotifyParentWindowPositionChanged: *const anyopaque,
     Close: *const fn (*ICoreWebView2Controller) callconv(.winapi) HRESULT,
     get_CoreWebView2: *const fn (*ICoreWebView2Controller, *?*ICoreWebView2) callconv(.winapi) HRESULT,
+};
+
+pub const ICoreWebView2Controller2Vtbl = extern struct {
+    QueryInterface: *const fn (*ICoreWebView2Controller2, *const win.GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*ICoreWebView2Controller2) callconv(.winapi) ULONG,
+    Release: *const fn (*ICoreWebView2Controller2) callconv(.winapi) ULONG,
+    get_IsVisible: *const anyopaque,
+    put_IsVisible: *const anyopaque,
+    get_Bounds: *const anyopaque,
+    put_Bounds: *const anyopaque,
+    get_ZoomFactor: *const anyopaque,
+    put_ZoomFactor: *const anyopaque,
+    add_ZoomFactorChanged: *const anyopaque,
+    remove_ZoomFactorChanged: *const anyopaque,
+    SetBoundsAndZoomFactor: *const anyopaque,
+    MoveFocus: *const anyopaque,
+    add_MoveFocusRequested: *const anyopaque,
+    remove_MoveFocusRequested: *const anyopaque,
+    add_GotFocus: *const anyopaque,
+    remove_GotFocus: *const anyopaque,
+    add_LostFocus: *const anyopaque,
+    remove_LostFocus: *const anyopaque,
+    add_AcceleratorKeyPressed: *const anyopaque,
+    remove_AcceleratorKeyPressed: *const anyopaque,
+    get_ParentWindow: *const anyopaque,
+    put_ParentWindow: *const anyopaque,
+    NotifyParentWindowPositionChanged: *const anyopaque,
+    Close: *const anyopaque,
+    get_CoreWebView2: *const anyopaque,
+    get_DefaultBackgroundColor: *const anyopaque,
+    put_DefaultBackgroundColor: *const fn (*ICoreWebView2Controller2, COREWEBVIEW2_COLOR) callconv(.winapi) HRESULT,
 };
 
 pub const ICoreWebView2SettingsVtbl = extern struct {
@@ -222,6 +264,13 @@ pub const Symbols = struct {
     pub fn deinit(self: *Symbols) void {
         self.loader.close();
     }
+};
+
+pub const IID_ICoreWebView2Controller2 = win.GUID{
+    .Data1 = 0xc979903e,
+    .Data2 = 0xd4ca,
+    .Data3 = 0x4228,
+    .Data4 = [8]u8{ 0x92, 0xeb, 0x47, 0xee, 0x3f, 0xa9, 0x6e, 0xab },
 };
 
 pub inline fn succeeded(hr: HRESULT) bool {

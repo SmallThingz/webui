@@ -422,6 +422,9 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         else
             common.GdkRGBA{ .red = 1.0, .green = 1.0, .blue = 1.0, .alpha = 1.0 };
         symbols.webkit_web_view_set_background_color(webview, &bg);
+        symbols.applyGtk4WindowStyle(window_widget, @ptrCast(webview), style);
+    } else {
+        symbols.applyGtk4WindowStyle(window_widget, null, style);
     }
 
     applyRoundedShape(&symbols, style.corner_radius, window_widget);

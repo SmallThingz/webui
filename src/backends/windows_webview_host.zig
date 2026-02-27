@@ -50,8 +50,6 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_FRAMECHANGED: u32 = 0x0020;
 
-const LWA_ALPHA: u32 = 0x00000002;
-
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
 const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
 const webview2_bg_env_name = std.unicode.utf8ToUtf16LeStringLiteral("WEBVIEW2_DEFAULT_BACKGROUND_COLOR");
@@ -155,9 +153,12 @@ extern "user32" fn SetWindowLongPtrW(win.HWND, i32, win.LONG_PTR) callconv(.wina
 extern "user32" fn GetWindowLongPtrW(win.HWND, i32) callconv(.winapi) win.LONG_PTR;
 extern "user32" fn SetWindowLongW(win.HWND, i32, i32) callconv(.winapi) i32;
 extern "user32" fn GetWindowLongW(win.HWND, i32) callconv(.winapi) i32;
-extern "user32" fn SetLayeredWindowAttributes(win.HWND, u32, u8, u32) callconv(.winapi) win.BOOL;
 extern "user32" fn PostMessageW(win.HWND, u32, win.WPARAM, win.LPARAM) callconv(.winapi) win.BOOL;
 extern "user32" fn SetWindowTextW(win.HWND, win.LPCWSTR) callconv(.winapi) win.BOOL;
+extern "user32" fn GetWindowRect(win.HWND, *win.RECT) callconv(.winapi) win.BOOL;
+extern "user32" fn SetWindowRgn(win.HWND, ?*anyopaque, win.BOOL) callconv(.winapi) i32;
+extern "gdi32" fn CreateRoundRectRgn(i32, i32, i32, i32, i32, i32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) win.BOOL;
 
 pub const Host = struct {
     allocator: std.mem.Allocator,
@@ -562,10 +563,6 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     }
     _ = SetWindowLongW(hwnd, GWL_EXSTYLE, @as(i32, @bitCast(ex_after)));
 
-    if (style.transparent) {
-        _ = SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-    }
-
     _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 
     if (style.size) |size| {
@@ -581,7 +578,9 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         _ = ShowWindow(hwnd, SW_SHOW);
     }
 
+    applyWindowCornerRadius(hwnd, style.corner_radius);
     updateControllerBounds(host);
+    applyControllerBackgroundColor(host);
 }
 
 fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
@@ -663,6 +662,48 @@ fn updateControllerBounds(host: *Host) void {
     var rect: win.RECT = undefined;
     if (GetClientRect(hwnd, &rect) == 0) return;
     _ = controller.lpVtbl.put_Bounds(controller, rect);
+}
+
+fn applyWindowCornerRadius(hwnd: win.HWND, radius: ?u16) void {
+    if (radius) |value| {
+        var window_rect: win.RECT = undefined;
+        if (GetWindowRect(hwnd, &window_rect) == 0) return;
+
+        const width = window_rect.right - window_rect.left;
+        const height = window_rect.bottom - window_rect.top;
+        if (width <= 1 or height <= 1) return;
+
+        const diameter = @max(@as(i32, 2), @as(i32, @intCast(@as(u32, value) * 2)));
+        const region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter) orelse return;
+        if (SetWindowRgn(hwnd, region, 1) == 0) {
+            _ = DeleteObject(region);
+        }
+        return;
+    }
+
+    _ = SetWindowRgn(hwnd, null, 1);
+}
+
+fn applyControllerBackgroundColor(host: *Host) void {
+    const controller = host.controller orelse return;
+
+    var raw: ?*anyopaque = null;
+    if (!wv2.succeeded(controller.lpVtbl.QueryInterface(
+        controller,
+        &wv2.IID_ICoreWebView2Controller2,
+        &raw,
+    ))) return;
+
+    const typed_raw = raw orelse return;
+    const controller2: *wv2.ICoreWebView2Controller2 = @ptrCast(@alignCast(typed_raw));
+    defer _ = controller2.lpVtbl.Release(controller2);
+
+    const color = if (host.style.transparent)
+        wv2.COREWEBVIEW2_COLOR{ .A = 0, .R = 0, .G = 0, .B = 0 }
+    else
+        wv2.COREWEBVIEW2_COLOR{ .A = 255, .R = 255, .G = 255, .B = 255 };
+
+    _ = controller2.lpVtbl.put_DefaultBackgroundColor(controller2, color);
 }
 
 const EnvironmentCompletedHandler = extern struct {
@@ -827,6 +868,7 @@ fn controllerHandlerInvoke(
         }
     }
 
+    applyControllerBackgroundColor(host);
     updateControllerBounds(host);
 
     if (host.pending_url) |pending| {
@@ -927,7 +969,10 @@ fn wndProc(hwnd: win.HWND, msg: u32, wparam: win.WPARAM, lparam: win.LPARAM) cal
 
     switch (msg) {
         WM_SIZE => {
-            if (host) |h| updateControllerBounds(h);
+            if (host) |h| {
+                applyWindowCornerRadius(hwnd, h.style.corner_radius);
+                updateControllerBounds(h);
+            }
             return 0;
         },
         WM_MOVE => {

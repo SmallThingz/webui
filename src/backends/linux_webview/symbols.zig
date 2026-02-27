@@ -47,6 +47,17 @@ pub const Symbols = struct {
     gtk_widget_destroy: ?*const fn (*common.GtkWidget) callconv(.c) void = null,
     gtk_window_destroy: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
     gtk_window_close: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
+    gtk_widget_set_name: ?*const fn (*common.GtkWidget, [*:0]const u8) callconv(.c) void = null,
+    gtk_widget_add_css_class: ?*const fn (*common.GtkWidget, [*:0]const u8) callconv(.c) void = null,
+    gtk_widget_set_overflow: ?*const fn (*common.GtkWidget, c_int) callconv(.c) void = null,
+    gtk_widget_set_opacity: ?*const fn (*common.GtkWidget, f64) callconv(.c) void = null,
+    gtk_widget_get_native: ?*const fn (*common.GtkWidget) callconv(.c) ?*common.GtkNative = null,
+    gtk_native_get_surface: ?*const fn (*common.GtkNative) callconv(.c) ?*common.GdkSurface = null,
+    gdk_surface_set_opaque_region: ?*const fn (*common.GdkSurface, ?*common.cairo_region_t) callconv(.c) void = null,
+    gdk_display_get_default: ?*const fn () callconv(.c) ?*common.GdkDisplay = null,
+    gtk_css_provider_new: ?*const fn () callconv(.c) ?*common.GtkCssProvider = null,
+    gtk_css_provider_load_from_data: ?*const fn (*common.GtkCssProvider, [*:0]const u8, isize) callconv(.c) void = null,
+    gtk_style_context_add_provider_for_display: ?*const fn (*common.GdkDisplay, *common.GtkStyleProvider, c_uint) callconv(.c) void = null,
 
     webkit_web_view_new: *const fn () callconv(.c) ?*common.GtkWidget,
     webkit_web_view_load_uri: *const fn (*common.WebKitWebView, [*:0]const u8) callconv(.c) void,
@@ -65,6 +76,7 @@ pub const Symbols = struct {
     g_main_loop_run: *const fn (*common.GMainLoop) callconv(.c) void,
     g_main_loop_quit: *const fn (*common.GMainLoop) callconv(.c) void,
     g_main_loop_unref: *const fn (*common.GMainLoop) callconv(.c) void,
+    g_object_unref: ?*const fn (?*anyopaque) callconv(.c) void = null,
 
     gdk_cairo_region_create_from_surface: ?*const fn (*common.cairo_surface_t) callconv(.c) ?*common.cairo_region_t = null,
     cairo_image_surface_create: ?*const fn (c_int, c_int, c_int) callconv(.c) ?*common.cairo_surface_t = null,
@@ -160,12 +172,79 @@ pub const Symbols = struct {
     }
 
     pub fn applyTransparentVisual(self: *const Symbols, window_widget: *common.GtkWidget) void {
-        if (self.gtk_widget_set_app_paintable) |set_paintable| set_paintable(window_widget, 1);
-        if (self.gtk_widget_get_screen) |get_screen| {
-            if (get_screen(window_widget)) |screen| {
-                if (self.gdk_screen_get_rgba_visual) |get_visual| {
-                    if (get_visual(screen)) |visual| {
-                        if (self.gtk_widget_set_visual) |set_visual| set_visual(window_widget, visual);
+        switch (self.gtk_api) {
+            .gtk3 => {
+                if (self.gtk_widget_set_app_paintable) |set_paintable| set_paintable(window_widget, 1);
+                if (self.gtk_widget_get_screen) |get_screen| {
+                    if (get_screen(window_widget)) |screen| {
+                        if (self.gdk_screen_get_rgba_visual) |get_visual| {
+                            if (get_visual(screen)) |visual| {
+                                if (self.gtk_widget_set_visual) |set_visual| set_visual(window_widget, visual);
+                            }
+                        }
+                    }
+                }
+            },
+            .gtk4 => {
+                if (self.gtk_widget_set_opacity) |set_opacity| set_opacity(window_widget, 1.0);
+                if (self.gtk_widget_get_native) |get_native| {
+                    if (get_native(window_widget)) |native| {
+                        if (self.gtk_native_get_surface) |native_surface| {
+                            if (native_surface(native)) |surface| {
+                                if (self.gdk_surface_set_opaque_region) |set_opaque_region| {
+                                    // Null region => compositor treats the surface as potentially translucent.
+                                    set_opaque_region(surface, null);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    pub fn applyGtk4WindowStyle(
+        self: *const Symbols,
+        window_widget: *common.GtkWidget,
+        webview_widget: ?*common.GtkWidget,
+        style: common.WindowStyle,
+    ) void {
+        if (self.gtk_api != .gtk4) return;
+
+        const radius: u16 = style.corner_radius orelse 0;
+        const overflow_value: c_int = if (radius > 0) common.GTK_OVERFLOW_HIDDEN else common.GTK_OVERFLOW_VISIBLE;
+
+        if (self.gtk_widget_set_name) |set_name| set_name(window_widget, "webui-native-window");
+        if (self.gtk_widget_add_css_class) |add_class| {
+            add_class(window_widget, "webui-native-window");
+            if (webview_widget) |webview| {
+                add_class(webview, "webui-native-webview");
+            }
+        }
+        if (self.gtk_widget_set_overflow) |set_overflow| set_overflow(window_widget, overflow_value);
+
+        if (self.gdk_display_get_default) |get_display| {
+            if (get_display()) |display| {
+                if (self.gtk_css_provider_new) |provider_new| {
+                    if (provider_new()) |provider| {
+                        defer if (self.g_object_unref) |unref| unref(provider);
+                        if (self.gtk_css_provider_load_from_data) |load_css| {
+                            if (self.gtk_style_context_add_provider_for_display) |add_provider| {
+                                var css_buf: [640]u8 = undefined;
+                                const alpha_text = if (style.transparent) "0.0" else "1.0";
+                                const css = std.fmt.bufPrintZ(
+                                    &css_buf,
+                                    ".webui-native-window{{border-radius:{d}px;background-color:rgba(0,0,0,{s});}}" ++ ".webui-native-window>*{{border-radius:{d}px;background-color:transparent;}}" ++ ".webui-native-webview{{border-radius:{d}px;background-color:transparent;}}",
+                                    .{ radius, alpha_text, radius, radius },
+                                ) catch return;
+                                load_css(provider, css.ptr, @as(isize, @intCast(css.len)));
+                                add_provider(
+                                    display,
+                                    @ptrCast(provider),
+                                    common.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -290,12 +369,24 @@ pub const Symbols = struct {
         self.gtk_widget_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_destroy), "gtk_widget_destroy");
         self.gtk_window_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_destroy), "gtk_window_destroy");
         self.gtk_window_close = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_close), "gtk_window_close");
+        self.gtk_widget_set_name = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_name), "gtk_widget_set_name");
+        self.gtk_widget_add_css_class = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_add_css_class), "gtk_widget_add_css_class");
+        self.gtk_widget_set_overflow = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_overflow), "gtk_widget_set_overflow");
+        self.gtk_widget_set_opacity = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_opacity), "gtk_widget_set_opacity");
+        self.gtk_widget_get_native = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_get_native), "gtk_widget_get_native");
+        self.gtk_native_get_surface = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_native_get_surface), "gtk_native_get_surface");
+        self.gdk_surface_set_opaque_region = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_set_opaque_region), "gdk_surface_set_opaque_region");
+        self.gdk_display_get_default = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_display_get_default), "gdk_display_get_default");
+        self.gtk_css_provider_new = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_css_provider_new), "gtk_css_provider_new");
+        self.gtk_css_provider_load_from_data = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_css_provider_load_from_data), "gtk_css_provider_load_from_data");
+        self.gtk_style_context_add_provider_for_display = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_style_context_add_provider_for_display), "gtk_style_context_add_provider_for_display");
 
         self.webkit_web_view_new = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_new), "webkit_web_view_new");
         self.webkit_web_view_load_uri = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_load_uri), "webkit_web_view_load_uri");
         self.webkit_web_view_set_background_color = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_set_background_color), "webkit_web_view_set_background_color");
 
         self.g_signal_connect_data = try lookupSym(&self.gobject, @TypeOf(self.g_signal_connect_data), "g_signal_connect_data");
+        self.g_object_unref = lookupOptionalSym(&self.gobject, @TypeOf(self.g_object_unref), "g_object_unref");
         self.g_idle_add = try lookupSym(&self.glib, @TypeOf(self.g_idle_add), "g_idle_add");
         self.g_main_loop_new = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_new), "g_main_loop_new");
         self.g_main_loop_run = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_run), "g_main_loop_run");
