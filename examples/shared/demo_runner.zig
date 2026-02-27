@@ -5,6 +5,7 @@ pub const ExampleKind = enum {
     minimal,
     call_js_from_zig,
     call_zig_from_js,
+    bidirectional_rpc,
     serve_folder,
     vfs,
     public_network,
@@ -188,7 +189,10 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
     try service.showHtml(html);
     try service.run();
 
-    if (kind == .call_js_from_zig or kind == .call_js_oop) {
+    const has_frontend_rpc_demo = kind == .call_js_from_zig or kind == .call_js_oop or kind == .bidirectional_rpc;
+    // Keep backend->frontend RPC examples explicit here so future refactors do not
+    // accidentally remove the only bidirectional demo path.
+    if (has_frontend_rpc_demo) {
         try service.callFrontendFireAndForget("demo.setStatus", .{"Updated by Zig frontend RPC"}, .{});
         const frontend_result = try service.callFrontend(
             allocator,
@@ -262,6 +266,7 @@ fn titleFor(comptime kind: ExampleKind) []const u8 {
         .minimal => "minimal",
         .call_js_from_zig => "call_js_from_zig",
         .call_zig_from_js => "call_zig_from_js",
+        .bidirectional_rpc => "bidirectional_rpc",
         .serve_folder => "serve_folder",
         .vfs => "virtual_file_system",
         .public_network => "public_network_access",
@@ -405,6 +410,7 @@ fn subtitleFor(comptime kind: ExampleKind) []const u8 {
         .minimal, .minimal_oop => "Hello from Zig WebUI runtime",
         .call_js_from_zig, .call_js_oop => "JS bridge is loaded and ready",
         .call_zig_from_js, .call_oop_from_js => "Call Zig functions from browser JS",
+        .bidirectional_rpc => "Frontend <-> backend RPC over WebSocket",
         .serve_folder, .serve_folder_oop => "Folder-serving semantics with RPC bridge",
         .vfs, .vfs_oop => "Virtual file system style app",
         .public_network => "Public network access mode enabled",
@@ -456,6 +462,7 @@ fn hintFor(comptime kind: ExampleKind) []const u8 {
         .minimal, .minimal_oop => "Minimal startup path with typed RPC ping/add.",
         .call_js_from_zig, .call_js_oop => "Backend will run a post-show script to update the status text.",
         .call_zig_from_js, .call_oop_from_js => "Use JS buttons to invoke Zig methods with typed args.",
+        .bidirectional_rpc => "Backend calls frontend handlers and frontend calls typed Zig RPC methods.",
         .serve_folder, .serve_folder_oop => "Folder-like flow with save and word-count actions.",
         .vfs, .vfs_oop => "Virtual filesystem-like flow with note save + content analysis.",
         .public_network => "Public listen policy enabled for LAN testing.",
@@ -480,6 +487,7 @@ fn defaultMessageFor(comptime kind: ExampleKind) []const u8 {
         .minimal, .minimal_oop => "Hello from ",
         .call_js_from_zig, .call_js_oop => "Script update target: ",
         .call_zig_from_js, .call_oop_from_js => "Type text and run word_count on it: ",
+        .bidirectional_rpc => "Bidirectional RPC payload: ",
         .serve_folder, .serve_folder_oop => "Folder demo content: ",
         .vfs, .vfs_oop => "VFS demo content: ",
         .public_network => "Network-visible demo payload: ",

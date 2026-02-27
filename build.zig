@@ -13,6 +13,7 @@ const ExampleChoice = enum {
     minimal,
     call_js_from_zig,
     call_zig_from_js,
+    bidirectional_rpc,
     serve_folder,
     vfs,
     public_network,
@@ -46,6 +47,11 @@ const examples = [_]Example{
         .selector = .call_zig_from_js,
         .artifact_name = "call_zig_from_js",
         .source_path = "examples/C/call_c_from_js/main.zig",
+    },
+    .{
+        .selector = .bidirectional_rpc,
+        .artifact_name = "bidirectional_rpc_zig",
+        .source_path = "examples/C/bidirectional_rpc/main.zig",
     },
     .{
         .selector = .serve_folder,

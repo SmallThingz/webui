@@ -62,6 +62,7 @@ pub const Symbols = struct {
     gtk_widget_input_shape_combine_region: ?*const fn (*common.GtkWidget, ?*common.cairo_region_t) callconv(.c) void = null,
     gtk_widget_show: *const fn (*common.GtkWidget) callconv(.c) void,
     gtk_widget_hide: *const fn (*common.GtkWidget) callconv(.c) void,
+    gtk_widget_queue_draw: ?*const fn (*common.GtkWidget) callconv(.c) void = null,
     gtk_widget_destroy: ?*const fn (*common.GtkWidget) callconv(.c) void = null,
     gtk_window_destroy: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
     gtk_window_close: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
@@ -178,6 +179,10 @@ pub const Symbols = struct {
     pub fn showWindow(self: *const Symbols, window_widget: *common.GtkWidget, child_widget: *common.GtkWidget) void {
         self.gtk_widget_show(child_widget);
         self.gtk_widget_show(window_widget);
+    }
+
+    pub fn queueWidgetDraw(self: *const Symbols, widget: *common.GtkWidget) void {
+        if (self.gtk_widget_queue_draw) |queue_draw| queue_draw(widget);
     }
 
     pub fn destroyWindow(self: *const Symbols, window_widget: *common.GtkWidget) void {
@@ -310,7 +315,6 @@ pub const Symbols = struct {
         const radius_raw: u16 = corner_radius orelse 0;
         const radius_i: c_int = @as(c_int, @intCast(radius_raw));
         if (radius_i <= 0) {
-            if (self.gdk_surface_set_input_region) |set_input| set_input(surface, null);
             if (self.gdk_surface_set_opaque_region) |set_opaque| {
                 if (transparent) set_opaque(surface, null);
             }
@@ -363,7 +367,6 @@ pub const Symbols = struct {
         const region = self.gdk_cairo_region_create_from_surface.?(surface_img) orelse return;
         defer self.cairo_region_destroy.?(region);
 
-        if (self.gdk_surface_set_input_region) |set_input| set_input(surface, region);
         if (self.gdk_surface_set_opaque_region) |set_opaque| {
             if (transparent) set_opaque(surface, null) else set_opaque(surface, region);
         }
@@ -616,6 +619,7 @@ pub const Symbols = struct {
         self.gtk_widget_input_shape_combine_region = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_input_shape_combine_region), "gtk_widget_input_shape_combine_region");
         self.gtk_widget_show = try lookupSym(&self.gtk, @TypeOf(self.gtk_widget_show), "gtk_widget_show");
         self.gtk_widget_hide = try lookupSym(&self.gtk, @TypeOf(self.gtk_widget_hide), "gtk_widget_hide");
+        self.gtk_widget_queue_draw = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_queue_draw), "gtk_widget_queue_draw");
         self.gtk_widget_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_destroy), "gtk_widget_destroy");
         self.gtk_window_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_destroy), "gtk_window_destroy");
         self.gtk_window_close = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_close), "gtk_window_close");

@@ -193,6 +193,7 @@ zig build run -Dexample=translucent_rounded -Drun-mode=webview,browser,web-url
 Available `-Dexample` values include:
 
 - `minimal`, `call_js_from_zig`, `call_zig_from_js`
+- `bidirectional_rpc`
 - `serve_folder`, `vfs`, `public_network`, `multi_client`
 - `chatgpt_api`, `custom_web_server`, `react`
 - `frameless`, `fancy_window`, `translucent_rounded`, `text_editor`

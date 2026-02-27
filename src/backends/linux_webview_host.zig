@@ -260,6 +260,10 @@ fn connectWindowSignals(symbols: *const Symbols, window_widget: *common.GtkWidge
     // Keep realize callback for all GTK variants so style/transparency can be
     // re-applied once the native surface exists. GTK4 size-allocate ABI differs.
     _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "realize", @ptrCast(&onRealize), host, null, 0);
+    // Workspace switches/remaps can leave GTK4/WebKit surfaces with stale
+    // compositor state until the next explicit redraw.
+    _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "map", @ptrCast(&onMap), host, null, 0);
+    _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "notify::is-active", @ptrCast(&onNotifyIsActive), host, null, 0);
     if (symbols.gtk_api == .gtk3) {
         _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "size-allocate", @ptrCast(&onSizeAllocate), host, null, 0);
     }
@@ -343,6 +347,21 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     symbols.applyTransparentVisual(window_widget);
     symbols.applyGtk4WindowStyle(window_widget, clip_widget, host.style);
     applyRoundedShape(&symbols, host.style.corner_radius, window_widget);
+    symbols.queueWidgetDraw(window_widget);
+    symbols.queueWidgetDraw(clip_widget);
+    if (host.webview) |webview| symbols.queueWidgetDraw(@ptrCast(webview));
+}
+
+fn onMap(_: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const raw_host = data orelse return;
+    const host: *Host = @ptrCast(@alignCast(raw_host));
+    refreshSurfaceAfterRemap(host);
+}
+
+fn onNotifyIsActive(_: ?*anyopaque, _: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const raw_host = data orelse return;
+    const host: *Host = @ptrCast(@alignCast(raw_host));
+    refreshSurfaceAfterRemap(host);
 }
 
 fn onSizeAllocate(widget: ?*anyopaque, allocation: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -467,6 +486,10 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     } else {
         symbols.gtk_widget_show(window_widget);
     }
+    const clip_widget = host.content_widget orelse window_widget;
+    symbols.queueWidgetDraw(window_widget);
+    symbols.queueWidgetDraw(clip_widget);
+    if (host.webview) |webview| symbols.queueWidgetDraw(@ptrCast(webview));
 }
 
 fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
@@ -523,6 +546,24 @@ fn applyWindowIconUiThread(host: *Host, symbols: *const Symbols, window_widget: 
     }
     cleanupIconTempFile(host);
     symbols.clearWindowIcon(window_widget);
+}
+
+fn refreshSurfaceAfterRemap(host: *Host) void {
+    // Signal callbacks may fire while style/control paths hold the lock.
+    // Use tryLock to avoid callback-induced lock inversions.
+    if (!host.mutex.tryLock()) return;
+    defer host.mutex.unlock();
+
+    const symbols = host.symbols orelse return;
+    const window_widget = host.window_widget orelse return;
+    const clip_widget = host.content_widget orelse window_widget;
+
+    symbols.applyTransparentVisual(window_widget);
+    symbols.applyGtk4WindowStyle(window_widget, clip_widget, host.style);
+    applyRoundedShape(&symbols, host.style.corner_radius, window_widget);
+    symbols.queueWidgetDraw(window_widget);
+    symbols.queueWidgetDraw(clip_widget);
+    if (host.webview) |webview| symbols.queueWidgetDraw(@ptrCast(webview));
 }
 
 fn writeIconTempFile(host: *Host, icon: WindowIcon) ![]u8 {
