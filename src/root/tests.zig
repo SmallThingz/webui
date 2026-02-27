@@ -401,7 +401,11 @@ test "shutdown in webview mode terminates tracked browser child process" {
     try child.spawn();
     defer {
         core_runtime.terminateBrowserProcess(gpa.allocator(), @as(i64, @intCast(child.id)));
-        _ = child.wait() catch {};
+        // On macOS this test may already reap via waitpid(WNOHANG) while polling.
+        // Avoid a second wait() call that would hit std.posix.waitpid(.CHILD).
+        if (builtin.os.tag != .macos) {
+            _ = child.wait() catch {};
+        }
     }
 
     const child_pid_i64: i64 = @as(i64, @intCast(child.id));
