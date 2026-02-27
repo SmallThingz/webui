@@ -36,6 +36,25 @@ fn hasCapability(haystack: []const WindowCapability, needle: WindowCapability) b
     return false;
 }
 
+fn writeAllStream(stream: std.net.Stream, bytes: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const n = std.posix.send(stream.handle, bytes[offset..], 0) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.Thread.sleep(std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            if (n == 0) return error.Closed;
+            offset += n;
+        }
+        return;
+    }
+    try stream.writeAll(bytes);
+}
+
 test "window lifecycle" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -71,7 +90,8 @@ test "browser fallback serves window html over local http" {
     const stream = try std.net.tcpConnectToAddress(address);
     defer stream.close();
 
-    try stream.writeAll(
+    try writeAllStream(
+        stream,
         "GET / HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
@@ -150,7 +170,8 @@ test "websocket upgrade uses same http server port" {
     const stream = try std.net.tcpConnectToAddress(address);
     defer stream.close();
 
-    try stream.writeAll(
+    try writeAllStream(
+        stream,
         "GET /webui/ws?client_id=test-client HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -166,6 +187,139 @@ test "websocket upgrade uses same http server port" {
     try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 101 Switching Protocols") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Upgrade: websocket") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+}
+
+test "http server remains responsive after partial request disconnect bursts" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "PartialDisconnectBurst" });
+    try win.showHtml("<html><body>partial-disconnect-ok</body></html>");
+    try app.run();
+
+    const address = try std.net.Address.parseIp4("127.0.0.1", win.state().server_port);
+    var bursts: usize = 0;
+    while (bursts < 64) : (bursts += 1) {
+        const stream = try std.net.tcpConnectToAddress(address);
+        try writeAllStream(stream, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        stream.close();
+    }
+
+    var checks: usize = 0;
+    while (checks < 16) : (checks += 1) {
+        const response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/", null);
+        defer gpa.allocator().free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "partial-disconnect-ok") != null);
+    }
+}
+
+test "websocket upgrade survives repeated connect-disconnect churn" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "WsChurn" });
+    try win.showHtml("<html><body>ws-churn-ok</body></html>");
+    try app.run();
+
+    const address = try std.net.Address.parseIp4("127.0.0.1", win.state().server_port);
+    var handshake_buf: [512]u8 = undefined;
+    var idx: usize = 0;
+    while (idx < 48) : (idx += 1) {
+        const stream = try std.net.tcpConnectToAddress(address);
+        const request = try std.fmt.bufPrint(
+            &handshake_buf,
+            "GET /webui/ws?client_id=churn-{d} HTTP/1.1\r\n" ++
+                "Host: 127.0.0.1\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n" ++
+                "\r\n",
+            .{idx},
+        );
+        try writeAllStream(stream, request);
+
+        const response = try readHttpHeadersFromStream(gpa.allocator(), stream, 64 * 1024);
+        defer gpa.allocator().free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 101 Switching Protocols") != null);
+        stream.close();
+    }
+
+    const response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/", null);
+    defer gpa.allocator().free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "ws-churn-ok") != null);
+}
+
+test "mixed concurrent http routes remain stable under socket churn" {
+    const Shared = struct { failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false) };
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        port: u16,
+        start: usize,
+        shared: *Shared,
+    };
+    const Worker = struct {
+        fn run(ctx: *Ctx) void {
+            var i: usize = 0;
+            while (i < 40) : (i += 1) {
+                const route_idx = (ctx.start + i) % 3;
+                const path = switch (route_idx) {
+                    0 => "/",
+                    1 => "/webui/window/control",
+                    else => "/webui/window/style",
+                };
+                const response = httpRoundTrip(ctx.allocator, ctx.port, "GET", path, null) catch {
+                    ctx.shared.failed.store(true, .release);
+                    return;
+                };
+                defer ctx.allocator.free(response);
+
+                if (std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") == null) {
+                    ctx.shared.failed.store(true, .release);
+                    return;
+                }
+            }
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "MixedRouteStress" });
+    try win.showHtml("<html><body>mixed-route-stress-ok</body></html>");
+    try app.run();
+
+    var shared = Shared{};
+    var contexts: [8]Ctx = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&contexts, 0..) |*ctx, idx| {
+        ctx.* = .{
+            .allocator = gpa.allocator(),
+            .port = win.state().server_port,
+            .start = idx * 7,
+            .shared = &shared,
+        };
+        threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ctx});
+    }
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!shared.failed.load(.acquire));
 }
 
 test "tls enabled runtime redirects plaintext http and serves https content on same port" {
@@ -291,7 +445,8 @@ test "native_webview launch order keeps local runtime reachable" {
     const stream = try std.net.tcpConnectToAddress(address);
     defer stream.close();
 
-    try stream.writeAll(
+    try writeAllStream(
+        stream,
         "GET / HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++

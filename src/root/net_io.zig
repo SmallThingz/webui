@@ -25,6 +25,14 @@ pub const WsInboundFrame = struct {
 
 fn readConn(conn: anytype, buffer: []u8) !usize {
     const Conn = @TypeOf(conn);
+    if (builtin.os.tag == .windows) {
+        if (Conn == std.net.Stream) {
+            return std.posix.recv(conn.handle, buffer, 0);
+        }
+        if (Conn == *std.net.Stream) {
+            return std.posix.recv(conn.handle, buffer, 0);
+        }
+    }
     if (Conn == std.net.Stream) {
         return conn.read(buffer);
     }
@@ -36,6 +44,14 @@ fn readConn(conn: anytype, buffer: []u8) !usize {
 
 fn writeConnAll(conn: anytype, bytes: []const u8) !void {
     const Conn = @TypeOf(conn);
+    if (builtin.os.tag == .windows) {
+        if (Conn == std.net.Stream) {
+            return sendAllWindows(conn.handle, bytes);
+        }
+        if (Conn == *std.net.Stream) {
+            return sendAllWindows(conn.handle, bytes);
+        }
+    }
     if (Conn == std.net.Stream) {
         return conn.writeAll(bytes);
     }
@@ -43,6 +59,21 @@ fn writeConnAll(conn: anytype, bytes: []const u8) !void {
         return conn.writeAll(bytes);
     }
     return conn.writeAll(bytes);
+}
+
+fn sendAllWindows(socket: std.posix.socket_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const n = std.posix.send(socket, bytes[offset..], 0) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        if (n == 0) return error.Closed;
+        offset += n;
+    }
 }
 
 fn readConnExact(conn: anytype, out: []u8) !void {
@@ -424,7 +455,7 @@ pub fn httpRoundTripWithHeaders(
         );
     defer allocator.free(request);
 
-    try stream.writeAll(request);
+    try writeConnAll(stream, request);
     return readAllFromStream(allocator, stream, 1024 * 1024);
 }
 

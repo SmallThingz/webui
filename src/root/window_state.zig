@@ -188,14 +188,31 @@ pub const WsTransport = union(enum) {
 
     pub fn read(self: *WsTransport, buffer: []u8) !usize {
         return switch (self.*) {
-            .plain => |stream| stream.read(buffer),
+            .plain => |stream| if (builtin.os.tag == .windows)
+                std.posix.recv(stream.handle, buffer, 0)
+            else
+                stream.read(buffer),
             .tls => |conn| conn.read(buffer),
         };
     }
 
     pub fn writeAll(self: *WsTransport, bytes: []const u8) !void {
         return switch (self.*) {
-            .plain => |stream| stream.writeAll(bytes),
+            .plain => |stream| if (builtin.os.tag == .windows) blk: {
+                var offset: usize = 0;
+                while (offset < bytes.len) {
+                    const n = std.posix.send(stream.handle, bytes[offset..], 0) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            std.Thread.sleep(std.time.ns_per_ms);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    if (n == 0) return error.Closed;
+                    offset += n;
+                }
+                break :blk;
+            } else stream.writeAll(bytes),
             .tls => |conn| conn.writeAll(bytes),
         };
     }
