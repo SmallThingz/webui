@@ -24,14 +24,7 @@ async function __webuiInvoke(endpoint, name, args) {
     const text = await res.text();
     throw new Error(`RPC ${name} failed: ${res.status} ${text}`);
   }
-  const body = await res.json();
-  if (body && typeof body === "object" && Number.isFinite(Number(body.job_id))) {
-    const jobId = Math.trunc(Number(body.job_id));
-    const pollMin = Number.isFinite(Number(body.poll_min_ms)) ? Math.max(50, Math.trunc(Number(body.poll_min_ms))) : 200;
-    const pollMax = Number.isFinite(Number(body.poll_max_ms)) ? Math.max(pollMin, Math.trunc(Number(body.poll_max_ms))) : 1000;
-    return await __webuiAwaitRpcJob(jobId, pollMin, pollMax);
-  }
-  return body;
+  return await res.json();
 }
 
 async function __webuiJson(endpoint, options) {
@@ -64,9 +57,7 @@ function __webuiNormalizeResult(result) {
   return result;
 }
 
-const __webuiRpcJobWaiters = new Map();
 const __webuiSocketConnectTimeoutMs = 10000;
-const __webuiRpcJobWaitTimeoutMs = 120000;
 
 function __webuiSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -101,113 +92,6 @@ async function __webuiSendObjectWithBackoff(message, timeoutMs, label) {
   }
 
   throw new Error(`${label || "socket send"} timed out`);
-}
-
-function __webuiDecodeJobValue(valueJson) {
-  if (typeof valueJson !== "string") return null;
-  try {
-    return JSON.parse(valueJson);
-  } catch (_) {
-    return null;
-  }
-}
-
-async function __webuiAwaitRpcJob(jobId, pollMinMs, pollMaxMs) {
-  let stopped = false;
-  let timer = null;
-  let currentDelay = pollMinMs;
-  const deadline = Date.now() + __webuiRpcJobWaitTimeoutMs;
-
-  return await new Promise((resolve, reject) => {
-    const cleanup = () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-      timer = null;
-      __webuiRpcJobWaiters.delete(jobId);
-    };
-
-    const failWithState = (status, fallbackMessage) => {
-      const message = status && typeof status.error_message === "string" && status.error_message.length > 0
-        ? status.error_message
-        : fallbackMessage;
-      reject(new Error(message));
-    };
-
-    const schedulePoll = () => {
-      if (stopped) return;
-      timer = setTimeout(() => {
-        void requestStatus();
-      }, currentDelay);
-      currentDelay = Math.min(pollMaxMs, Math.max(pollMinMs, Math.floor(currentDelay * 1.6)));
-    };
-
-    const handleStatus = (status) => {
-      if (stopped) return;
-      const state = status && typeof status.state === "string" ? status.state : "queued";
-      if (state === "completed") {
-        cleanup();
-        resolve({ value: __webuiDecodeJobValue(status.value_json) });
-        return;
-      }
-      if (state === "failed") {
-        cleanup();
-        failWithState(status, `RPC job ${jobId} failed`);
-        return;
-      }
-      if (state === "canceled") {
-        cleanup();
-        failWithState(status, `RPC job ${jobId} canceled`);
-        return;
-      }
-      if (state === "timed_out") {
-        cleanup();
-        failWithState(status, `RPC job ${jobId} timed out`);
-        return;
-      }
-    };
-
-    const requestStatus = async () => {
-      if (stopped) return;
-      if (Date.now() >= deadline) {
-        cleanup();
-        reject(new Error(`RPC job ${jobId} wait timed out`));
-        return;
-      }
-      try {
-        await __webuiSendObjectWithBackoff(
-          {
-            type: "rpc_job_wait",
-            job_id: jobId,
-            client_id: __webuiClientId,
-          },
-          Math.min(__webuiSocketConnectTimeoutMs, Math.max(500, deadline - Date.now())),
-          `rpc job ${jobId} wait`
-        );
-      } catch (err) {
-        if (Date.now() >= deadline) {
-          cleanup();
-          reject(err);
-          return;
-        }
-      }
-      schedulePoll();
-    };
-
-    __webuiRpcJobWaiters.set(jobId, {
-      onUpdate() {
-        if (stopped) return;
-        currentDelay = pollMinMs;
-        if (timer) clearTimeout(timer);
-        timer = null;
-        void requestStatus();
-      },
-      onStatus: handleStatus,
-    });
-
-    // WebSocket-only polling path: periodic rpc_job_wait messages over WS with
-    // immediate nudges when rpc_job_update notifications arrive.
-    void requestStatus();
-  });
 }
 
 let __webuiWindowRuntimeEmulationEnabled = true;
@@ -439,22 +323,6 @@ function __webuiHandleSocketMessage(raw) {
   if (!message || typeof message !== "object") return;
   if (message.type === "backend_close") {
     __webuiHandleBackendClose(message);
-    return;
-  }
-  if (message.type === "rpc_job_update") {
-    const id = Number(message.job_id);
-    if (Number.isFinite(id)) {
-      const waiter = __webuiRpcJobWaiters.get(Math.trunc(id));
-      if (waiter && typeof waiter.onUpdate === "function") waiter.onUpdate();
-    }
-    return;
-  }
-  if (message.type === "rpc_job_status") {
-    const id = Number(message.job_id);
-    if (Number.isFinite(id)) {
-      const waiter = __webuiRpcJobWaiters.get(Math.trunc(id));
-      if (waiter && typeof waiter.onStatus === "function") waiter.onStatus(message);
-    }
     return;
   }
   if (message.type !== "script_task") return;

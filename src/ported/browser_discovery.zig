@@ -22,7 +22,6 @@ pub const BrowserKind = enum {
     operagx,
     palemoon,
     sigmaos,
-    lightpanda,
 };
 
 pub const BrowserSource = enum {
@@ -69,7 +68,6 @@ pub const all_browser_kinds = [_]BrowserKind{
     .operagx,
     .palemoon,
     .sigmaos,
-    .lightpanda,
 };
 
 const env_browser_keys = [_][]const u8{
@@ -429,7 +427,6 @@ fn inferKindFromPath(path: []const u8) BrowserKind {
     if (containsTokenIgnoreCase(path, "shift")) return .shift;
     if (containsTokenIgnoreCase(path, "palemoon") or containsTokenIgnoreCase(path, "pale moon")) return .palemoon;
     if (containsTokenIgnoreCase(path, "sigmaos")) return .sigmaos;
-    if (containsTokenIgnoreCase(path, "lightpanda")) return .lightpanda;
     return .chromium;
 }
 
@@ -566,7 +563,6 @@ const windows_specs = [_]BrowserSpec{
     .{ .kind = .sidekick, .score_weight = 65, .executable_names = &.{ "sidekick.exe", "sidekick" }, .known_paths = &.{ "%PROGRAMFILES%\\Sidekick\\sidekick.exe", "%LOCALAPPDATA%\\Programs\\Sidekick\\sidekick.exe" } },
     .{ .kind = .shift, .score_weight = 65, .executable_names = &.{ "shift.exe", "shift" }, .known_paths = &.{ "%PROGRAMFILES%\\Shift\\Shift.exe", "%LOCALAPPDATA%\\Programs\\Shift\\Shift.exe" } },
     .{ .kind = .palemoon, .score_weight = 60, .executable_names = &.{ "palemoon.exe", "palemoon" }, .known_paths = &.{ "%PROGRAMFILES%\\Pale Moon\\palemoon.exe", "%PROGRAMFILES(X86)%\\Pale Moon\\palemoon.exe" } },
-    .{ .kind = .lightpanda, .score_weight = 55, .executable_names = &.{ "lightpanda.exe", "lightpanda" }, .known_paths = &.{ "%PROGRAMFILES%\\Lightpanda\\lightpanda.exe", "%PROGRAMFILES(X86)%\\Lightpanda\\lightpanda.exe", "%LOCALAPPDATA%\\Programs\\Lightpanda\\lightpanda.exe" } },
     .{ .kind = .sigmaos, .score_weight = 5, .executable_names = &.{}, .known_paths = &.{} },
     .{ .kind = .safari, .score_weight = 5, .executable_names = &.{ "Safari.exe", "safari.exe", "safari" }, .known_paths = &.{ "%PROGRAMFILES%\\Safari\\Safari.exe", "%PROGRAMFILES(X86)%\\Safari\\Safari.exe", "%LOCALAPPDATA%\\Programs\\Safari\\Safari.exe" } },
 };
@@ -592,7 +588,6 @@ const macos_specs = [_]BrowserSpec{
     .{ .kind = .shift, .score_weight = 65, .executable_names = &.{"Shift"}, .known_paths = &.{"/Applications/Shift.app/Contents/MacOS/Shift"}, .mac_bundle_names = &.{"Shift"} },
     .{ .kind = .palemoon, .score_weight = 60, .executable_names = &.{ "Pale Moon", "palemoon" }, .known_paths = &.{"/Applications/Pale Moon.app/Contents/MacOS/palemoon"}, .mac_bundle_names = &.{"Pale Moon"} },
     .{ .kind = .sigmaos, .score_weight = 60, .executable_names = &.{"SigmaOS"}, .known_paths = &.{"/Applications/SigmaOS.app/Contents/MacOS/SigmaOS"}, .mac_bundle_names = &.{"SigmaOS"} },
-    .{ .kind = .lightpanda, .score_weight = 55, .executable_names = &.{ "Lightpanda", "lightpanda" }, .known_paths = &.{ "/Applications/Lightpanda.app/Contents/MacOS/Lightpanda", "/Applications/lightpanda.app/Contents/MacOS/lightpanda" }, .mac_bundle_names = &.{ "Lightpanda", "lightpanda" } },
 };
 
 const linux_specs = [_]BrowserSpec{
@@ -614,7 +609,6 @@ const linux_specs = [_]BrowserSpec{
     .{ .kind = .sidekick, .score_weight = 65, .executable_names = &.{ "sidekick", "sidekick-browser" }, .known_paths = &.{ "/usr/bin/sidekick-browser", "/opt/sidekick/sidekick" } },
     .{ .kind = .shift, .score_weight = 65, .executable_names = &.{ "shift", "shift-browser" }, .known_paths = &.{ "/usr/bin/shift-browser", "/opt/shift/shift" } },
     .{ .kind = .palemoon, .score_weight = 60, .executable_names = &.{ "palemoon", "pale-moon" }, .known_paths = &.{ "/usr/bin/palemoon", "/usr/bin/pale-moon" } },
-    .{ .kind = .lightpanda, .score_weight = 55, .executable_names = &.{ "lightpanda", "lightpanda-browser" }, .known_paths = &.{ "/usr/bin/lightpanda", "/usr/local/bin/lightpanda", "/opt/lightpanda/lightpanda" } },
     .{ .kind = .sigmaos, .score_weight = 5, .executable_names = &.{}, .known_paths = &.{} },
     .{ .kind = .safari, .score_weight = 5, .executable_names = &.{"safari"}, .known_paths = &.{} },
 };
@@ -642,7 +636,6 @@ const windowsSearchDirs = [_][]const u8{
     "%LOCALAPPDATA%\\Programs\\Arc",
     "%LOCALAPPDATA%\\Programs\\Sidekick",
     "%LOCALAPPDATA%\\Programs\\Shift",
-    "%LOCALAPPDATA%\\Programs\\Lightpanda",
     "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\Application",
     "%PROGRAMFILES%\\Pale Moon",
     "%PROGRAMFILES(X86)%\\Pale Moon",
@@ -673,7 +666,6 @@ const linuxSearchDirs = [_][]const u8{
     "/opt/arc",
     "/opt/sidekick",
     "/opt/shift",
-    "/opt/lightpanda",
     "/var/lib/flatpak/exports/bin",
     "~/.local/share/flatpak/exports/bin",
 };
@@ -703,7 +695,6 @@ test "catalog includes browser_driver and webui browser families" {
         .sidekick,
         .shift,
         .operagx,
-        .lightpanda,
         .palemoon,
         .chromium,
         .opera,
@@ -785,5 +776,4 @@ test "infer kind from common path tokens" {
     try std.testing.expectEqual(BrowserKind.firefox, inferKindFromPath("/usr/bin/firefox"));
     try std.testing.expectEqual(BrowserKind.yandex, inferKindFromPath("/opt/yandex/browser/yandex-browser"));
     try std.testing.expectEqual(BrowserKind.sigmaos, inferKindFromPath("/Applications/SigmaOS.app/Contents/MacOS/SigmaOS"));
-    try std.testing.expectEqual(BrowserKind.lightpanda, inferKindFromPath("/usr/local/bin/lightpanda"));
 }

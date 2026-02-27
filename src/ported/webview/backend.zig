@@ -2,9 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const style_types = @import("../../window_style.zig");
 const browser_discovery = @import("../browser_discovery.zig");
-const win32 = @import("win32_wv2.zig");
-const mac = @import("wkwebview.zig");
-const linux = @import("linux_webkit.zig");
+const core_runtime = @import("../webui.zig");
 
 pub const WindowContent = union(enum) {
     html: []const u8,
@@ -12,123 +10,11 @@ pub const WindowContent = union(enum) {
     url: []const u8,
 };
 
-pub const NativeBackend = union(enum) {
-    none: void,
-    windows: win32.Win32WebView,
-    macos: mac.MacWebView,
-    linux: linux.LinuxWebView,
-
-    pub fn init(use_native: bool) NativeBackend {
-        if (!use_native) return .{ .none = {} };
-
-        return switch (builtin.os.tag) {
-            .windows => .{ .windows = .{} },
-            .macos => .{ .macos = .{} },
-            .linux => .{ .linux = .{} },
-            else => .{ .none = {} },
-        };
-    }
-
-    pub fn deinit(self: *NativeBackend) void {
-        _ = self;
-    }
-
-    pub fn isNative(self: NativeBackend) bool {
-        return switch (self) {
-            .none => false,
-            else => true,
-        };
-    }
-
-    pub fn isReady(self: *const NativeBackend) bool {
-        return switch (self.*) {
-            .none => false,
-            .windows => |*w| w.isReady(),
-            .macos => |*m| m.isReady(),
-            .linux => |*l| l.isReady(),
-        };
-    }
-
-    pub fn createWindow(self: *NativeBackend, window_id: usize, title: []const u8, style: style_types.WindowStyle) !void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| try w.createWindow(window_id, title, style),
-            .macos => |*m| try m.createWindow(window_id, title, style),
-            .linux => |*l| try l.createWindow(window_id, title, style),
-        }
-    }
-
-    pub fn showContent(self: *NativeBackend, content: WindowContent) !void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| try w.showContent(content),
-            .macos => |*m| try m.showContent(content),
-            .linux => |*l| try l.showContent(content),
-        }
-    }
-
-    pub fn navigate(self: *NativeBackend, url: []const u8) void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| w.navigate(url),
-            .macos => |*m| m.navigate(url),
-            .linux => |*l| l.navigate(url),
-        }
-    }
-
-    pub fn attachBrowserProcess(self: *NativeBackend, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| w.attachBrowserProcess(kind, pid, is_child_process),
-            .macos => |*m| m.attachBrowserProcess(kind, pid, is_child_process),
-            .linux => |*l| l.attachBrowserProcess(kind, pid, is_child_process),
-        }
-    }
-
-    pub fn applyStyle(self: *NativeBackend, style: style_types.WindowStyle) !void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| try w.applyStyle(style),
-            .macos => |*m| try m.applyStyle(style),
-            .linux => |*l| try l.applyStyle(style),
-        }
-    }
-
-    pub fn control(self: *NativeBackend, cmd: style_types.WindowControl) !void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| try w.control(cmd),
-            .macos => |*m| try m.control(cmd),
-            .linux => |*l| try l.control(cmd),
-        }
-    }
-
-    pub fn pumpEvents(self: *NativeBackend) !void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| try w.pumpEvents(),
-            .macos => |*m| try m.pumpEvents(),
-            .linux => |*l| try l.pumpEvents(),
-        }
-    }
-
-    pub fn destroyWindow(self: *NativeBackend) void {
-        switch (self.*) {
-            .none => {},
-            .windows => |*w| w.destroyWindow(),
-            .macos => |*m| m.destroyWindow(),
-            .linux => |*l| l.destroyWindow(),
-        }
-    }
-
-    pub fn capabilities(self: *const NativeBackend) []const style_types.WindowCapability {
-        return switch (self.*) {
-            .none => &.{},
-            .windows => |*w| w.capabilities(),
-            .macos => |*m| m.capabilities(),
-            .linux => |*l| l.capabilities(),
-        };
-    }
+pub const NativeBackend = switch (builtin.os.tag) {
+    .linux => LinuxWebView,
+    .windows => Win32WebView,
+    .macos => MacWebView,
+    else => @compileError("Unsupported Backend"),
 };
 
 test "native backend selects platform or none" {
@@ -137,3 +23,552 @@ test "native backend selects platform or none" {
     try std.testing.expect(fallback == .none);
     _ = native;
 }
+
+pub const LinuxWebView = struct {
+    window_id: usize = 0,
+    title: []const u8 = "",
+    style: style_types.WindowStyle = .{},
+    hidden: bool = false,
+    maximized: bool = false,
+    native_host_ready: bool = false,
+    browser_kind: ?browser_discovery.BrowserKind = null,
+    browser_pid: ?i64 = null,
+    browser_is_child: bool = false,
+
+    pub fn isReady(self: *const LinuxWebView) bool {
+        return self.native_host_ready;
+    }
+
+    pub fn createWindow(self: *LinuxWebView, window_id: usize, title: []const u8, style: style_types.WindowStyle) !void {
+        self.window_id = window_id;
+        self.title = title;
+        self.style = style;
+    }
+
+    pub fn showContent(self: *LinuxWebView, content: anytype) !void {
+        switch (content) {
+            .url => |url| self.navigate(url),
+            else => return error.UnsupportedWindowContent,
+        }
+    }
+
+    pub fn attachBrowserProcess(self: *LinuxWebView, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
+        self.browser_kind = kind;
+        self.browser_pid = pid;
+        self.browser_is_child = is_child_process;
+        self.native_host_ready = pid != null;
+    }
+
+    pub fn navigate(self: *LinuxWebView, url: []const u8) void {
+        if (!self.native_host_ready) return;
+        if (self.browser_kind) |kind| {
+            _ = core_runtime.openUrlInExistingBrowserKind(std.heap.page_allocator, kind, url);
+        }
+    }
+
+    pub fn applyStyle(self: *LinuxWebView, style: style_types.WindowStyle) !void {
+        self.style = style;
+        if (!self.native_host_ready) return;
+        if (self.browser_kind) |kind| {
+            if (!core_runtime.supportsRequestedStyleInBrowser(kind, style)) return error.UnsupportedWindowStyle;
+        }
+    }
+
+    pub fn control(self: *LinuxWebView, cmd: style_types.WindowControl) !void {
+        if (!self.native_host_ready) return error.NativeBackendUnavailable;
+        if (!self.browser_is_child) return error.UnsupportedWindowControl;
+        switch (cmd) {
+            .close => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                return error.UnsupportedWindowControl;
+            },
+            .hide => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                self.hidden = true;
+                return error.UnsupportedWindowControl;
+            },
+            .show => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = false;
+                        return;
+                    }
+                }
+                self.hidden = false;
+                return error.UnsupportedWindowControl;
+            },
+            .maximize => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.maximized = true;
+                        return;
+                    }
+                }
+                self.maximized = true;
+                return error.UnsupportedWindowControl;
+            },
+            .restore => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.maximized = false;
+                        self.hidden = false;
+                        return;
+                    }
+                }
+                self.maximized = false;
+                return error.UnsupportedWindowControl;
+            },
+            .minimize => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                self.hidden = true;
+                return error.UnsupportedWindowControl;
+            },
+        }
+    }
+
+    pub fn pumpEvents(self: *LinuxWebView) !void {
+        _ = self;
+    }
+
+    pub fn destroyWindow(self: *LinuxWebView) void {
+        self.native_host_ready = false;
+        self.browser_kind = null;
+        self.browser_pid = null;
+        self.browser_is_child = false;
+    }
+
+    pub fn capabilities(self: *const LinuxWebView) []const style_types.WindowCapability {
+        if (!self.native_host_ready) return &.{};
+        if (self.browser_kind == null) {
+            return &.{
+                .native_frameless,
+                .native_transparency,
+                .native_corner_radius,
+                .native_positioning,
+                .native_minmax,
+                .native_kiosk,
+            };
+        }
+        if (self.browser_kind) |kind| {
+            if (supportsChromiumStyle(kind)) {
+                return &.{
+                    .native_frameless,
+                    .native_transparency,
+                    .native_corner_radius,
+                    .native_positioning,
+                    .native_minmax,
+                    .native_kiosk,
+                };
+            }
+            if (kind == .firefox or kind == .tor or kind == .librewolf or kind == .mullvad or kind == .palemoon) {
+                return &.{ .native_kiosk, .native_minmax };
+            }
+        }
+        return &.{};
+    }
+
+    test "linux backend capabilities require host readiness" {
+        var backend: LinuxWebView = .{};
+        try std.testing.expectEqual(@as(usize, 0), backend.capabilities().len);
+
+        backend.attachBrowserProcess(.chrome, 1234, true);
+        const caps = backend.capabilities();
+        try std.testing.expect(caps.len > 0);
+        try std.testing.expect(style_types.hasCapability(.native_frameless, caps));
+        try std.testing.expect(style_types.hasCapability(.native_minmax, caps));
+    }
+
+    test "linux backend control requires child-owned browser process" {
+        var backend: LinuxWebView = .{};
+        backend.attachBrowserProcess(.chrome, 1234, false);
+        try std.testing.expectError(error.UnsupportedWindowControl, backend.control(.maximize));
+    }
+};
+
+pub const Win32WebView = struct {
+    window_id: usize = 0,
+    title: []const u8 = "",
+    style: style_types.WindowStyle = .{},
+    hidden: bool = false,
+    maximized: bool = false,
+    native_host_ready: bool = false,
+    browser_kind: ?browser_discovery.BrowserKind = null,
+    browser_pid: ?i64 = null,
+    browser_is_child: bool = false,
+
+    pub fn isReady(self: *const Win32WebView) bool {
+        return self.native_host_ready;
+    }
+
+    pub fn createWindow(self: *Win32WebView, window_id: usize, title: []const u8, style: style_types.WindowStyle) !void {
+        self.window_id = window_id;
+        self.title = title;
+        self.style = style;
+    }
+
+    pub fn showContent(self: *Win32WebView, content: anytype) !void {
+        switch (content) {
+            .url => |url| self.navigate(url),
+            else => return error.UnsupportedWindowContent,
+        }
+    }
+
+    pub fn attachBrowserProcess(self: *Win32WebView, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
+        self.browser_kind = kind;
+        self.browser_pid = pid;
+        self.browser_is_child = is_child_process;
+        self.native_host_ready = pid != null;
+    }
+
+    pub fn navigate(self: *Win32WebView, url: []const u8) void {
+        if (!self.native_host_ready) return;
+        if (self.browser_kind) |kind| {
+            _ = core_runtime.openUrlInExistingBrowserKind(std.heap.page_allocator, kind, url);
+        }
+    }
+
+    pub fn applyStyle(self: *Win32WebView, style: style_types.WindowStyle) !void {
+        self.style = style;
+        if (!self.native_host_ready) return;
+        if (self.browser_kind) |kind| {
+            if (!core_runtime.supportsRequestedStyleInBrowser(kind, style)) return error.UnsupportedWindowStyle;
+        }
+    }
+
+    pub fn control(self: *Win32WebView, cmd: style_types.WindowControl) !void {
+        if (!self.native_host_ready) return error.NativeBackendUnavailable;
+        if (!self.browser_is_child) return error.UnsupportedWindowControl;
+        switch (cmd) {
+            .close => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                return error.UnsupportedWindowControl;
+            },
+            .hide => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                self.hidden = true;
+                return error.UnsupportedWindowControl;
+            },
+            .show => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = false;
+                        return;
+                    }
+                }
+                self.hidden = false;
+                return error.UnsupportedWindowControl;
+            },
+            .maximize => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.maximized = true;
+                        return;
+                    }
+                }
+                self.maximized = true;
+                return error.UnsupportedWindowControl;
+            },
+            .restore => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.maximized = false;
+                        self.hidden = false;
+                        return;
+                    }
+                }
+                self.maximized = false;
+                return error.UnsupportedWindowControl;
+            },
+            .minimize => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                self.hidden = true;
+                return error.UnsupportedWindowControl;
+            },
+        }
+    }
+
+    pub fn pumpEvents(self: *Win32WebView) !void {
+        _ = self;
+    }
+
+    pub fn destroyWindow(self: *Win32WebView) void {
+        self.native_host_ready = false;
+        self.browser_kind = null;
+        self.browser_pid = null;
+        self.browser_is_child = false;
+    }
+
+    pub fn capabilities(self: *const Win32WebView) []const style_types.WindowCapability {
+        if (!self.native_host_ready) return &.{};
+        if (self.browser_kind == null) {
+            return &.{
+                .native_frameless,
+                .native_transparency,
+                .native_corner_radius,
+                .native_positioning,
+                .native_minmax,
+                .native_kiosk,
+            };
+        }
+        if (self.browser_kind) |kind| {
+            if (supportsChromiumStyle(kind)) {
+                return &.{
+                    .native_frameless,
+                    .native_transparency,
+                    .native_corner_radius,
+                    .native_positioning,
+                    .native_minmax,
+                    .native_kiosk,
+                };
+            }
+            if (kind == .firefox or kind == .tor or kind == .librewolf or kind == .mullvad or kind == .palemoon) {
+                return &.{ .native_kiosk, .native_minmax };
+            }
+        }
+        return &.{};
+    }
+
+    test "win backend capabilities require host readiness" {
+        var backend: Win32WebView = .{};
+        try std.testing.expectEqual(@as(usize, 0), backend.capabilities().len);
+
+        backend.attachBrowserProcess(.chrome, 1234, true);
+        const caps = backend.capabilities();
+        try std.testing.expect(caps.len > 0);
+        try std.testing.expect(style_types.hasCapability(.native_frameless, caps));
+        try std.testing.expect(style_types.hasCapability(.native_minmax, caps));
+    }
+
+    test "win backend control requires child-owned browser process" {
+        var backend: Win32WebView = .{};
+        backend.attachBrowserProcess(.chrome, 1234, false);
+        try std.testing.expectError(error.UnsupportedWindowControl, backend.control(.maximize));
+    }
+};
+
+pub const MacWebView = struct {
+    window_id: usize = 0,
+    title: []const u8 = "",
+    style: style_types.WindowStyle = .{},
+    hidden: bool = false,
+    maximized: bool = false,
+    native_host_ready: bool = false,
+    browser_kind: ?browser_discovery.BrowserKind = null,
+    browser_pid: ?i64 = null,
+    browser_is_child: bool = false,
+
+    pub fn isReady(self: *const MacWebView) bool {
+        return self.native_host_ready;
+    }
+
+    pub fn createWindow(self: *MacWebView, window_id: usize, title: []const u8, style: style_types.WindowStyle) !void {
+        self.window_id = window_id;
+        self.title = title;
+        self.style = style;
+    }
+
+    pub fn showContent(self: *MacWebView, content: anytype) !void {
+        switch (content) {
+            .url => |url| self.navigate(url),
+            else => return error.UnsupportedWindowContent,
+        }
+    }
+
+    pub fn attachBrowserProcess(self: *MacWebView, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
+        self.browser_kind = kind;
+        self.browser_pid = pid;
+        self.browser_is_child = is_child_process;
+        self.native_host_ready = pid != null;
+    }
+
+    pub fn navigate(self: *MacWebView, url: []const u8) void {
+        if (!self.native_host_ready) return;
+        if (self.browser_kind) |kind| {
+            _ = core_runtime.openUrlInExistingBrowserKind(std.heap.page_allocator, kind, url);
+        }
+    }
+
+    pub fn applyStyle(self: *MacWebView, style: style_types.WindowStyle) !void {
+        self.style = style;
+        if (!self.native_host_ready) return;
+        if (self.browser_kind) |kind| {
+            if (!core_runtime.supportsRequestedStyleInBrowser(kind, style)) return error.UnsupportedWindowStyle;
+        }
+    }
+
+    pub fn control(self: *MacWebView, cmd: style_types.WindowControl) !void {
+        if (!self.native_host_ready) return error.NativeBackendUnavailable;
+        if (!self.browser_is_child) return error.UnsupportedWindowControl;
+        switch (cmd) {
+            .close => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                return error.UnsupportedWindowControl;
+            },
+            .hide => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                self.hidden = true;
+                return error.UnsupportedWindowControl;
+            },
+            .show => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = false;
+                        return;
+                    }
+                }
+                self.hidden = false;
+                return error.UnsupportedWindowControl;
+            },
+            .maximize => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.maximized = true;
+                        return;
+                    }
+                }
+                self.maximized = true;
+                return error.UnsupportedWindowControl;
+            },
+            .restore => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.maximized = false;
+                        self.hidden = false;
+                        return;
+                    }
+                }
+                self.maximized = false;
+                return error.UnsupportedWindowControl;
+            },
+            .minimize => {
+                if (self.browser_pid) |pid| {
+                    if (core_runtime.controlBrowserWindow(std.heap.page_allocator, pid, cmd)) {
+                        self.hidden = true;
+                        return;
+                    }
+                }
+                self.hidden = true;
+                return error.UnsupportedWindowControl;
+            },
+        }
+    }
+
+    pub fn pumpEvents(self: *MacWebView) !void {
+        _ = self;
+    }
+
+    pub fn destroyWindow(self: *MacWebView) void {
+        self.native_host_ready = false;
+        self.browser_kind = null;
+        self.browser_pid = null;
+        self.browser_is_child = false;
+    }
+
+    pub fn capabilities(self: *const MacWebView) []const style_types.WindowCapability {
+        if (!self.native_host_ready) return &.{};
+        if (self.browser_kind == null) {
+            return &.{
+                .native_frameless,
+                .native_transparency,
+                .native_corner_radius,
+                .native_positioning,
+                .native_minmax,
+                .native_kiosk,
+            };
+        }
+        if (self.browser_kind) |kind| {
+            if (supportsChromiumStyle(kind)) {
+                return &.{
+                    .native_frameless,
+                    .native_transparency,
+                    .native_corner_radius,
+                    .native_positioning,
+                    .native_minmax,
+                    .native_kiosk,
+                };
+            }
+            if (kind == .firefox or kind == .tor or kind == .librewolf or kind == .mullvad or kind == .palemoon or kind == .safari) {
+                return &.{ .native_kiosk, .native_minmax };
+            }
+        }
+        return &.{};
+    }
+
+    test "mac backend capabilities require host readiness" {
+        var backend: MacWebView = .{};
+        try std.testing.expectEqual(@as(usize, 0), backend.capabilities().len);
+
+        backend.attachBrowserProcess(.chrome, 1234, true);
+        const caps = backend.capabilities();
+        try std.testing.expect(caps.len > 0);
+        try std.testing.expect(style_types.hasCapability(.native_frameless, caps));
+        try std.testing.expect(style_types.hasCapability(.native_minmax, caps));
+    }
+
+    test "mac backend control requires child-owned browser process" {
+        var backend: MacWebView = .{};
+        backend.attachBrowserProcess(.chrome, 1234, false);
+        try std.testing.expectError(error.UnsupportedWindowControl, backend.control(.maximize));
+    }
+};
+
+fn supportsChromiumStyle(kind: browser_discovery.BrowserKind) bool {
+    return switch (kind) {
+        .chrome,
+        .edge,
+        .chromium,
+        .opera,
+        .brave,
+        .vivaldi,
+        .epic,
+        .yandex,
+        .duckduckgo,
+        .arc,
+        .sidekick,
+        .shift,
+        .operagx,
+        => true,
+        else => false,
+    };
+}
+

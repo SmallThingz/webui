@@ -443,7 +443,6 @@ fn supportsChromiumAppMode(kind: browser_discovery.BrowserKind) bool {
         .sidekick,
         .shift,
         .operagx,
-        .lightpanda,
         => true,
         else => false,
     };

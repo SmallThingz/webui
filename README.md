@@ -293,19 +293,14 @@ What you can generate:
 
 Dispatch modes:
 - `sync` (direct execution)
-- `threaded` (worker queue)
+- `threaded` (worker queue, default)
 - `custom` (hook dispatcher)
 
-Async jobs (WebSocket-driven):
-- Set `RpcOptions.execution_mode = .queued_async`.
-- `POST <rpc_route>` returns `{ job_id, state, poll_min_ms, poll_max_ms }`.
-- Completion is pushed over WebSocket as `rpc_job_update`.
-- JS bridge waits for a reconnecting WebSocket and requests status/cancel over WS only (`rpc_job_wait`, `rpc_job_cancel`).
-
-Typed APIs:
-- `Window.rpcPollJob(allocator, job_id) !RpcJobStatus`
-- `Window.rpcCancelJob(job_id) !bool`
-- `Service` mirrors both methods.
+RPC behavior:
+- JS calls are async (`Promise`) by default.
+- Backend dispatch is asynchronous by default via `dispatcher_mode = .threaded`.
+- `/webui/rpc` returns direct RPC result payloads (no job ids).
+- Use `dispatcher_mode = .sync` when strict in-thread execution is required.
 
 Runtime introspection and diagnostics:
 - `Window.runtimeRenderState()` / `Service.runtimeRenderState()`

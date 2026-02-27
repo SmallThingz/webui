@@ -182,31 +182,20 @@ Use these to avoid warning-string parsing:
 - `Service.listRuntimeRequirements(allocator)`
 - `App.onDiagnostic(...)` / `Service.onDiagnostic(...)`
 
-## Async RPC Jobs (WebSocket-Only)
+## RPC Dispatch Defaults
 
-Enable async jobs:
+RPC dispatch is async by default via threaded backend execution:
 
 ```zig
 try window.bindRpc(rpc_methods, .{
-    .execution_mode = .queued_async,
-    .job_queue_capacity = 1024,
-    .job_poll_min_ms = 200,
-    .job_poll_max_ms = 1000,
-    .push_job_updates = true,
+    .dispatcher_mode = .threaded, // default
 });
 ```
 
 Runtime behavior:
-- `POST <rpc_route>` returns `job_id` immediately.
-- Completion updates are pushed over `/webui/ws` as `rpc_job_update`.
-- Bridge uses reconnecting WebSocket control messages for wait/cancel:
-  - `rpc_job_wait`
-  - `rpc_job_cancel`
-
-Typed control APIs:
-- `Window.rpcPollJob(allocator, job_id) !RpcJobStatus`
-- `Window.rpcCancelJob(job_id) !bool`
-- `Service.rpcPollJob(...)` / `Service.rpcCancelJob(...)`
+- `POST <rpc_route>` returns the RPC result directly.
+- JS remains async (`Promise`), but there is no job-id layer.
+- For strict same-thread execution, opt into `dispatcher_mode = .sync`.
 
 ## Notes
 

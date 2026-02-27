@@ -1,17 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 
 const bridge_template = @import("bridge/template.zig");
 const bridge_runtime_helpers = @import("bridge/runtime_helpers.zig");
 const core_runtime = @import("ported/webui.zig");
 const browser_discovery = @import("ported/browser_discovery.zig");
-const civetweb = @import("ported/civetweb/civetweb.zig");
+const civetweb = @import("network/civetweb.zig");
 const tls_runtime = @import("network/tls_runtime.zig");
 const websocket = @import("websocket");
 pub const process_signals = @import("process_signals.zig");
 const window_style_types = @import("window_style.zig");
 const webview_backend = @import("ported/webview/backend.zig");
+const api_types = @import("root/api_types.zig");
+const launch_policy = @import("root/launch_policy.zig");
+const rpc_reflect = @import("root/rpc_reflect.zig");
+const net_io = @import("root/net_io.zig");
 const runtime_requirements = @import("runtime_requirements.zig");
 
 pub const runtime = core_runtime;
@@ -48,303 +51,54 @@ pub const WindowControl = window_style_types.WindowControl;
 pub const WindowCapability = window_style_types.WindowCapability;
 pub const CloseHandler = window_style_types.CloseHandler;
 
-pub const BuildFlags = struct {
-    pub const dynamic = build_options.dynamic;
-    pub const enable_tls = build_options.enable_tls;
-    pub const enable_webui_log = build_options.enable_webui_log;
-    pub const run_mode = build_options.run_mode;
-};
+pub const BuildFlags = api_types.BuildFlags;
+pub const DispatcherMode = api_types.DispatcherMode;
+pub const TransportMode = api_types.TransportMode;
+pub const LaunchSurface = api_types.LaunchSurface;
+pub const LaunchPolicy = api_types.LaunchPolicy;
+pub const FallbackReason = api_types.FallbackReason;
+pub const RuntimeRenderState = api_types.RuntimeRenderState;
+pub const DiagnosticCategory = api_types.DiagnosticCategory;
+pub const DiagnosticSeverity = api_types.DiagnosticSeverity;
+pub const Diagnostic = api_types.Diagnostic;
+pub const EventKind = api_types.EventKind;
+pub const BridgeOptions = api_types.BridgeOptions;
+pub const Event = api_types.Event;
+pub const EventHandler = api_types.EventHandler;
+pub const RawHandler = api_types.RawHandler;
+pub const RpcInvokeFn = api_types.RpcInvokeFn;
+pub const CustomDispatcher = api_types.CustomDispatcher;
+pub const RpcOptions = api_types.RpcOptions;
+pub const AppOptions = api_types.AppOptions;
+pub const WindowOptions = api_types.WindowOptions;
+pub const WindowContent = api_types.WindowContent;
+pub const WindowControlResult = api_types.WindowControlResult;
+pub const ScriptTarget = api_types.ScriptTarget;
+pub const ScriptOptions = api_types.ScriptOptions;
+pub const ScriptEvalResult = api_types.ScriptEvalResult;
+pub const RuntimeRequirement = api_types.RuntimeRequirement;
+pub const EffectiveCapabilities = api_types.EffectiveCapabilities;
+pub const ServiceOptions = api_types.ServiceOptions;
 
-pub const DispatcherMode = enum {
-    sync,
-    threaded,
-    custom,
-};
+const launchPolicyOrder = launch_policy.order;
+const launchPolicyContains = launch_policy.contains;
+const launchPolicyNextAfter = launch_policy.nextAfter;
 
-pub const TransportMode = enum {
-    browser_fallback,
-    native_webview,
-};
-
-pub const LaunchSurface = enum {
-    native_webview,
-    browser_window,
-    web_url,
-};
-
-pub const LaunchPolicy = struct {
-    first: LaunchSurface = .native_webview,
-    second: ?LaunchSurface = .browser_window,
-    third: ?LaunchSurface = .web_url,
-    app_mode_required: bool = true,
-    allow_dual_surface: bool = false,
-
-    pub fn webviewFirst() LaunchPolicy {
-        return .{
-            .first = .native_webview,
-            .second = .browser_window,
-            .third = .web_url,
-        };
-    }
-
-    pub fn browserFirst() LaunchPolicy {
-        return .{
-            .first = .browser_window,
-            .second = .web_url,
-            .third = .native_webview,
-            .app_mode_required = false,
-        };
-    }
-
-    pub fn webUrlOnly() LaunchPolicy {
-        return .{
-            .first = .web_url,
-            .second = null,
-            .third = null,
-            .app_mode_required = false,
-        };
-    }
-};
-
-pub const FallbackReason = enum {
-    native_backend_unavailable,
-    unsupported_style,
-    launch_failed,
-    dependency_missing,
-};
-
-pub const RuntimeRenderState = struct {
-    active_transport: TransportMode = .browser_fallback,
-    active_surface: LaunchSurface = .web_url,
-    fallback_applied: bool = false,
-    fallback_reason: ?FallbackReason = null,
-    launch_policy: LaunchPolicy = .{},
-    using_system_fallback_launcher: bool = false,
-    browser_process: ?struct {
-        pid: i64,
-        kind: ?browser_discovery.BrowserKind,
-        lifecycle_linked: bool,
-    } = null,
-};
-
-pub const DiagnosticCategory = enum {
-    transport,
-    browser_launch,
-    rpc,
-    websocket,
-    tls,
-    lifecycle,
-    runtime_requirements,
-};
-
-pub const DiagnosticSeverity = enum {
-    debug,
-    info,
-    warn,
-    err,
-};
-
-pub const Diagnostic = struct {
-    code: []const u8,
-    category: DiagnosticCategory,
-    severity: DiagnosticSeverity,
-    message: []const u8,
-    window_id: usize,
-    timestamp_ms: i64,
-};
-
-pub const EventKind = enum {
-    connected,
-    disconnected,
-    navigation,
-    rpc,
-    raw,
-    window_state,
-    window_capability,
-    close_requested,
-};
-
-pub const BridgeOptions = struct {
-    namespace: []const u8 = "webuiRpc",
-    script_route: []const u8 = "/webui_bridge.js",
-    rpc_route: []const u8 = "/webui/rpc",
-};
-
-pub const Event = struct {
-    window_id: usize,
-    kind: EventKind,
-    name: []const u8,
-    payload: []const u8,
-    client_id: ?usize = null,
-    connection_id: ?usize = null,
-};
-
-pub const EventHandler = *const fn (context: ?*anyopaque, event: *const Event) void;
-pub const RawHandler = *const fn (context: ?*anyopaque, bytes: []const u8) void;
-
-pub const RpcInvokeFn = *const fn (allocator: std.mem.Allocator, args: []const std.json.Value) anyerror![]u8;
-pub const CustomDispatcher = *const fn (
-    context: ?*anyopaque,
-    function_name: []const u8,
-    invoker: RpcInvokeFn,
-    allocator: std.mem.Allocator,
-    args: []const std.json.Value,
-) anyerror![]u8;
-
-pub const RpcJobNotifyFn = *const fn (context: ?*anyopaque, job_id: RpcJobId, state: RpcJobState) void;
-
-pub const RpcOptions = struct {
-    dispatcher_mode: DispatcherMode = .sync,
-    custom_dispatcher: ?CustomDispatcher = null,
-    custom_context: ?*anyopaque = null,
-    bridge_options: BridgeOptions = .{},
-    threaded_poll_interval_ns: u64 = 2 * std.time.ns_per_ms,
-    execution_mode: RpcExecutionMode = .inline_sync,
-    job_queue_capacity: usize = 1024,
-    job_default_timeout_ms: ?u32 = null,
-    job_result_ttl_ms: u32 = 60_000,
-    job_poll_min_ms: u32 = 200,
-    job_poll_max_ms: u32 = 1_000,
-    push_job_updates: bool = true,
-};
-
-pub const AppOptions = struct {
-    launch_policy: LaunchPolicy = .{},
-    enable_tls: bool = build_options.enable_tls,
-    tls: TlsOptions = .{
-        .enabled = build_options.enable_tls,
-    },
-    enable_webui_log: bool = build_options.enable_webui_log,
-    public_network: bool = false,
-    browser_launch: BrowserLaunchOptions = .{},
-    window_fallback_emulation: bool = true,
-};
-
-pub const WindowOptions = struct {
-    window_id: ?usize = null,
-    title: []const u8 = "WebUI Zig",
-    style: WindowStyle = .{},
-};
-
-pub const WindowContent = union(enum) {
-    html: []const u8,
-    file: []const u8,
-    url: []const u8,
-};
-
-pub const WindowControlResult = struct {
-    success: bool = true,
-    emulation: ?[]const u8 = null,
-    closed: bool = false,
-    warning: ?[]const u8 = null,
-};
-
-pub const ScriptTarget = union(enum) {
-    window_default,
-    client_connection: usize,
-};
-
-pub const ScriptOptions = struct {
-    target: ScriptTarget = .window_default,
-    timeout_ms: ?u32 = null,
-};
-
-pub const ScriptEvalResult = struct {
-    ok: bool,
-    timed_out: bool,
-    js_error: bool,
-    value: ?[]u8,
-    error_message: ?[]u8,
-};
-
-pub const RpcExecutionMode = enum {
-    inline_sync,
-    queued_async,
-};
-
-pub const RpcJobId = u64;
-
-pub const RpcJobState = enum {
-    queued,
-    running,
-    completed,
-    failed,
-    canceled,
-    timed_out,
-};
-
-pub const RpcJobStatus = struct {
-    id: RpcJobId,
-    state: RpcJobState,
-    value_json: ?[]u8 = null,
-    error_message: ?[]u8 = null,
-    created_ms: i64,
-    updated_ms: i64,
-};
-
-pub const RuntimeRequirement = runtime_requirements.RuntimeRequirement;
-
-pub const EffectiveCapabilities = struct {
-    transport_if_shown: TransportMode,
-    surface_if_shown: LaunchSurface,
-    supports_native_window_controls: bool,
-    supports_transparency: bool,
-    supports_frameless: bool,
-    fallback_expected: bool,
-};
-
-pub const ServiceOptions = struct {
-    app: AppOptions = .{},
-    window: WindowOptions = .{},
-    rpc: RpcOptions = .{},
-};
-
-fn launchPolicyOrder(policy: LaunchPolicy) [3]?LaunchSurface {
-    var out: [3]?LaunchSurface = .{ null, null, null };
-    var write_idx: usize = 0;
-    const input = [_]?LaunchSurface{ policy.first, policy.second, policy.third };
-    for (input) |candidate| {
-        if (candidate == null) continue;
-
-        var duplicate = false;
-        for (out) |existing| {
-            if (existing != null and existing.? == candidate.?) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) continue;
-        out[write_idx] = candidate.?;
-        write_idx += 1;
-        if (write_idx >= out.len) break;
-    }
-
-    if (out[0] == null) out[0] = .web_url;
-    return out;
-}
-
-fn launchPolicyContains(policy: LaunchPolicy, surface: LaunchSurface) bool {
-    const ordered = launchPolicyOrder(policy);
-    for (ordered) |candidate| {
-        if (candidate == null) continue;
-        if (candidate.? == surface) return true;
-    }
-    return false;
-}
-
-fn launchPolicyNextAfter(policy: LaunchPolicy, current: LaunchSurface) ?LaunchSurface {
-    const ordered = launchPolicyOrder(policy);
-    var found = false;
-    for (ordered) |candidate| {
-        if (candidate == null) continue;
-        if (!found) {
-            if (candidate.? == current) found = true;
-            continue;
-        }
-        return candidate.?;
-    }
-    return null;
-}
+const HttpRequest = net_io.HttpRequest;
+const pathWithoutQuery = net_io.pathWithoutQuery;
+const wsClientTokenFromUrl = net_io.wsClientTokenFromUrl;
+const httpHeaderValue = net_io.httpHeaderValue;
+const readHttpRequest = net_io.readHttpRequest;
+const readWsInboundFrameAlloc = net_io.readWsInboundFrameAlloc;
+const containsTokenIgnoreCase = net_io.containsTokenIgnoreCase;
+const writeWebSocketHandshakeResponse = net_io.writeWebSocketHandshakeResponse;
+const writeHttpResponse = net_io.writeHttpResponse;
+const contentTypeForPath = net_io.contentTypeForPath;
+const readAllFromStream = net_io.readAllFromStream;
+const httpRoundTrip = net_io.httpRoundTrip;
+const httpRoundTripWithHeaders = net_io.httpRoundTripWithHeaders;
+const readHttpHeadersFromStream = net_io.readHttpHeadersFromStream;
+const httpResponseBody = net_io.httpResponseBody;
 
 const EventCallbackState = struct {
     handler: ?EventHandler = null,
@@ -448,38 +202,6 @@ const ClientSession = struct {
     last_seen_ms: i64,
 };
 
-const RpcJob = struct {
-    allocator: std.mem.Allocator,
-    id: RpcJobId,
-    payload_json: []u8,
-    state: RpcJobState = .queued,
-    value_json: ?[]u8 = null,
-    error_message: ?[]u8 = null,
-    cancel_requested: bool = false,
-    created_ms: i64,
-    updated_ms: i64,
-
-    fn init(allocator: std.mem.Allocator, id: RpcJobId, payload_json: []const u8) !*RpcJob {
-        const now_ms = std.time.milliTimestamp();
-        const job = try allocator.create(RpcJob);
-        job.* = .{
-            .allocator = allocator,
-            .id = id,
-            .payload_json = try allocator.dupe(u8, payload_json),
-            .created_ms = now_ms,
-            .updated_ms = now_ms,
-        };
-        return job;
-    }
-
-    fn deinit(self: *RpcJob) void {
-        self.allocator.free(self.payload_json);
-        if (self.value_json) |value| self.allocator.free(value);
-        if (self.error_message) |msg| self.allocator.free(msg);
-        self.allocator.destroy(self);
-    }
-};
-
 const ScriptTask = struct {
     allocator: std.mem.Allocator,
     id: u64,
@@ -538,24 +260,6 @@ const RpcRegistryState = struct {
     worker_stop: std.atomic.Value(bool),
     worker_lifecycle_mutex: std.Thread.Mutex,
     log_enabled: bool,
-    execution_mode: RpcExecutionMode,
-    job_queue_capacity: usize,
-    job_default_timeout_ms: ?u32,
-    job_result_ttl_ms: u32,
-    job_poll_min_ms: u32,
-    job_poll_max_ms: u32,
-    push_job_updates: bool,
-
-    job_mutex: std.Thread.Mutex,
-    job_cond: std.Thread.Condition,
-    jobs_pending: std.array_list.Managed(*RpcJob),
-    jobs_all: std.array_list.Managed(*RpcJob),
-    next_job_id: RpcJobId,
-    job_worker_thread: ?std.Thread,
-    job_worker_stop: std.atomic.Value(bool),
-    job_worker_lifecycle_mutex: std.Thread.Mutex,
-    job_notify: ?RpcJobNotifyFn,
-    job_notify_context: ?*anyopaque,
 
     fn init(allocator: std.mem.Allocator, log_enabled: bool) RpcRegistryState {
         return .{
@@ -575,29 +279,11 @@ const RpcRegistryState = struct {
             .worker_stop = std.atomic.Value(bool).init(false),
             .worker_lifecycle_mutex = .{},
             .log_enabled = log_enabled,
-            .execution_mode = .inline_sync,
-            .job_queue_capacity = 1024,
-            .job_default_timeout_ms = null,
-            .job_result_ttl_ms = 60_000,
-            .job_poll_min_ms = 200,
-            .job_poll_max_ms = 1_000,
-            .push_job_updates = true,
-            .job_mutex = .{},
-            .job_cond = .{},
-            .jobs_pending = std.array_list.Managed(*RpcJob).init(allocator),
-            .jobs_all = std.array_list.Managed(*RpcJob).init(allocator),
-            .next_job_id = 1,
-            .job_worker_thread = null,
-            .job_worker_stop = std.atomic.Value(bool).init(false),
-            .job_worker_lifecycle_mutex = .{},
-            .job_notify = null,
-            .job_notify_context = null,
         };
     }
 
     fn deinit(self: *RpcRegistryState, allocator: std.mem.Allocator) void {
         self.stopWorker();
-        self.stopJobWorker();
 
         self.queue_mutex.lock();
         while (self.queue.items.len > 0) {
@@ -607,22 +293,6 @@ const RpcRegistryState = struct {
         }
         self.queue_mutex.unlock();
         self.queue.deinit();
-
-        self.job_mutex.lock();
-        while (self.jobs_pending.items.len > 0) {
-            const job = self.jobs_pending.items[self.jobs_pending.items.len - 1];
-            _ = self.jobs_pending.pop();
-            _ = self.removeJobAllLocked(job.id);
-            job.deinit();
-        }
-        while (self.jobs_all.items.len > 0) {
-            const job = self.jobs_all.items[self.jobs_all.items.len - 1];
-            _ = self.jobs_all.pop();
-            job.deinit();
-        }
-        self.job_mutex.unlock();
-        self.jobs_pending.deinit();
-        self.jobs_all.deinit();
 
         for (self.handlers.items) |handler| {
             allocator.free(handler.name);
@@ -785,146 +455,6 @@ const RpcRegistryState = struct {
         }
     }
 
-    fn ensureJobWorkerStarted(self: *RpcRegistryState) !void {
-        self.job_worker_lifecycle_mutex.lock();
-        defer self.job_worker_lifecycle_mutex.unlock();
-
-        if (self.execution_mode != .queued_async) return;
-        if (self.job_worker_thread != null) return;
-
-        self.job_worker_stop.store(false, .release);
-        self.job_worker_thread = try std.Thread.spawn(.{}, rpcJobWorkerMain, .{self});
-    }
-
-    fn stopJobWorker(self: *RpcRegistryState) void {
-        self.job_worker_lifecycle_mutex.lock();
-        defer self.job_worker_lifecycle_mutex.unlock();
-
-        self.job_worker_stop.store(true, .release);
-        self.job_cond.broadcast();
-        if (self.job_worker_thread) |thread| {
-            thread.join();
-            self.job_worker_thread = null;
-        }
-    }
-
-    fn findJobLocked(self: *RpcRegistryState, id: RpcJobId) ?*RpcJob {
-        for (self.jobs_all.items) |job| {
-            if (job.id == id) return job;
-        }
-        return null;
-    }
-
-    fn removeJobAllLocked(self: *RpcRegistryState, id: RpcJobId) bool {
-        for (self.jobs_all.items, 0..) |job, idx| {
-            if (job.id != id) continue;
-            _ = self.jobs_all.orderedRemove(idx);
-            return true;
-        }
-        return false;
-    }
-
-    fn removeJobPendingLocked(self: *RpcRegistryState, id: RpcJobId) bool {
-        for (self.jobs_pending.items, 0..) |job, idx| {
-            if (job.id != id) continue;
-            _ = self.jobs_pending.orderedRemove(idx);
-            return true;
-        }
-        return false;
-    }
-
-    fn cleanupExpiredJobsLocked(self: *RpcRegistryState) void {
-        if (self.job_result_ttl_ms == 0) return;
-        const now_ms = std.time.milliTimestamp();
-        var idx: usize = 0;
-        while (idx < self.jobs_all.items.len) {
-            const job = self.jobs_all.items[idx];
-            switch (job.state) {
-                .completed, .failed, .canceled, .timed_out => {},
-                else => {
-                    idx += 1;
-                    continue;
-                },
-            }
-            if (now_ms - job.updated_ms < @as(i64, @intCast(self.job_result_ttl_ms))) {
-                idx += 1;
-                continue;
-            }
-            _ = self.jobs_all.orderedRemove(idx);
-            job.deinit();
-        }
-    }
-
-    fn enqueueJob(self: *RpcRegistryState, allocator: std.mem.Allocator, payload_json: []const u8) !RpcJobStatus {
-        try self.ensureJobWorkerStarted();
-
-        self.job_mutex.lock();
-        defer self.job_mutex.unlock();
-
-        self.cleanupExpiredJobsLocked();
-
-        if (self.jobs_pending.items.len >= self.job_queue_capacity) {
-            return error.RpcJobQueueFull;
-        }
-
-        const job = try RpcJob.init(allocator, self.next_job_id, payload_json);
-        self.next_job_id += 1;
-        try self.jobs_pending.append(job);
-        try self.jobs_all.append(job);
-        self.job_cond.signal();
-
-        return .{
-            .id = job.id,
-            .state = .queued,
-            .value_json = null,
-            .error_message = null,
-            .created_ms = job.created_ms,
-            .updated_ms = job.updated_ms,
-        };
-    }
-
-    fn pollJob(self: *RpcRegistryState, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
-        self.job_mutex.lock();
-        defer self.job_mutex.unlock();
-        self.cleanupExpiredJobsLocked();
-        const job = self.findJobLocked(job_id) orelse return error.UnknownRpcJob;
-        return .{
-            .id = job.id,
-            .state = job.state,
-            .value_json = if (job.value_json) |v| try allocator.dupe(u8, v) else null,
-            .error_message = if (job.error_message) |e| try allocator.dupe(u8, e) else null,
-            .created_ms = job.created_ms,
-            .updated_ms = job.updated_ms,
-        };
-    }
-
-    fn cancelJob(self: *RpcRegistryState, job_id: RpcJobId) !bool {
-        self.job_mutex.lock();
-        defer self.job_mutex.unlock();
-
-        const job = self.findJobLocked(job_id) orelse return false;
-        switch (job.state) {
-            .queued => {
-                _ = self.removeJobPendingLocked(job_id);
-                job.state = .canceled;
-                job.updated_ms = std.time.milliTimestamp();
-                return true;
-            },
-            .running => {
-                job.cancel_requested = true;
-                return true;
-            },
-            else => return false,
-        }
-    }
-
-    fn notifyJobUpdate(self: *RpcRegistryState, job: *const RpcJob) void {
-        if (!self.push_job_updates) return;
-        if (self.job_notify) |hook| {
-            hook(self.job_notify_context, job.id, job.state);
-        }
-    }
-
     fn invokeFromJsonPayload(self: *RpcRegistryState, allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
         if (self.dispatcher_mode != .threaded) {
             return try self.invokeFromJsonPayloadSync(allocator, payload_json);
@@ -1031,61 +561,6 @@ const RpcRegistryState = struct {
             work.done = true;
             work.cond.signal();
             work.mutex.unlock();
-        }
-    }
-
-    fn rpcJobWorkerMain(self: *RpcRegistryState) void {
-        const poll_ns = if (self.threaded_poll_interval_ns == 0) std.time.ns_per_ms else self.threaded_poll_interval_ns;
-        while (!self.job_worker_stop.load(.acquire)) {
-            self.job_mutex.lock();
-            while (self.jobs_pending.items.len == 0 and !self.job_worker_stop.load(.acquire)) {
-                self.job_cond.timedWait(&self.job_mutex, poll_ns) catch {};
-            }
-            if (self.jobs_pending.items.len == 0) {
-                self.job_mutex.unlock();
-                continue;
-            }
-
-            const job = self.jobs_pending.orderedRemove(0);
-            job.state = .running;
-            job.updated_ms = std.time.milliTimestamp();
-            self.job_mutex.unlock();
-
-            const started_ms = std.time.milliTimestamp();
-            const result = self.invokeFromJsonPayloadSync(job.allocator, job.payload_json);
-
-            self.job_mutex.lock();
-            defer self.job_mutex.unlock();
-
-            if (job.cancel_requested) {
-                job.state = .canceled;
-                job.updated_ms = std.time.milliTimestamp();
-                self.notifyJobUpdate(job);
-                continue;
-            }
-
-            if (self.job_default_timeout_ms) |timeout_ms| {
-                const elapsed = std.time.milliTimestamp() - started_ms;
-                if (elapsed > @as(i64, @intCast(timeout_ms))) {
-                    job.state = .timed_out;
-                    job.updated_ms = std.time.milliTimestamp();
-                    self.notifyJobUpdate(job);
-                    continue;
-                }
-            }
-
-            if (result) |value| {
-                if (job.value_json) |prev| job.allocator.free(prev);
-                job.value_json = value;
-                job.state = .completed;
-                job.updated_ms = std.time.milliTimestamp();
-            } else |err| {
-                if (job.error_message) |prev| job.allocator.free(prev);
-                job.error_message = std.fmt.allocPrint(job.allocator, "{s}", .{@errorName(err)}) catch null;
-                job.state = .failed;
-                job.updated_ms = std.time.milliTimestamp();
-            }
-            self.notifyJobUpdate(job);
         }
     }
 };
@@ -1940,77 +1415,6 @@ const WindowState = struct {
         }
     }
 
-    fn onRpcJobUpdated(context: ?*anyopaque, job_id: RpcJobId, state: RpcJobState) void {
-        const self = context orelse return;
-        const win_state: *WindowState = @ptrCast(@alignCast(self));
-
-        win_state.state_mutex.lock();
-        defer win_state.state_mutex.unlock();
-        if (win_state.ws_connections.items.len == 0) return;
-
-        const payload = std.json.Stringify.valueAlloc(win_state.allocator, .{
-            .type = "rpc_job_update",
-            .job_id = job_id,
-            .state = @tagName(state),
-        }, .{}) catch return;
-        defer win_state.allocator.free(payload);
-
-        var idx: usize = 0;
-        while (idx < win_state.ws_connections.items.len) {
-            const entry = win_state.ws_connections.items[idx];
-            win_state.sendWsTextLocked(entry.stream, payload) catch {
-                win_state.closeWsConnectionLocked(entry.connection_id);
-                continue;
-            };
-            idx += 1;
-        }
-    }
-
-    fn sendRpcJobStatusPayloadLocked(
-        self: *WindowState,
-        connection_id: usize,
-        status: RpcJobStatus,
-    ) void {
-        const entry = self.findWsConnectionByIdLocked(connection_id) orelse return;
-        const payload = std.json.Stringify.valueAlloc(self.allocator, .{
-            .type = "rpc_job_status",
-            .job_id = status.id,
-            .state = @tagName(status.state),
-            .value_json = status.value_json,
-            .error_message = status.error_message,
-            .created_ms = status.created_ms,
-            .updated_ms = status.updated_ms,
-        }, .{}) catch return;
-        defer self.allocator.free(payload);
-
-        self.sendWsTextLocked(entry.stream, payload) catch {
-            self.closeWsConnectionLocked(entry.connection_id);
-        };
-    }
-
-    fn sendRpcJobErrorPayloadLocked(
-        self: *WindowState,
-        connection_id: usize,
-        job_id: RpcJobId,
-        err_name: []const u8,
-    ) void {
-        const entry = self.findWsConnectionByIdLocked(connection_id) orelse return;
-        const payload = std.json.Stringify.valueAlloc(self.allocator, .{
-            .type = "rpc_job_status",
-            .job_id = job_id,
-            .state = "failed",
-            .value_json = @as(?[]const u8, null),
-            .error_message = err_name,
-            .created_ms = @as(i64, 0),
-            .updated_ms = std.time.milliTimestamp(),
-        }, .{}) catch return;
-        defer self.allocator.free(payload);
-
-        self.sendWsTextLocked(entry.stream, payload) catch {
-            self.closeWsConnectionLocked(entry.connection_id);
-        };
-    }
-
     fn pushBackendCloseSignalLocked(self: *WindowState, reason: []const u8) !u64 {
         if (self.ws_connections.items.len == 0) return 0;
 
@@ -2139,7 +1543,7 @@ const WindowState = struct {
         task.mutex.unlock();
     }
 
-    fn handleWebSocketClientMessage(self: *WindowState, connection_id: usize, data: []const u8) !void {
+    fn handleWebSocketClientMessage(self: *WindowState, _: usize, data: []const u8) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
         defer parsed.deinit();
 
@@ -2171,57 +1575,6 @@ const WindowState = struct {
 
             self.state_mutex.lock();
             self.requestLifecycleCloseFromFrontend();
-            self.state_mutex.unlock();
-            return;
-        }
-
-        if (std.mem.eql(u8, msg_type_value.string, "rpc_job_wait")) {
-            const id_value = parsed.value.object.get("job_id") orelse return;
-            const job_id: RpcJobId = switch (id_value) {
-                .integer => |v| @as(RpcJobId, @intCast(v)),
-                .float => |v| @as(RpcJobId, @intFromFloat(v)),
-                else => return,
-            };
-
-            const status = self.rpc_state.pollJob(self.allocator, job_id) catch |err| {
-                self.state_mutex.lock();
-                self.sendRpcJobErrorPayloadLocked(connection_id, job_id, @errorName(err));
-                self.state_mutex.unlock();
-                return;
-            };
-            defer {
-                if (status.value_json) |v| self.allocator.free(v);
-                if (status.error_message) |e| self.allocator.free(e);
-            }
-
-            self.state_mutex.lock();
-            self.sendRpcJobStatusPayloadLocked(connection_id, status);
-            self.state_mutex.unlock();
-            return;
-        }
-
-        if (std.mem.eql(u8, msg_type_value.string, "rpc_job_cancel")) {
-            const id_value = parsed.value.object.get("job_id") orelse return;
-            const job_id: RpcJobId = switch (id_value) {
-                .integer => |v| @as(RpcJobId, @intCast(v)),
-                .float => |v| @as(RpcJobId, @intFromFloat(v)),
-                else => return,
-            };
-
-            _ = self.rpc_state.cancelJob(job_id) catch false;
-            const status = self.rpc_state.pollJob(self.allocator, job_id) catch |err| {
-                self.state_mutex.lock();
-                self.sendRpcJobErrorPayloadLocked(connection_id, job_id, @errorName(err));
-                self.state_mutex.unlock();
-                return;
-            };
-            defer {
-                if (status.value_json) |v| self.allocator.free(v);
-                if (status.error_message) |e| self.allocator.free(e);
-            }
-
-            self.state_mutex.lock();
-            self.sendRpcJobStatusPayloadLocked(connection_id, status);
             self.state_mutex.unlock();
             return;
         }
@@ -2578,11 +1931,6 @@ pub const App = struct {
         }
 
         try self.windows.append(try WindowState.init(self.allocator, id, options, self.options, &self.diagnostic_callback));
-        for (self.windows.items, 0..) |*state, idx_iter| {
-            _ = idx_iter;
-            state.rpc_state.job_notify = WindowState.onRpcJobUpdated;
-            state.rpc_state.job_notify_context = state;
-        }
         const idx = self.windows.items.len - 1;
 
         return .{
@@ -3019,14 +2367,6 @@ pub const Window = struct {
         };
     }
 
-    pub fn rpcPollJob(self: *Window, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
-        return self.state().rpc_state.pollJob(allocator, job_id);
-    }
-
-    pub fn rpcCancelJob(self: *Window, job_id: RpcJobId) !bool {
-        return self.state().rpc_state.cancelJob(job_id);
-    }
-
     fn state(self: *Window) *WindowState {
         return &self.app.windows.items[self.index];
     }
@@ -3284,16 +2624,6 @@ pub const Service = struct {
         return win.evalScript(allocator, script, options);
     }
 
-    pub fn rpcPollJob(self: *Service, allocator: std.mem.Allocator, job_id: RpcJobId) !RpcJobStatus {
-        var win = self.window();
-        return win.rpcPollJob(allocator, job_id);
-    }
-
-    pub fn rpcCancelJob(self: *Service, job_id: RpcJobId) !bool {
-        var win = self.window();
-        return win.rpcCancelJob(job_id);
-    }
-
     pub fn browserUrl(self: *Service) ![]u8 {
         var win = self.window();
         return win.browserUrl();
@@ -3349,19 +2679,9 @@ pub const RpcRegistry = struct {
         self.state.custom_dispatcher = options.custom_dispatcher;
         self.state.custom_context = options.custom_context;
         self.state.threaded_poll_interval_ns = options.threaded_poll_interval_ns;
-        self.state.execution_mode = options.execution_mode;
-        self.state.job_queue_capacity = options.job_queue_capacity;
-        self.state.job_default_timeout_ms = options.job_default_timeout_ms;
-        self.state.job_result_ttl_ms = options.job_result_ttl_ms;
-        self.state.job_poll_min_ms = options.job_poll_min_ms;
-        self.state.job_poll_max_ms = options.job_poll_max_ms;
-        self.state.push_job_updates = options.push_job_updates;
 
         if (self.state.dispatcher_mode == .threaded) {
             try self.state.ensureWorkerStarted();
-        }
-        if (self.state.execution_mode == .queued_async) {
-            try self.state.ensureJobWorkerStarted();
         }
 
         var registered_count: usize = 0;
@@ -3467,120 +2787,9 @@ fn bridgeOptionsEqual(lhs: BridgeOptions, rhs: BridgeOptions) bool {
         std.mem.eql(u8, lhs.rpc_route, rhs.rpc_route);
 }
 
-fn buildTsArgSignature(allocator: std.mem.Allocator, comptime params: anytype) ![]u8 {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-
-    inline for (params, 0..) |param, idx| {
-        if (idx != 0) try out.appendSlice(", ");
-        const param_type = param.type orelse return error.InvalidRpcParamType;
-        try out.writer().print("arg{d}: {s}", .{ idx, tsTypeNameForType(param_type) });
-    }
-
-    return out.toOwnedSlice();
-}
-
-fn tsTypeNameForReturn(comptime return_type: type) []const u8 {
-    if (@typeInfo(return_type) == .error_union) {
-        const payload = @typeInfo(return_type).error_union.payload;
-        return tsTypeNameForType(payload);
-    }
-    return tsTypeNameForType(return_type);
-}
-
-fn tsTypeNameForType(comptime T: type) []const u8 {
-    return switch (@typeInfo(T)) {
-        .bool => "boolean",
-        .int, .comptime_int, .float, .comptime_float => "number",
-        .pointer => |ptr| blk: {
-            if (ptr.size == .slice and ptr.child == u8 and ptr.is_const) break :blk "string";
-            break :blk "unknown";
-        },
-        .optional => "unknown | null",
-        .@"enum" => "string",
-        .void => "void",
-        else => "unknown",
-    };
-}
-
-fn makeInvoker(comptime RpcStruct: type, comptime function_name: []const u8) RpcInvokeFn {
-    return struct {
-        fn invoke(allocator: std.mem.Allocator, args: []const std.json.Value) anyerror![]u8 {
-            const function = @field(RpcStruct, function_name);
-            const Fn = @TypeOf(function);
-            const fn_info = @typeInfo(Fn).@"fn";
-
-            if (args.len != fn_info.params.len) return error.InvalidRpcArgCount;
-
-            var tuple: std.meta.ArgsTuple(Fn) = undefined;
-            inline for (fn_info.params, 0..) |param, idx| {
-                const param_type = param.type orelse @compileError("RPC parameter type is required");
-                @field(tuple, std.fmt.comptimePrint("{d}", .{idx})) = try coerceJsonArg(param_type, args[idx]);
-            }
-
-            const return_type = fn_info.return_type orelse void;
-
-            if (@typeInfo(return_type) == .error_union) {
-                const result = try @call(.auto, function, tuple);
-                return try encodeJsonValue(allocator, result);
-            }
-
-            if (return_type == void) {
-                @call(.auto, function, tuple);
-                return try allocator.dupe(u8, "null");
-            }
-
-            const result = @call(.auto, function, tuple);
-            return try encodeJsonValue(allocator, result);
-        }
-    }.invoke;
-}
-
-fn coerceJsonArg(comptime T: type, value: std.json.Value) !T {
-    return switch (@typeInfo(T)) {
-        .bool => switch (value) {
-            .bool => |b| b,
-            else => error.InvalidRpcArgType,
-        },
-        .int, .comptime_int => switch (value) {
-            .integer => |v| @as(T, @intCast(v)),
-            .float => |v| @as(T, @intFromFloat(v)),
-            else => error.InvalidRpcArgType,
-        },
-        .float, .comptime_float => switch (value) {
-            .float => |v| @as(T, @floatCast(v)),
-            .integer => |v| @as(T, @floatFromInt(v)),
-            else => error.InvalidRpcArgType,
-        },
-        .pointer => |ptr| blk: {
-            if (ptr.size == .slice and ptr.child == u8 and ptr.is_const) {
-                break :blk switch (value) {
-                    .string => |s| s,
-                    else => error.InvalidRpcArgType,
-                };
-            }
-            break :blk error.UnsupportedRpcArgType;
-        },
-        .optional => |opt| blk: {
-            if (value == .null) break :blk @as(T, null);
-            const unwrapped = try coerceJsonArg(opt.child, value);
-            break :blk unwrapped;
-        },
-        .@"enum" => |enum_info| blk: {
-            _ = enum_info;
-            const raw = switch (value) {
-                .string => |s| s,
-                else => break :blk error.InvalidRpcArgType,
-            };
-            break :blk std.meta.stringToEnum(T, raw) orelse error.InvalidRpcArgType;
-        },
-        else => error.UnsupportedRpcArgType,
-    };
-}
-
-fn encodeJsonValue(allocator: std.mem.Allocator, value: anytype) ![]u8 {
-    return try std.json.Stringify.valueAlloc(allocator, value, .{});
-}
+const buildTsArgSignature = rpc_reflect.buildTsArgSignature;
+const tsTypeNameForReturn = rpc_reflect.tsTypeNameForReturn;
+const makeInvoker = rpc_reflect.makeInvoker;
 
 fn replaceOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
     if (target.*) |buf| {
@@ -3595,141 +2804,6 @@ fn isLikelyUrl(url: []const u8) bool {
 
 fn isHttpUrl(url: []const u8) bool {
     return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
-}
-
-const HttpRequest = struct {
-    raw: []u8,
-    method: []const u8,
-    path: []const u8,
-    headers: []const u8,
-    body: []const u8,
-};
-
-const WsInboundType = enum {
-    text,
-    binary,
-    ping,
-    pong,
-    close,
-};
-
-const WsInboundFrame = struct {
-    kind: WsInboundType,
-    payload: []u8,
-};
-
-fn readSocketExact(handle: std.posix.socket_t, out: []u8) !void {
-    var offset: usize = 0;
-    while (offset < out.len) {
-        const n = std.posix.recv(handle, out[offset..], 0) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(std.time.ns_per_ms);
-                continue;
-            },
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.SocketNotConnected,
-            => return error.Closed,
-            else => return err,
-        };
-        if (n == 0) return error.Closed;
-        offset += n;
-    }
-}
-
-fn decodeWsOpcode(byte: u8) !WsInboundType {
-    return switch (byte & 0x0F) {
-        0x1 => .text,
-        0x2 => .binary,
-        0x8 => .close,
-        0x9 => .ping,
-        0xA => .pong,
-        else => error.UnsupportedWebSocketOpcode,
-    };
-}
-
-fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream, max_payload_size: usize) !WsInboundFrame {
-    var header: [2]u8 = undefined;
-    try readSocketExact(stream.handle, &header);
-
-    const fin = (header[0] & 0x80) != 0;
-    if (!fin) return error.UnsupportedWebSocketFragmentation;
-
-    const kind = try decodeWsOpcode(header[0]);
-    const masked = (header[1] & 0x80) != 0;
-    if (!masked) return error.InvalidWebSocketMasking;
-
-    var payload_len_u64: u64 = header[1] & 0x7F;
-    if (payload_len_u64 == 126) {
-        var ext: [2]u8 = undefined;
-        try readSocketExact(stream.handle, &ext);
-        payload_len_u64 = (@as(u64, ext[0]) << 8) | @as(u64, ext[1]);
-    } else if (payload_len_u64 == 127) {
-        var ext: [8]u8 = undefined;
-        try readSocketExact(stream.handle, &ext);
-        payload_len_u64 =
-            (@as(u64, ext[0]) << 56) |
-            (@as(u64, ext[1]) << 48) |
-            (@as(u64, ext[2]) << 40) |
-            (@as(u64, ext[3]) << 32) |
-            (@as(u64, ext[4]) << 24) |
-            (@as(u64, ext[5]) << 16) |
-            (@as(u64, ext[6]) << 8) |
-            (@as(u64, ext[7]));
-    }
-
-    if (payload_len_u64 > max_payload_size) return error.WebSocketMessageTooLarge;
-    const payload_len: usize = @intCast(payload_len_u64);
-
-    var masking_key: [4]u8 = undefined;
-    try readSocketExact(stream.handle, &masking_key);
-
-    const payload = try allocator.alloc(u8, payload_len);
-    errdefer allocator.free(payload);
-
-    if (payload_len > 0) {
-        try readSocketExact(stream.handle, payload);
-        for (payload, 0..) |byte, i| {
-            payload[i] = byte ^ masking_key[i & 3];
-        }
-    }
-
-    return .{
-        .kind = kind,
-        .payload = payload,
-    };
-}
-
-fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
-    var it = std.mem.splitScalar(u8, value, ',');
-    while (it.next()) |part| {
-        const normalized = std.mem.trim(u8, part, " \t");
-        if (std.ascii.eqlIgnoreCase(normalized, token)) return true;
-    }
-    return false;
-}
-
-fn writeWebSocketHandshakeResponse(stream: std.net.Stream, sec_key: []const u8) !void {
-    var sha1_digest: [20]u8 = undefined;
-    var hasher = std.crypto.hash.Sha1.init(.{});
-    hasher.update(sec_key);
-    hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    hasher.final(&sha1_digest);
-
-    var accept_key: [28]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&accept_key, &sha1_digest);
-
-    var response_buf: [512]u8 = undefined;
-    const response = try std.fmt.bufPrint(
-        &response_buf,
-        "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Accept: {s}\r\n\r\n",
-        .{accept_key},
-    );
-
-    try WindowState.writeSocketAll(stream.handle, response);
 }
 
 fn wsConnectionThreadMain(state: *WindowState, stream: std.net.Stream, connection_id: usize) void {
@@ -3815,7 +2889,7 @@ fn handleWebSocketUpgradeRoute(state: *WindowState, stream: std.net.Stream, requ
 
     try writeWebSocketHandshakeResponse(stream, sec_key);
 
-    const token = wsClientTokenFromUrl(request.path);
+    const token = wsClientTokenFromUrl(request.path, default_client_token);
     var connection_id: usize = 0;
     state.state_mutex.lock();
     {
@@ -3853,37 +2927,6 @@ fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: s
 
     try writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "not found");
     return false;
-}
-
-fn pathWithoutQuery(path: []const u8) []const u8 {
-    return if (std.mem.indexOfScalar(u8, path, '?')) |q| path[0..q] else path;
-}
-
-fn wsClientTokenFromUrl(url: []const u8) []const u8 {
-    const query_start = std.mem.indexOfScalar(u8, url, '?') orelse return default_client_token;
-    var pair_it = std.mem.splitScalar(u8, url[query_start + 1 ..], '&');
-    while (pair_it.next()) |pair| {
-        if (pair.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        const key = pair[0..eq];
-        if (!std.mem.eql(u8, key, "client_id")) continue;
-        const value = pair[eq + 1 ..];
-        if (value.len == 0) return default_client_token;
-        return value;
-    }
-    return default_client_token;
-}
-
-fn httpHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitSequence(u8, headers, "\r\n");
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        const sep = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const header_name = std.mem.trim(u8, line[0..sep], " \t");
-        if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
-        return std.mem.trim(u8, line[sep + 1 ..], " \t");
-    }
-    return null;
 }
 
 fn handleBridgeScriptRoute(
@@ -3933,27 +2976,6 @@ fn handleRpcRoute(
     state.state_mutex.lock();
     const client_ref = state.findOrCreateClientSessionLocked(client_token) catch null;
     state.state_mutex.unlock();
-
-    if (state.rpc_state.execution_mode == .queued_async) {
-        const job = state.rpc_state.enqueueJob(allocator, body) catch |err| {
-            state.emitDiagnostic("rpc.enqueue.error", .rpc, .warn, @errorName(err));
-            const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-            defer allocator.free(err_body);
-            try writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_body);
-            return true;
-        };
-
-        const payload = try std.json.Stringify.valueAlloc(allocator, .{
-            .job_id = job.id,
-            .state = @tagName(job.state),
-            .poll_min_ms = state.rpc_state.job_poll_min_ms,
-            .poll_max_ms = state.rpc_state.job_poll_max_ms,
-        }, .{});
-        defer allocator.free(payload);
-
-        try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-        return true;
-    }
 
     state.rpc_state.invoke_mutex.lock();
     const payload = state.rpc_state.invokeFromJsonPayload(allocator, body) catch |err| {
@@ -4166,230 +3188,6 @@ fn handleWindowContentRoute(
 
     try writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "no content");
     return true;
-}
-
-fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpRequest {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    errdefer buf.deinit();
-
-    var scratch: [4096]u8 = undefined;
-    var header_end: ?usize = null;
-    var content_length: usize = 0;
-
-    while (true) {
-        const read_n = std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(std.time.ns_per_ms);
-                continue;
-            },
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.SocketNotConnected,
-            => break,
-            else => return err,
-        };
-        if (read_n == 0) break;
-        try buf.appendSlice(scratch[0..read_n]);
-
-        if (header_end == null) {
-            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |idx| {
-                header_end = idx + 4;
-                content_length = parseContentLength(buf.items[0..idx]) orelse 0;
-            }
-        }
-
-        if (header_end) |end_idx| {
-            if (buf.items.len >= end_idx + content_length) break;
-        }
-
-        if (buf.items.len > 16 * 1024 * 1024) return error.RequestTooLarge;
-    }
-
-    const raw = try buf.toOwnedSlice();
-
-    const end_idx = header_end orelse return error.InvalidHttpRequest;
-    const first_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.InvalidHttpRequest;
-
-    const line = raw[0..first_line_end];
-    var line_it = std.mem.splitScalar(u8, line, ' ');
-    const method = line_it.next() orelse return error.InvalidHttpRequest;
-    const path = line_it.next() orelse return error.InvalidHttpRequest;
-
-    const body_end = end_idx + content_length;
-    if (body_end > raw.len) return error.InvalidHttpRequest;
-    const headers_start = first_line_end + 2;
-    const headers_end = end_idx - 4;
-    const headers = if (headers_start <= headers_end) raw[headers_start..headers_end] else "";
-
-    return .{
-        .raw = raw,
-        .method = method,
-        .path = path,
-        .headers = headers,
-        .body = raw[end_idx..body_end],
-    };
-}
-
-fn parseContentLength(headers: []const u8) ?usize {
-    var it = std.mem.splitSequence(u8, headers, "\r\n");
-    while (it.next()) |line| {
-        const sep = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const key = std.mem.trim(u8, line[0..sep], " \t");
-        if (!std.ascii.eqlIgnoreCase(key, "Content-Length")) continue;
-
-        const value = std.mem.trim(u8, line[sep + 1 ..], " \t");
-        return std.fmt.parseInt(usize, value, 10) catch null;
-    }
-    return null;
-}
-
-fn writeHttpResponse(stream: std.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
-    var header_buf: [512]u8 = undefined;
-    const status_text = switch (status) {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        else => "OK",
-    };
-
-    const header = try std.fmt.bufPrint(
-        &header_buf,
-        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-        .{ status, status_text, content_type, body.len },
-    );
-
-    try WindowState.writeSocketAll(stream.handle, header);
-    try WindowState.writeSocketAll(stream.handle, body);
-}
-
-fn contentTypeForPath(path: []const u8) []const u8 {
-    const ext = std.fs.path.extension(path);
-    if (std.mem.eql(u8, ext, ".html") or std.mem.eql(u8, ext, ".htm")) return "text/html; charset=utf-8";
-    if (std.mem.eql(u8, ext, ".js")) return "application/javascript; charset=utf-8";
-    if (std.mem.eql(u8, ext, ".css")) return "text/css; charset=utf-8";
-    if (std.mem.eql(u8, ext, ".json")) return "application/json; charset=utf-8";
-    if (std.mem.eql(u8, ext, ".svg")) return "image/svg+xml";
-    if (std.mem.eql(u8, ext, ".png")) return "image/png";
-    if (std.mem.eql(u8, ext, ".jpg") or std.mem.eql(u8, ext, ".jpeg")) return "image/jpeg";
-    return "application/octet-stream";
-}
-
-fn readAllFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-
-    var scratch: [4096]u8 = undefined;
-    while (true) {
-        const n = if (builtin.os.tag == .windows)
-            std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
-                error.WouldBlock => {
-                    std.Thread.sleep(std.time.ns_per_ms);
-                    continue;
-                },
-                error.ConnectionResetByPeer,
-                error.ConnectionTimedOut,
-                error.SocketNotConnected,
-                => break,
-                else => return err,
-            }
-        else
-            stream.read(&scratch) catch |err| switch (err) {
-                error.WouldBlock => {
-                    std.Thread.sleep(std.time.ns_per_ms);
-                    continue;
-                },
-                error.ConnectionResetByPeer,
-                error.ConnectionTimedOut,
-                error.SocketNotConnected,
-                => break,
-                else => return err,
-            };
-        if (n == 0) break;
-        if (out.items.len + n > max_bytes) return error.ResponseTooLarge;
-        try out.appendSlice(scratch[0..n]);
-    }
-
-    return out.toOwnedSlice();
-}
-
-fn httpRoundTrip(
-    allocator: std.mem.Allocator,
-    port: u16,
-    method: []const u8,
-    path: []const u8,
-    body: ?[]const u8,
-) ![]u8 {
-    return httpRoundTripWithHeaders(allocator, port, method, path, body, &.{});
-}
-
-fn httpRoundTripWithHeaders(
-    allocator: std.mem.Allocator,
-    port: u16,
-    method: []const u8,
-    path: []const u8,
-    body: ?[]const u8,
-    extra_headers: []const []const u8,
-) ![]u8 {
-    const address = try std.net.Address.parseIp4("127.0.0.1", port);
-    const stream = try std.net.tcpConnectToAddress(address);
-    defer stream.close();
-
-    var extra = std.array_list.Managed(u8).init(allocator);
-    defer extra.deinit();
-    for (extra_headers) |header| {
-        try extra.appendSlice(header);
-        try extra.appendSlice("\r\n");
-    }
-
-    const request = if (body) |b|
-        try std.fmt.allocPrint(
-            allocator,
-            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-            .{ method, path, extra.items, b.len, b },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Connection: close\r\n\r\n",
-            .{ method, path, extra.items },
-        );
-    defer allocator.free(request);
-
-    try stream.writeAll(request);
-    return readAllFromStream(allocator, stream, 1024 * 1024);
-}
-
-fn readHttpHeadersFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-
-    var scratch: [512]u8 = undefined;
-    while (out.items.len < max_bytes) {
-        const n = std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(std.time.ns_per_ms);
-                continue;
-            },
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.SocketNotConnected,
-            => break,
-            else => return err,
-        };
-        if (n == 0) break;
-        if (out.items.len + n > max_bytes) return error.ResponseTooLarge;
-        try out.appendSlice(scratch[0..n]);
-        if (std.mem.indexOf(u8, out.items, "\r\n\r\n") != null) break;
-    }
-
-    return out.toOwnedSlice();
-}
-
-fn httpResponseBody(response: []const u8) []const u8 {
-    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
-    return response[header_end + 4 ..];
 }
 
 test "window lifecycle" {
@@ -5824,7 +4622,7 @@ test "service requirement listing and probe are available before show" {
     try std.testing.expect(found_native);
 }
 
-test "async rpc jobs support poll and cancel" {
+test "rpc route returns value directly with threaded default dispatcher" {
     const DemoRpc = struct {
         pub fn delayedAdd(a: i64, b: i64, delay_ms: i64) i64 {
             const delay = if (delay_ms < 0) @as(u64, 0) else @as(u64, @intCast(delay_ms));
@@ -5845,112 +4643,23 @@ test "async rpc jobs support poll and cancel" {
     });
     defer app.deinit();
 
-    var win = try app.newWindow(.{ .title = "AsyncJobs" });
+    var win = try app.newWindow(.{ .title = "RpcThreadedDefault" });
     try win.bindRpc(DemoRpc, .{
         .bridge_options = .{ .rpc_route = "/webui/rpc" },
-        .execution_mode = .queued_async,
-        .job_poll_min_ms = 10,
-        .job_poll_max_ms = 40,
     });
-    try win.showHtml("<html><body>async-jobs</body></html>");
+    try win.showHtml("<html><body>rpc-threaded-default</body></html>");
     try app.run();
 
-    const first = try win.state().rpc_state.enqueueJob(gpa.allocator(), "{\"name\":\"delayedAdd\",\"args\":[20,22,40]}");
-    try std.testing.expectEqual(@as(RpcJobState, .queued), first.state);
-
-    var completed = false;
-    var attempts: usize = 0;
-    while (attempts < 120) : (attempts += 1) {
-        const status = try win.rpcPollJob(gpa.allocator(), first.id);
-        defer {
-            if (status.value_json) |value| gpa.allocator().free(value);
-            if (status.error_message) |msg| gpa.allocator().free(msg);
-        }
-
-        switch (status.state) {
-            .completed => {
-                completed = true;
-                try std.testing.expect(status.value_json != null);
-                try std.testing.expect(std.mem.indexOf(u8, status.value_json.?, "\"value\":42") != null);
-                break;
-            },
-            .failed, .timed_out, .canceled => return error.InvalidRpcResult,
-            else => std.Thread.sleep(5 * std.time.ns_per_ms),
-        }
-    }
-    try std.testing.expect(completed);
-
-    const blocker = try win.state().rpc_state.enqueueJob(gpa.allocator(), "{\"name\":\"delayedAdd\",\"args\":[1,1,220]}");
-    const queued = try win.state().rpc_state.enqueueJob(gpa.allocator(), "{\"name\":\"delayedAdd\",\"args\":[2,2,5]}");
-    _ = blocker;
-
-    try std.testing.expect(try win.rpcCancelJob(queued.id));
-    const canceled_status = try win.rpcPollJob(gpa.allocator(), queued.id);
-    defer {
-        if (canceled_status.value_json) |value| gpa.allocator().free(value);
-        if (canceled_status.error_message) |msg| gpa.allocator().free(msg);
-    }
-    try std.testing.expectEqual(@as(RpcJobState, .canceled), canceled_status.state);
-}
-
-test "async rpc job enqueue via http with status and cancel via API" {
-    const DemoRpc = struct {
-        pub fn ping() []const u8 {
-            return "pong";
-        }
-    };
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    var app = try App.init(gpa.allocator(), .{
-        .launch_policy = .{
-            .first = .web_url,
-            .second = null,
-            .third = null,
-        },
-    });
-    defer app.deinit();
-
-    var win = try app.newWindow(.{ .title = "AsyncRouteRoundtrip" });
-    try win.bindRpc(DemoRpc, .{
-        .bridge_options = .{ .rpc_route = "/webui/rpc" },
-        .execution_mode = .queued_async,
-    });
-    try win.showHtml("<html><body>async-route-roundtrip</body></html>");
-    try app.run();
-
-    const enqueue_response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"ping\",\"args\":[]}");
-    defer gpa.allocator().free(enqueue_response);
-    try std.testing.expect(std.mem.indexOf(u8, enqueue_response, "\"job_id\":") != null);
-
-    const body = httpResponseBody(enqueue_response);
-    var parsed = try std.json.parseFromSlice(std.json.Value, gpa.allocator(), body, .{});
-    defer parsed.deinit();
-    const job_id_value = parsed.value.object.get("job_id") orelse return error.InvalidHttpRequest;
-    const job_id: u64 = switch (job_id_value) {
-        .integer => |v| @as(u64, @intCast(v)),
-        .float => |v| @as(u64, @intFromFloat(v)),
-        else => return error.InvalidHttpRequest,
-    };
-
-    var done = false;
-    var attempts: usize = 0;
-    while (attempts < 80) : (attempts += 1) {
-        const status = try win.rpcPollJob(gpa.allocator(), job_id);
-        defer {
-            if (status.value_json) |value| gpa.allocator().free(value);
-            if (status.error_message) |msg| gpa.allocator().free(msg);
-        }
-        if (status.state == .completed) {
-            done = true;
-            break;
-        }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
-    }
-    try std.testing.expect(done);
-
-    try std.testing.expect(!try win.rpcCancelJob(job_id));
+    const response = try httpRoundTrip(
+        gpa.allocator(),
+        win.state().server_port,
+        "POST",
+        "/webui/rpc",
+        "{\"name\":\"delayedAdd\",\"args\":[20,22,10]}",
+    );
+    defer gpa.allocator().free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"value\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"job_id\"") == null);
 }
 
 test "threaded dispatcher stress handles concurrent http rpc requests" {
