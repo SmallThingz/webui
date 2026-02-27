@@ -20,6 +20,10 @@ pub const Symbols = struct {
     gtk_window_new_gtk3: ?*const fn (c_int) callconv(.c) ?*common.GtkWidget = null,
     gtk_window_new_gtk4: ?*const fn () callconv(.c) ?*common.GtkWidget = null,
     gtk_window_set_child: ?*const fn (*common.GtkWindow, ?*common.GtkWidget) callconv(.c) void = null,
+    gtk_frame_new: ?*const fn (?[*:0]const u8) callconv(.c) ?*common.GtkWidget = null,
+    gtk_frame_set_child: ?*const fn (*common.GtkFrame, ?*common.GtkWidget) callconv(.c) void = null,
+    gtk_widget_set_hexpand: ?*const fn (*common.GtkWidget, c_int) callconv(.c) void = null,
+    gtk_widget_set_vexpand: ?*const fn (*common.GtkWidget, c_int) callconv(.c) void = null,
 
     gtk_window_set_title: *const fn (*common.GtkWindow, [*:0]const u8) callconv(.c) void,
     gtk_window_set_default_size: *const fn (*common.GtkWindow, c_int, c_int) callconv(.c) void,
@@ -47,17 +51,12 @@ pub const Symbols = struct {
     gtk_widget_destroy: ?*const fn (*common.GtkWidget) callconv(.c) void = null,
     gtk_window_destroy: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
     gtk_window_close: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
-    gtk_widget_set_name: ?*const fn (*common.GtkWidget, [*:0]const u8) callconv(.c) void = null,
-    gtk_widget_add_css_class: ?*const fn (*common.GtkWidget, [*:0]const u8) callconv(.c) void = null,
     gtk_widget_set_overflow: ?*const fn (*common.GtkWidget, c_int) callconv(.c) void = null,
     gtk_widget_set_opacity: ?*const fn (*common.GtkWidget, f64) callconv(.c) void = null,
     gtk_widget_get_native: ?*const fn (*common.GtkWidget) callconv(.c) ?*common.GtkNative = null,
     gtk_native_get_surface: ?*const fn (*common.GtkNative) callconv(.c) ?*common.GdkSurface = null,
+    gdk_surface_set_input_region: ?*const fn (*common.GdkSurface, ?*common.cairo_region_t) callconv(.c) void = null,
     gdk_surface_set_opaque_region: ?*const fn (*common.GdkSurface, ?*common.cairo_region_t) callconv(.c) void = null,
-    gdk_display_get_default: ?*const fn () callconv(.c) ?*common.GdkDisplay = null,
-    gtk_css_provider_new: ?*const fn () callconv(.c) ?*common.GtkCssProvider = null,
-    gtk_css_provider_load_from_data: ?*const fn (*common.GtkCssProvider, [*:0]const u8, isize) callconv(.c) void = null,
-    gtk_style_context_add_provider_for_display: ?*const fn (*common.GdkDisplay, *common.GtkStyleProvider, c_uint) callconv(.c) void = null,
 
     webkit_web_view_new: *const fn () callconv(.c) ?*common.GtkWidget,
     webkit_web_view_load_uri: *const fn (*common.WebKitWebView, [*:0]const u8) callconv(.c) void,
@@ -127,13 +126,32 @@ pub const Symbols = struct {
         };
     }
 
-    pub fn addWindowChild(self: *const Symbols, window_widget: *common.GtkWidget, child_widget: *common.GtkWidget) void {
+    pub fn addWindowChild(self: *const Symbols, window_widget: *common.GtkWidget, child_widget: *common.GtkWidget) ?*common.GtkWidget {
         switch (self.gtk_api) {
             .gtk3 => {
                 if (self.gtk_container_add) |add| add(@ptrCast(window_widget), child_widget);
+                return child_widget;
             },
             .gtk4 => {
+                if (self.gtk_frame_new) |frame_new| {
+                    if (frame_new(null)) |frame_widget| {
+                        if (self.gtk_widget_set_hexpand) |set_hexpand| {
+                            set_hexpand(frame_widget, 1);
+                            set_hexpand(child_widget, 1);
+                        }
+                        if (self.gtk_widget_set_vexpand) |set_vexpand| {
+                            set_vexpand(frame_widget, 1);
+                            set_vexpand(child_widget, 1);
+                        }
+                        if (self.gtk_frame_set_child) |set_frame_child| {
+                            set_frame_child(@ptrCast(frame_widget), child_widget);
+                        }
+                        if (self.gtk_window_set_child) |set_child| set_child(@ptrCast(window_widget), frame_widget);
+                        return frame_widget;
+                    }
+                }
                 if (self.gtk_window_set_child) |set_child| set_child(@ptrCast(window_widget), child_widget);
+                return child_widget;
             },
         }
     }
@@ -214,40 +232,88 @@ pub const Symbols = struct {
         const radius: u16 = style.corner_radius orelse 0;
         const overflow_value: c_int = if (radius > 0) common.GTK_OVERFLOW_HIDDEN else common.GTK_OVERFLOW_VISIBLE;
 
-        if (self.gtk_widget_set_name) |set_name| set_name(window_widget, "webui-native-window");
-        if (self.gtk_widget_add_css_class) |add_class| {
-            add_class(window_widget, "webui-native-window");
-            if (webview_widget) |webview| {
-                add_class(webview, "webui-native-webview");
-            }
-        }
         if (self.gtk_widget_set_overflow) |set_overflow| set_overflow(window_widget, overflow_value);
+        if (self.gtk_widget_set_overflow) |set_overflow| {
+            if (webview_widget) |webview| set_overflow(webview, overflow_value);
+        }
+        self.applyGtk4RoundedSurface(window_widget, style.corner_radius, style.transparent);
+    }
 
-        if (self.gdk_display_get_default) |get_display| {
-            if (get_display()) |display| {
-                if (self.gtk_css_provider_new) |provider_new| {
-                    if (provider_new()) |provider| {
-                        defer if (self.g_object_unref) |unref| unref(provider);
-                        if (self.gtk_css_provider_load_from_data) |load_css| {
-                            if (self.gtk_style_context_add_provider_for_display) |add_provider| {
-                                var css_buf: [640]u8 = undefined;
-                                const alpha_text = if (style.transparent) "0.0" else "1.0";
-                                const css = std.fmt.bufPrintZ(
-                                    &css_buf,
-                                    ".webui-native-window{{border-radius:{d}px;background-color:rgba(0,0,0,{s});}}" ++ ".webui-native-window>*{{border-radius:{d}px;background-color:transparent;}}" ++ ".webui-native-webview{{border-radius:{d}px;background-color:transparent;}}",
-                                    .{ radius, alpha_text, radius, radius },
-                                ) catch return;
-                                load_css(provider, css.ptr, @as(isize, @intCast(css.len)));
-                                add_provider(
-                                    display,
-                                    @ptrCast(provider),
-                                    common.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
-                                );
-                            }
-                        }
-                    }
-                }
+    pub fn applyGtk4RoundedSurface(
+        self: *const Symbols,
+        window_widget: *common.GtkWidget,
+        corner_radius: ?u16,
+        transparent: bool,
+    ) void {
+        if (self.gtk_api != .gtk4) return;
+        const get_native = self.gtk_widget_get_native orelse return;
+        const get_surface = self.gtk_native_get_surface orelse return;
+        const native = get_native(window_widget) orelse return;
+        const surface = get_surface(native) orelse return;
+
+        const width = self.gtk_widget_get_allocated_width(window_widget);
+        const height = self.gtk_widget_get_allocated_height(window_widget);
+        if (width <= 0 or height <= 0) return;
+
+        const radius_raw: u16 = corner_radius orelse 0;
+        const radius_i: c_int = @as(c_int, @intCast(radius_raw));
+        if (radius_i <= 0) {
+            if (self.gdk_surface_set_input_region) |set_input| set_input(surface, null);
+            if (self.gdk_surface_set_opaque_region) |set_opaque| {
+                if (transparent) set_opaque(surface, null);
             }
+            return;
+        }
+
+        if (self.gdk_cairo_region_create_from_surface == null or
+            self.cairo_image_surface_create == null or
+            self.cairo_surface_destroy == null or
+            self.cairo_create == null or
+            self.cairo_destroy == null or
+            self.cairo_set_source_rgba == null or
+            self.cairo_paint == null or
+            self.cairo_new_path == null or
+            self.cairo_arc == null or
+            self.cairo_close_path == null or
+            self.cairo_rectangle == null or
+            self.cairo_fill == null or
+            self.cairo_region_destroy == null)
+        {
+            return;
+        }
+
+        const max_radius = @min(@divTrunc(width, 2), @divTrunc(height, 2));
+        const radius = @min(radius_i, max_radius);
+        if (radius <= 0) return;
+
+        const surface_img = self.cairo_image_surface_create.?(common.CAIRO_FORMAT_A8, width, height) orelse return;
+        defer self.cairo_surface_destroy.?(surface_img);
+        const cr = self.cairo_create.?(surface_img) orelse return;
+        defer self.cairo_destroy.?(cr);
+
+        self.cairo_set_source_rgba.?(cr, 0.0, 0.0, 0.0, 0.0);
+        self.cairo_paint.?(cr);
+        self.cairo_set_source_rgba.?(cr, 1.0, 1.0, 1.0, 1.0);
+
+        const w = @as(f64, @floatFromInt(width));
+        const h = @as(f64, @floatFromInt(height));
+        const r = @as(f64, @floatFromInt(radius));
+        const pi = std.math.pi;
+
+        self.cairo_new_path.?(cr);
+        self.cairo_arc.?(cr, w - r, r, r, -pi / 2.0, 0.0);
+        self.cairo_arc.?(cr, w - r, h - r, r, 0.0, pi / 2.0);
+        self.cairo_arc.?(cr, r, h - r, r, pi / 2.0, pi);
+        self.cairo_arc.?(cr, r, r, r, pi, pi * 1.5);
+        self.cairo_close_path.?(cr);
+        self.cairo_fill.?(cr);
+
+        const region = self.gdk_cairo_region_create_from_surface.?(surface_img) orelse return;
+        defer self.cairo_region_destroy.?(region);
+
+        if (self.gdk_surface_set_input_region) |set_input| set_input(surface, region);
+        if (self.gdk_surface_set_opaque_region) |set_opaque| {
+            if (transparent) set_opaque(surface, null) else set_opaque(surface, region);
         }
     }
 
@@ -342,6 +408,10 @@ pub const Symbols = struct {
         self.gtk_window_new_gtk3 = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_new_gtk3), "gtk_window_new");
         self.gtk_window_new_gtk4 = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_new_gtk4), "gtk_window_new");
         self.gtk_window_set_child = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_set_child), "gtk_window_set_child");
+        self.gtk_frame_new = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_frame_new), "gtk_frame_new");
+        self.gtk_frame_set_child = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_frame_set_child), "gtk_frame_set_child");
+        self.gtk_widget_set_hexpand = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_hexpand), "gtk_widget_set_hexpand");
+        self.gtk_widget_set_vexpand = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_vexpand), "gtk_widget_set_vexpand");
 
         self.gtk_window_set_title = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_set_title), "gtk_window_set_title");
         self.gtk_window_set_default_size = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_set_default_size), "gtk_window_set_default_size");
@@ -369,17 +439,12 @@ pub const Symbols = struct {
         self.gtk_widget_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_destroy), "gtk_widget_destroy");
         self.gtk_window_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_destroy), "gtk_window_destroy");
         self.gtk_window_close = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_close), "gtk_window_close");
-        self.gtk_widget_set_name = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_name), "gtk_widget_set_name");
-        self.gtk_widget_add_css_class = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_add_css_class), "gtk_widget_add_css_class");
         self.gtk_widget_set_overflow = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_overflow), "gtk_widget_set_overflow");
         self.gtk_widget_set_opacity = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_set_opacity), "gtk_widget_set_opacity");
         self.gtk_widget_get_native = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_get_native), "gtk_widget_get_native");
         self.gtk_native_get_surface = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_native_get_surface), "gtk_native_get_surface");
+        self.gdk_surface_set_input_region = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_set_input_region), "gdk_surface_set_input_region");
         self.gdk_surface_set_opaque_region = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_surface_set_opaque_region), "gdk_surface_set_opaque_region");
-        self.gdk_display_get_default = lookupOptionalSym(&self.gdk, @TypeOf(self.gdk_display_get_default), "gdk_display_get_default");
-        self.gtk_css_provider_new = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_css_provider_new), "gtk_css_provider_new");
-        self.gtk_css_provider_load_from_data = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_css_provider_load_from_data), "gtk_css_provider_load_from_data");
-        self.gtk_style_context_add_provider_for_display = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_style_context_add_provider_for_display), "gtk_style_context_add_provider_for_display");
 
         self.webkit_web_view_new = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_new), "webkit_web_view_new");
         self.webkit_web_view_load_uri = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_load_uri), "webkit_web_view_load_uri");

@@ -6,6 +6,7 @@ pub const WindowControl = window_style_types.WindowControl;
 pub const GtkWidget = opaque {};
 pub const GtkWindow = opaque {};
 pub const GtkContainer = opaque {};
+pub const GtkFrame = opaque {};
 pub const GdkScreen = opaque {};
 pub const GdkVisual = opaque {};
 pub const GdkDisplay = opaque {};

@@ -38,6 +38,7 @@ pub const Host = struct {
 
     symbols: ?Symbols = null,
     window_widget: ?*common.GtkWidget = null,
+    content_widget: ?*common.GtkWidget = null,
     webview: ?*common.WebKitWebView = null,
     main_loop: ?*common.GMainLoop = null,
 
@@ -218,7 +219,10 @@ fn threadMain(host: *Host) void {
     const width: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.width)) else default_width;
     const height: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.height)) else default_height;
     symbols.gtk_window_set_default_size(window, width, height);
-    symbols.addWindowChild(window_widget, webview_widget);
+    const content_widget = symbols.addWindowChild(window_widget, webview_widget) orelse {
+        failStartup(host, error.NativeBackendUnavailable);
+        return;
+    };
 
     const main_loop = symbols.g_main_loop_new(null, 0) orelse {
         log.err("g_main_loop_new returned null", .{});
@@ -228,6 +232,7 @@ fn threadMain(host: *Host) void {
 
     host.mutex.lock();
     host.window_widget = window_widget;
+    host.content_widget = content_widget;
     host.webview = webview;
     host.main_loop = main_loop;
     host.mutex.unlock();
@@ -235,7 +240,10 @@ fn threadMain(host: *Host) void {
     applyStyleUiThread(host, host.style);
     connectWindowSignals(symbols, window_widget, host);
 
-    symbols.showWindow(window_widget, webview_widget);
+    symbols.showWindow(window_widget, content_widget);
+    if (content_widget != webview_widget) {
+        symbols.gtk_widget_show(webview_widget);
+    }
 
     host.mutex.lock();
     host.ui_ready = true;
@@ -251,10 +259,10 @@ fn threadMain(host: *Host) void {
 
 fn connectWindowSignals(symbols: *const Symbols, window_widget: *common.GtkWidget, host: *Host) void {
     _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "destroy", @ptrCast(&onDestroy), host, null, 0);
-    // GTK4 changed the size-allocate ABI; keep GTK3-only callbacks off GTK4 to
-    // avoid undefined behavior from mismatched callback signatures.
+    // Keep realize callback for all GTK variants so style/transparency can be
+    // re-applied once the native surface exists. GTK4 size-allocate ABI differs.
+    _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "realize", @ptrCast(&onRealize), host, null, 0);
     if (symbols.gtk_api == .gtk3) {
-        _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "realize", @ptrCast(&onRealize), host, null, 0);
         _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "size-allocate", @ptrCast(&onSizeAllocate), host, null, 0);
     }
 }
@@ -282,6 +290,7 @@ fn finishThreadShutdown(host: *Host) void {
     host.closed.store(true, .release);
     host.ui_ready = false;
     host.window_widget = null;
+    host.content_widget = null;
     host.webview = null;
     if (host.main_loop) |loop_ptr| {
         if (host.symbols) |symbols| {
@@ -329,6 +338,9 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     host.mutex.lock();
     defer host.mutex.unlock();
     const symbols = host.symbols orelse return;
+    const clip_widget = host.content_widget orelse window_widget;
+    symbols.applyTransparentVisual(window_widget);
+    symbols.applyGtk4WindowStyle(window_widget, clip_widget, host.style);
     applyRoundedShape(&symbols, host.style.corner_radius, window_widget);
 }
 
@@ -422,9 +434,9 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         else
             common.GdkRGBA{ .red = 1.0, .green = 1.0, .blue = 1.0, .alpha = 1.0 };
         symbols.webkit_web_view_set_background_color(webview, &bg);
-        symbols.applyGtk4WindowStyle(window_widget, @ptrCast(webview), style);
+        symbols.applyGtk4WindowStyle(window_widget, host.content_widget orelse @ptrCast(webview), style);
     } else {
-        symbols.applyGtk4WindowStyle(window_widget, null, style);
+        symbols.applyGtk4WindowStyle(window_widget, host.content_widget orelse window_widget, style);
     }
 
     applyRoundedShape(&symbols, style.corner_radius, window_widget);
