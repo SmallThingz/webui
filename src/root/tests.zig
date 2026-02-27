@@ -753,6 +753,30 @@ test "window_closing lifecycle pending close cancels on websocket reconnect" {
     try std.testing.expect(!close_after_reconnect);
 }
 
+test "window_closing lifecycle message is ignored in web-url mode without tracked pid" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "LifecycleCloseWebUrlNoPid" });
+    try win.showHtml("<html><body>lifecycle-close-web-url-no-pid</body></html>");
+    try app.run();
+
+    win.state().state_mutex.lock();
+    win.state().runtime_render_state.active_surface = .web_url;
+    win.state().requestLifecycleCloseFromFrontend();
+    const pending = win.state().lifecycle_close_pending;
+    const should_close = win.state().close_requested.load(.acquire);
+    win.state().state_mutex.unlock();
+
+    try std.testing.expect(!pending);
+    try std.testing.expect(!should_close);
+}
+
 test "non-linked tracked browser pid death detaches without close in web mode" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
