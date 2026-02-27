@@ -38,6 +38,7 @@ pub const Host = struct {
     symbols: ?Symbols = null,
     window_widget: ?*common.GtkWidget = null,
     webview: ?*common.WebKitWebView = null,
+    main_loop: ?*common.GMainLoop = null,
 
     startup_done: bool = false,
     startup_error: ?anyerror = null,
@@ -171,9 +172,9 @@ fn threadMain(host: *Host) void {
     host.mutex.unlock();
 
     const symbols = &host.symbols.?;
-    symbols.gtk_init(null, null);
+    symbols.initToolkit();
 
-    const window_widget = symbols.gtk_window_new(common.GTK_WINDOW_TOPLEVEL) orelse {
+    const window_widget = symbols.newTopLevelWindow() orelse {
         failStartup(host, error.NativeBackendUnavailable);
         return;
     };
@@ -195,17 +196,23 @@ fn threadMain(host: *Host) void {
     const width: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.width)) else default_width;
     const height: c_int = if (host.style.size) |size| @as(c_int, @intCast(size.height)) else default_height;
     symbols.gtk_window_set_default_size(window, width, height);
-    symbols.gtk_container_add(@ptrCast(window_widget), webview_widget);
+    symbols.addWindowChild(window_widget, webview_widget);
+
+    const main_loop = symbols.g_main_loop_new(null, 0) orelse {
+        failStartup(host, error.NativeBackendUnavailable);
+        return;
+    };
 
     host.mutex.lock();
     host.window_widget = window_widget;
     host.webview = webview;
+    host.main_loop = main_loop;
     host.mutex.unlock();
 
     applyStyleUiThread(host, host.style);
     connectWindowSignals(symbols, window_widget, host);
 
-    symbols.gtk_widget_show_all(window_widget);
+    symbols.showWindow(window_widget, webview_widget);
 
     host.mutex.lock();
     host.ui_ready = true;
@@ -213,7 +220,9 @@ fn threadMain(host: *Host) void {
     host.cond.broadcast();
     host.mutex.unlock();
 
-    symbols.gtk_main();
+    if (host.main_loop) |loop_ptr| {
+        symbols.g_main_loop_run(loop_ptr);
+    }
     finishThreadShutdown(host);
 }
 
@@ -246,6 +255,12 @@ fn finishThreadShutdown(host: *Host) void {
     host.ui_ready = false;
     host.window_widget = null;
     host.webview = null;
+    if (host.main_loop) |loop_ptr| {
+        if (host.symbols) |symbols| {
+            symbols.g_main_loop_unref(loop_ptr);
+        }
+    }
+    host.main_loop = null;
 
     for (host.queue.items) |*cmd| cmd.deinit(host.allocator);
     host.queue.clearRetainingCapacity();
@@ -272,7 +287,9 @@ fn onDestroy(_: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     defer typed.mutex.unlock();
     typed.closed.store(true, .release);
     typed.shutdown_requested = true;
-    if (typed.symbols) |symbols| symbols.gtk_main_quit();
+    if (typed.symbols) |symbols| {
+        if (typed.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
+    }
 }
 
 fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
@@ -342,7 +359,7 @@ fn executeUiCommand(host: *Host, command: *Command) void {
             if (host.window_widget) |window_widget| {
                 symbols.gtk_widget_destroy(window_widget);
             }
-            symbols.gtk_main_quit();
+            if (host.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
         },
     }
 }
@@ -362,18 +379,13 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     }
 
     if (style.center or style.position == null) {
-        symbols.gtk_window_set_position(window, common.GTK_WIN_POS_CENTER);
+        symbols.setWindowPositionCenter(window);
     } else if (style.position) |pos| {
-        symbols.gtk_window_move(window, @as(c_int, @intCast(pos.x)), @as(c_int, @intCast(pos.y)));
+        symbols.setWindowPosition(window, @as(c_int, @intCast(pos.x)), @as(c_int, @intCast(pos.y)));
     }
 
     if (style.transparent) {
-        symbols.gtk_widget_set_app_paintable(window_widget, 1);
-        if (symbols.gtk_widget_get_screen(window_widget)) |screen| {
-            if (symbols.gdk_screen_get_rgba_visual(screen)) |rgba_visual| {
-                symbols.gtk_widget_set_visual(window_widget, rgba_visual);
-            }
-        }
+        symbols.applyTransparentVisual(window_widget);
     }
 
     if (host.webview) |webview| {
@@ -399,7 +411,7 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
     const window: *common.GtkWindow = @ptrCast(window_widget);
 
     switch (cmd) {
-        .minimize => symbols.gtk_window_iconify(window),
+        .minimize => symbols.minimizeWindow(window),
         .maximize => symbols.gtk_window_maximize(window),
         .restore => {
             symbols.gtk_window_unmaximize(window);
@@ -408,7 +420,7 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
         .close => {
             host.shutdown_requested = true;
             symbols.gtk_widget_destroy(window_widget);
-            symbols.gtk_main_quit();
+            if (host.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
         },
         .hide => symbols.gtk_widget_hide(window_widget),
         .show => symbols.gtk_widget_show(window_widget),

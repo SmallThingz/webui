@@ -53,6 +53,9 @@ const SWP_FRAMECHANGED: u32 = 0x0020;
 const LWA_ALPHA: u32 = 0x00000002;
 
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
+const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+const webview2_bg_env_name = std.unicode.utf8ToUtf16LeStringLiteral("WEBVIEW2_DEFAULT_BACKGROUND_COLOR");
+const webview2_bg_env_zero = std.unicode.utf8ToUtf16LeStringLiteral("0");
 
 const window_class_name = std.unicode.utf8ToUtf16LeStringLiteral("WebUiZigHost");
 
@@ -120,6 +123,7 @@ const WNDCLASSEXW = extern struct {
 extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) wv2.HRESULT;
 extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 extern "ole32" fn CoTaskMemFree(?*anyopaque) callconv(.winapi) void;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
 extern "user32" fn RegisterClassExW(*const WNDCLASSEXW) callconv(.winapi) win.ATOM;
 extern "user32" fn UnregisterClassW(win.LPCWSTR, ?win.HINSTANCE) callconv(.winapi) win.BOOL;
@@ -331,14 +335,18 @@ fn threadMain(host: *Host) void {
         return;
     };
 
+    if (!createWebViewEnvironment(host)) {
+        _ = DestroyWindow(hwnd);
+        failStartup(host, error.NativeBackendUnavailable);
+        return;
+    }
+
     host.mutex.lock();
     host.hwnd = hwnd;
     host.ui_ready = true;
     host.startup_done = true;
     host.cond.broadcast();
     host.mutex.unlock();
-
-    _ = createWebViewEnvironment(host);
 
     if (host.style.hidden) {
         _ = ShowWindow(hwnd, SW_HIDE);
@@ -404,7 +412,14 @@ fn registerWindowClass(host: *Host) bool {
         .hIconSm = null,
     };
 
-    if (RegisterClassExW(&wc) == 0) return false;
+    const atom = RegisterClassExW(&wc);
+    if (atom == 0) {
+        if (GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
+            host.class_registered = false;
+            return true;
+        }
+        return false;
+    }
     host.class_registered = true;
     return true;
 }
@@ -618,6 +633,12 @@ fn computeWindowStyle(style: WindowStyle) u32 {
 
 fn createWebViewEnvironment(host: *Host) bool {
     const symbols = host.symbols orelse return false;
+
+    if (host.style.transparent) {
+        _ = std.os.windows.kernel32.SetEnvironmentVariableW(webview2_bg_env_name, webview2_bg_env_zero);
+    } else {
+        _ = std.os.windows.kernel32.SetEnvironmentVariableW(webview2_bg_env_name, null);
+    }
 
     var env_handler = host.allocator.create(EnvironmentCompletedHandler) catch return false;
     env_handler.* = .{
@@ -941,4 +962,27 @@ test "runtimeAvailable false on non-windows targets" {
     if (builtin.os.tag != .windows) {
         try std.testing.expect(!runtimeAvailable());
     }
+}
+
+test "computeWindowStyle maps frameless and resizable flags" {
+    const frameless_fixed = computeWindowStyle(.{
+        .frameless = true,
+        .resizable = false,
+    });
+    try std.testing.expect((frameless_fixed & WS_POPUP) != 0);
+    try std.testing.expect((frameless_fixed & WS_THICKFRAME) == 0);
+
+    const frameless_resizable = computeWindowStyle(.{
+        .frameless = true,
+        .resizable = true,
+    });
+    try std.testing.expect((frameless_resizable & WS_POPUP) != 0);
+    try std.testing.expect((frameless_resizable & WS_THICKFRAME) != 0);
+
+    const classic_fixed = computeWindowStyle(.{
+        .frameless = false,
+        .resizable = false,
+    });
+    try std.testing.expect((classic_fixed & WS_THICKFRAME) == 0);
+    try std.testing.expect((classic_fixed & WS_MAXIMIZEBOX) == 0);
 }

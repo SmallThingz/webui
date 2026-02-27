@@ -194,6 +194,9 @@ fn threadMain(host: *Host) void {
         host.mutex.unlock();
     }
 
+    const startup_pool = host.symbols.?.autorelease_pool_push();
+    defer host.symbols.?.autorelease_pool_pop(startup_pool);
+
     if (!initializeApp(host)) {
         failStartup(host, error.NativeBackendUnavailable);
         return;
@@ -212,6 +215,9 @@ fn threadMain(host: *Host) void {
 
     var idle_ticks: usize = 0;
     while (true) {
+        const syms = host.symbols orelse break;
+        const pool = syms.autorelease_pool_push();
+
         var had_activity = false;
 
         drainCommandsUiThread(host, &had_activity);
@@ -230,7 +236,10 @@ fn threadMain(host: *Host) void {
         host.mutex.lock();
         const stop = host.shutdown_requested;
         host.mutex.unlock();
-        if (stop) break;
+        if (stop) {
+            syms.autorelease_pool_pop(pool);
+            break;
+        }
 
         if (!had_activity) {
             idle_ticks += 1;
@@ -240,6 +249,8 @@ fn threadMain(host: *Host) void {
         } else {
             idle_ticks = 0;
         }
+
+        syms.autorelease_pool_pop(pool);
     }
 
     cleanupUiThread(host);
@@ -497,7 +508,7 @@ fn pumpEvents(host: *Host) bool {
     const date_class = objcClass(host, "NSDate") orelse return false;
     const distant_past = msgSendId(host, date_class, sel(host, "distantPast")) orelse return false;
 
-    const default_mode = nsString(host, "kCFRunLoopDefaultMode") orelse return false;
+    const default_mode = nsString(host, "NSDefaultRunLoopMode") orelse return false;
 
     const event = msgSendIdU64IdIdBool(
         host,
@@ -671,4 +682,36 @@ test "runtimeAvailable false on non-macos targets" {
     if (builtin.os.tag != .macos) {
         try std.testing.expect(!runtimeAvailable());
     }
+}
+
+test "computeWindowStyleMask follows frameless and resizable flags" {
+    const frameless_fixed = computeWindowStyleMask(.{
+        .frameless = true,
+        .resizable = false,
+    });
+    try std.testing.expectEqual(@as(u64, NSWindowStyleMaskBorderless), frameless_fixed);
+
+    const frameless_resizable = computeWindowStyleMask(.{
+        .frameless = true,
+        .resizable = true,
+    });
+    try std.testing.expect((frameless_resizable & NSWindowStyleMaskResizable) != 0);
+
+    const classic_fixed = computeWindowStyleMask(.{
+        .frameless = false,
+        .resizable = false,
+    });
+    try std.testing.expect((classic_fixed & NSWindowStyleMaskTitled) != 0);
+    try std.testing.expect((classic_fixed & NSWindowStyleMaskResizable) == 0);
+}
+
+test "styleRect uses explicit size and position when provided" {
+    const rect = styleRect(.{
+        .size = .{ .width = 1234, .height = 777 },
+        .position = .{ .x = 42, .y = 84 },
+    });
+    try std.testing.expectEqual(@as(f64, 1234), rect.size.width);
+    try std.testing.expectEqual(@as(f64, 777), rect.size.height);
+    try std.testing.expectEqual(@as(f64, 42), rect.origin.x);
+    try std.testing.expectEqual(@as(f64, 84), rect.origin.y);
 }

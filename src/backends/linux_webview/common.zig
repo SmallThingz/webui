@@ -9,6 +9,7 @@ pub const GtkContainer = opaque {};
 pub const GdkScreen = opaque {};
 pub const GdkVisual = opaque {};
 pub const WebKitWebView = opaque {};
+pub const GMainLoop = opaque {};
 pub const cairo_region_t = opaque {};
 pub const cairo_t = opaque {};
 pub const cairo_surface_t = opaque {};
@@ -30,4 +31,3 @@ pub const GdkRGBA = extern struct {
 pub const GTK_WINDOW_TOPLEVEL: c_int = 0;
 pub const GTK_WIN_POS_CENTER: c_int = 1;
 pub const CAIRO_FORMAT_A8: c_int = 2;
-
