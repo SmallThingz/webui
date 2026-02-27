@@ -329,7 +329,17 @@ pub fn build(b: *Build) void {
         run_step.dependOn(&fail.step);
     }
 
-    const mod_tests = b.addTest(.{ .root_module = webui_mod });
+    const mod_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = false,
+            .imports = &.{
+                .{ .name = "webui", .module = webui_mod },
+            },
+        }),
+    });
     mod_tests.step.dependOn(runtime_helpers_assets.prepare_step);
     mod_tests.linkLibrary(webui_lib);
     const run_mod_tests = b.addRunArtifact(mod_tests);
