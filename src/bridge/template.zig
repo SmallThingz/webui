@@ -70,13 +70,14 @@ fn renderWithRuntimeHelpers(
         try writer.writeAll("])),\n");
     }
 
+    // Keep generated bridge JS usable from classic <script src="..."> loads.
+    // Do not emit ESM `export` statements here: examples and legacy pages rely
+    // on the global namespace binding being available immediately.
     try writer.writeAll("});\nif (typeof globalThis !== \"undefined\") { globalThis.");
     try writer.writeAll(options.namespace);
     try writer.writeAll(" = ");
     try writer.writeAll(options.namespace);
-    try writer.writeAll("; }\nexport default ");
-    try writer.writeAll(options.namespace);
-    try writer.writeAll(";\n");
+    try writer.writeAll("; }\n");
 
     return out.toOwnedSlice();
 }
@@ -127,7 +128,7 @@ pub fn renderComptime(comptime RpcStruct: type, comptime options: RenderOptions)
         out = out ++ "])),\n";
     }
 
-    out = out ++ "});\nif (typeof globalThis !== \"undefined\") { globalThis." ++ options.namespace ++ " = " ++ options.namespace ++ "; }\nexport default " ++ options.namespace ++ ";\n";
+    out = out ++ "});\nif (typeof globalThis !== \"undefined\") { globalThis." ++ options.namespace ++ " = " ++ options.namespace ++ "; }\n";
     return out;
 }
 
@@ -167,9 +168,6 @@ pub fn renderTypeScriptDeclarations(
     try writer.writeAll("export declare const ");
     try writer.writeAll(options.namespace);
     try writer.writeAll(": WebuiRpcClient;\n");
-    try writer.writeAll("export default ");
-    try writer.writeAll(options.namespace);
-    try writer.writeAll(";\n");
     try writer.writeAll("declare global {\n");
     try writer.writeAll("  var ");
     try writer.writeAll(options.namespace);
@@ -195,7 +193,6 @@ pub fn renderTypeScriptDeclarationsComptime(comptime RpcStruct: type, comptime o
     out = out ++
         "}\n" ++
         "export declare const " ++ options.namespace ++ ": WebuiRpcClient;\n" ++
-        "export default " ++ options.namespace ++ ";\n" ++
         "declare global {\n" ++
         "  var " ++ options.namespace ++ ": WebuiRpcClient;\n" ++
         "}\n";

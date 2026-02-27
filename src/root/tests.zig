@@ -1153,7 +1153,9 @@ test "typed rpc registration, invocation, and bridge generation" {
     const script = win.rpcClientScript();
     try std.testing.expect(std.mem.indexOf(u8, script, "sum: async (arg0, arg1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "__webuiRpcEndpoint = \"/webui/rpc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "globalThis.webuiRpc = webuiRpc") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "globalThis.__webuiWindowControl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "export default") == null);
 
     const written_path = try std.fmt.allocPrint(gpa.allocator(), ".zig-cache/test_bridge_written_{d}.js", .{std.time.nanoTimestamp()});
     defer gpa.allocator().free(written_path);

@@ -373,7 +373,7 @@ fn genericHtml(allocator: std.mem.Allocator, comptime kind: ExampleKind, title: 
     return std.mem.concat(allocator, u8, &.{
         "<!doctype html><html><head><meta charset=\"utf-8\"/><title>",
         title,
-        "</title><script type=\"module\" src=\"/webui_bridge.js\"></script><style>",
+        "</title><script src=\"/webui_bridge.js\"></script><style>",
         "*{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden}",
         "body{font-family:'Segoe UI',Tahoma,sans-serif;background:#0c1220;color:#e9eef8}",
         ".shell{height:100%;display:flex;flex-direction:column}",
@@ -450,15 +450,15 @@ const COMMON_SCRIPT =
     "document.getElementById('min')?.addEventListener('click',()=>control('minimize'));" ++
     "document.getElementById('max')?.addEventListener('click',()=>control(document.fullscreenElement?'restore':'maximize'));" ++
     "document.getElementById('close')?.addEventListener('click',()=>control('close'));" ++
-    "document.getElementById('ping')?.addEventListener('click',async()=>{try{out.textContent='ping => '+await webuiRpc.ping();}catch(e){out.textContent='ping failed: '+e;}});" ++
-    "document.getElementById('sum')?.addEventListener('click',async()=>{try{out.textContent='add(100,23) => '+await webuiRpc.add(100,23);}catch(e){out.textContent='add failed: '+e;}});" ++
-    "document.getElementById('wc')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='word_count => '+await webuiRpc.word_count(msg);}catch(e){out.textContent='word_count failed: '+e;}});" ++
-    "document.getElementById('save')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='save_note => '+await webuiRpc.save_note(msg);}catch(e){out.textContent='save_note failed: '+e;}});" ++
-    "document.getElementById('echo')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='echo => '+await webuiRpc.echo(msg);}catch(e){out.textContent='echo failed: '+e;}});" ++
-    "(async()=>{try{status.textContent='Backend: '+await webuiRpc.ping();}catch(e){status.textContent='Backend unavailable: '+e;}})();";
+    "document.getElementById('ping')?.addEventListener('click',async()=>{try{out.textContent='ping => '+await globalThis.webuiRpc.ping();}catch(e){out.textContent='ping failed: '+e;}});" ++
+    "document.getElementById('sum')?.addEventListener('click',async()=>{try{out.textContent='add(100,23) => '+await globalThis.webuiRpc.add(100,23);}catch(e){out.textContent='add failed: '+e;}});" ++
+    "document.getElementById('wc')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='word_count => '+await globalThis.webuiRpc.word_count(msg);}catch(e){out.textContent='word_count failed: '+e;}});" ++
+    "document.getElementById('save')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='save_note => '+await globalThis.webuiRpc.save_note(msg);}catch(e){out.textContent='save_note failed: '+e;}});" ++
+    "document.getElementById('echo')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='echo => '+await globalThis.webuiRpc.echo(msg);}catch(e){out.textContent='echo failed: '+e;}});" ++
+    "(async()=>{try{status.textContent='Backend: '+await globalThis.webuiRpc.ping();}catch(e){status.textContent='Backend unavailable: '+e;}})();";
 
 const HTML_FRAMELESS =
-    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Frameless</title><script type=\"module\" src=\"/webui_bridge.js\"></script>" ++
+    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Frameless</title><script src=\"/webui_bridge.js\"></script>" ++
     "<style>*{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden}body{font-family:'Segoe UI',sans-serif;background:transparent;color:#f5f5f5}" ++
     ".shell{height:100%;width:100%;background:rgba(24,24,28,.94);display:flex;flex-direction:column;overflow:hidden;backdrop-filter:blur(20px)}" ++
     ".title{height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 14px;background:rgba(0,0,0,.25);-webkit-app-region:drag;--webui-app-region:drag}" ++
@@ -466,7 +466,7 @@ const HTML_FRAMELESS =
     ".content{flex:1;padding:18px;overflow:auto}</style></head><body><div class=\"shell\"><div class=\"title\"><strong>Frameless Example</strong><div class=\"dots\"><button class=\"dot min\" id=\"min\"></button><button class=\"dot max\" id=\"max\"></button><button class=\"dot close\" id=\"close\"></button></div></div><div class=\"content\"><h2>Frameless</h2><p id=\"status\">Loading...</p><button id=\"ping\">Ping</button><button id=\"sum\">Compute 100 + 23</button><textarea id=\"msg\">Hello frameless</textarea><button id=\"echo\">Echo</button><pre id=\"out\"></pre></div></div><script>" ++ COMMON_SCRIPT ++ "</script></body></html>";
 
 const HTML_FANCY_WINDOW =
-    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Fancy Window</title><script type=\"module\" src=\"/webui_bridge.js\"></script>" ++
+    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Fancy Window</title><script src=\"/webui_bridge.js\"></script>" ++
     "<style>*{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden}body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle at top right,#23395f,#0b1220 60%);color:#e7ecf7}" ++
     ".shell{height:100%;display:flex}.window{width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 18px 60px rgba(0,0,0,.45)}" ++
     ".bar{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:rgba(7,12,23,.88);backdrop-filter:blur(8px);-webkit-app-region:drag;--webui-app-region:drag}" ++
@@ -475,7 +475,7 @@ const HTML_FANCY_WINDOW =
     "</head><body><div class=\"shell\"><div class=\"window\"><div class=\"bar\"><div class=\"dots\"><button class=\"dot r\" id=\"close\"></button><button class=\"dot y\" id=\"min\"></button><button class=\"dot g\" id=\"max\"></button></div><strong>Fancy Window Example</strong></div><div class=\"content\"><h2>Polished Window UX</h2><p id=\"status\">Loading...</p><button id=\"ping\">Ping</button> <button id=\"sum\">Compute 100 + 23</button><textarea id=\"msg\">Hello from fancy window</textarea><button id=\"echo\">Echo</button><pre id=\"out\"></pre></div></div></div><script>" ++ COMMON_SCRIPT ++ "</script></body></html>";
 
 const HTML_TRANSLUCENT_ROUNDED =
-    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Translucent Rounded</title><script type=\"module\" src=\"/webui_bridge.js\"></script>" ++
+    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Translucent Rounded</title><script src=\"/webui_bridge.js\"></script>" ++
     "<style>*{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden}body{font-family:'Segoe UI',Tahoma,sans-serif;background:transparent;color:#edf3ff}" ++
     ".stage{height:100%;width:100%;padding:0}.glass{height:100%;width:100%;overflow:hidden;background:linear-gradient(180deg,rgba(7,12,20,.88),rgba(9,15,25,.78));box-shadow:0 26px 70px rgba(2,7,14,.62);backdrop-filter:blur(14px);display:flex;flex-direction:column}" ++
     ".bar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 14px;background:rgba(5,10,18,.72);-webkit-app-region:drag;--webui-app-region:drag}" ++
@@ -484,6 +484,6 @@ const HTML_TRANSLUCENT_ROUNDED =
     "</head><body><div class=\"stage\"><div class=\"glass\"><div class=\"bar\"><div class=\"controls\"><button class=\"control close\" id=\"close\"></button><button class=\"control min\" id=\"min\"></button><button class=\"control max\" id=\"max\"></button></div><div><strong>Translucent Rounded Window</strong></div></div><div class=\"content\"><h2>Cross-platform Glass UI</h2><p id=\"status\">Loading...</p><button id=\"ping\">Ping</button> <button id=\"sum\">Compute 100 + 23</button><textarea id=\"msg\">Semi-transparent and native rounded.</textarea><button id=\"echo\">Echo</button><pre id=\"out\"></pre></div></div></div><script>" ++ COMMON_SCRIPT ++ "</script></body></html>";
 
 const HTML_TEXT_EDITOR =
-    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Text Editor</title><script type=\"module\" src=\"/webui_bridge.js\"></script>" ++
+    "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Text Editor</title><script src=\"/webui_bridge.js\"></script>" ++
     "<style>*{box-sizing:border-box}body{font-family:Arial;background:#0f141a;color:#eee;padding:20px;margin:0}textarea{width:100%;min-height:260px}button{margin-top:8px;padding:8px 12px;border:0;background:#53d3ff;color:#06213a;font-weight:700;cursor:pointer}pre{min-height:90px;background:#111b2a;padding:10px}</style></head>" ++
-    "<body><h3>Text Editor Example</h3><p id=\"status\">Checking backend...</p><textarea id=\"msg\" placeholder=\"Type...\"></textarea><br/><button id=\"stats\">Word Count</button><button id=\"save\">Save</button><pre id=\"out\"></pre><script>const st=document.getElementById('status');const out=document.getElementById('out');(async()=>{try{st.textContent='Backend: '+await webuiRpc.ping();}catch(e){st.textContent='Backend unavailable: '+e;}})();document.getElementById('stats').onclick=async()=>{out.textContent='words => '+await webuiRpc.word_count(document.getElementById('msg').value);};document.getElementById('save').onclick=async()=>{out.textContent='save => '+await webuiRpc.save_note(document.getElementById('msg').value);};</script></body></html>";
+    "<body><h3>Text Editor Example</h3><p id=\"status\">Checking backend...</p><textarea id=\"msg\" placeholder=\"Type...\"></textarea><br/><button id=\"stats\">Word Count</button><button id=\"save\">Save</button><pre id=\"out\"></pre><script>const st=document.getElementById('status');const out=document.getElementById('out');(async()=>{try{st.textContent='Backend: '+await globalThis.webuiRpc.ping();}catch(e){st.textContent='Backend unavailable: '+e;}})();document.getElementById('stats').onclick=async()=>{out.textContent='words => '+await globalThis.webuiRpc.word_count(document.getElementById('msg').value);};document.getElementById('save').onclick=async()=>{out.textContent='save => '+await globalThis.webuiRpc.save_note(document.getElementById('msg').value);};</script></body></html>";

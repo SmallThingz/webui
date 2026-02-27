@@ -50,7 +50,7 @@ pub fn main() !void {
     } else {
         try service.show(.{
             .html = "<!doctype html><html><head><meta charset=\"utf-8\" />" ++
-                "<title>WebUI Zig</title><script type=\"module\" src=\"/webui_bridge.js\"></script></head>" ++
+                "<title>WebUI Zig</title><script src=\"/webui_bridge.js\"></script></head>" ++
                 "<body><h1>WebUI Zig Runtime</h1><button id=\"btn\">Call RPC add(7, 9)</button>" ++
                 "<pre id=\"out\">ready</pre><script>" ++
                 "document.getElementById('btn').addEventListener('click', async () => {" ++

@@ -2,7 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const browser_discovery = @import("browser_discovery.zig");
 const window_style_types = @import("../root/window_style.zig");
-const linux_browser_host = @import("../backends/linux_browser_host.zig");
+const platform_browser_host = switch (builtin.os.tag) {
+    .linux => @import("../backends/linux_browser_host.zig"),
+    .windows => @import("../backends/windows_browser_host.zig"),
+    .macos => @import("../backends/macos_browser_host.zig"),
+    else => struct {},
+};
 
 pub const BrowserLaunch = struct {
     pid: ?i64 = null,
@@ -178,9 +183,9 @@ pub fn terminateBrowserProcess(allocator: std.mem.Allocator, pid: i64) void {
     if (pid <= 0) return;
 
     switch (builtin.os.tag) {
-        .windows => terminateBrowserProcessWindows(allocator, pid),
+        .linux, .windows, .macos => platform_browser_host.terminateProcess(allocator, pid),
         .wasi => {},
-        else => terminateBrowserProcessPosix(pid),
+        else => {},
     }
 }
 
@@ -198,9 +203,9 @@ pub fn cleanupBrowserProfileDir(
 pub fn isProcessAlive(pid: i64) bool {
     if (pid <= 0) return false;
     return switch (builtin.os.tag) {
-        .windows => isProcessAliveWindows(std.heap.page_allocator, pid),
+        .linux, .windows, .macos => platform_browser_host.isProcessAlive(std.heap.page_allocator, pid),
         .wasi => false,
-        else => isProcessAlivePosix(pid),
+        else => false,
     };
 }
 
@@ -216,9 +221,7 @@ pub fn controlBrowserWindow(allocator: std.mem.Allocator, pid: i64, cmd: window_
     if (pid <= 0) return false;
 
     return switch (builtin.os.tag) {
-        .windows => controlBrowserWindowWindows(allocator, pid, cmd),
-        .macos => controlBrowserWindowMacos(allocator, pid, cmd),
-        .linux => controlBrowserWindowLinux(allocator, pid, cmd),
+        .linux, .windows, .macos => platform_browser_host.controlWindow(allocator, pid, cmd),
         else => false,
     };
 }
@@ -235,16 +238,9 @@ pub fn openUrlInExistingBrowserKind(
         if (install.kind != kind) continue;
 
         switch (builtin.os.tag) {
-            .windows => {
-                // Navigate with direct URL argument to avoid relaunching in app-mode.
-                const launch = launchWindowsTracked(allocator, install.path, &.{url}) catch null;
-                return launch != null;
-            },
+            .linux, .windows, .macos => return platform_browser_host.openUrlInExistingInstall(allocator, install.path, url),
             .wasi => return false,
-            else => {
-                const launch = launchPosixTracked(allocator, install.path, &.{url}) catch null;
-                return launch != null;
-            },
+            else => return false,
         }
     }
 
@@ -302,10 +298,16 @@ fn launchBrowserCandidate(
     defer spec.deinit(allocator);
 
     const launch = switch (builtin.os.tag) {
-        .windows => try launchWindowsTracked(allocator, browser_path, spec.args[0..spec.len]),
-        .linux => try launchLinuxTracked(allocator, browser_path, spec.args[0..spec.len]),
+        .linux, .windows, .macos => blk: {
+            const result = try platform_browser_host.launchTracked(allocator, browser_path, spec.args[0..spec.len]);
+            if (result) |r| break :blk BrowserLaunch{
+                .pid = r.pid,
+                .is_child_process = r.is_child_process,
+            };
+            break :blk null;
+        },
         .wasi => null,
-        else => try launchPosixTracked(allocator, browser_path, spec.args[0..spec.len]),
+        else => null,
     };
 
     if (launch) |result| {
@@ -486,48 +488,6 @@ fn supportsNewWindowFlag(kind: browser_discovery.BrowserKind) bool {
         => true,
         else => false,
     };
-}
-
-fn launchWindowsTracked(allocator: std.mem.Allocator, browser_path: []const u8, args: []const []const u8) !?BrowserLaunch {
-    const script = try buildPowershellLaunchScript(allocator, browser_path, args);
-    defer allocator.free(script);
-
-    if (try launchWindowsPowershell(allocator, "powershell", script)) |launch| return launch;
-    return try launchWindowsPowershell(allocator, "pwsh", script);
-}
-
-fn launchWindowsPowershell(allocator: std.mem.Allocator, shell_exe: []const u8, script: []const u8) !?BrowserLaunch {
-    const out = runCommandCaptureStdout(allocator, &.{ shell_exe, "-NoProfile", "-NonInteractive", "-Command", script }) catch return null;
-    defer allocator.free(out);
-
-    const pid = parsePidFromOutput(out) orelse return null;
-    return .{ .pid = pid, .is_child_process = true };
-}
-
-fn launchLinuxTracked(allocator: std.mem.Allocator, browser_path: []const u8, args: []const []const u8) !?BrowserLaunch {
-    if (try linux_browser_host.launchTracked(allocator, browser_path, args)) |result| {
-        return .{
-            .pid = result.pid,
-            .is_child_process = result.is_child_process,
-        };
-    }
-    return null;
-}
-
-fn launchPosixTracked(allocator: std.mem.Allocator, browser_path: []const u8, args: []const []const u8) !?BrowserLaunch {
-    var argv = std.array_list.Managed([]const u8).init(allocator);
-    defer argv.deinit();
-
-    try argv.append(browser_path);
-    if (args.len > 0) try argv.appendSlice(args);
-
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch return null;
-    return .{ .pid = @as(i64, @intCast(child.id)), .is_child_process = true };
 }
 
 fn launchSystemFallback(allocator: std.mem.Allocator, url: []const u8) !?BrowserLaunch {
@@ -828,172 +788,6 @@ fn runCommandNoCapture(allocator: std.mem.Allocator, argv: []const []const u8) !
     };
 }
 
-fn controlBrowserWindowWindows(allocator: std.mem.Allocator, pid: i64, cmd: window_style_types.WindowControl) bool {
-    if (cmd == .close) {
-        terminateBrowserProcessWindows(allocator, pid);
-        return true;
-    }
-
-    const show_code = windowsShowWindowCode(cmd) orelse return false;
-    const script = std.fmt.allocPrint(
-        allocator,
-        "$ErrorActionPreference='Stop';" ++
-            "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class WebuiUser32{{[DllImport(\"user32.dll\")] public static extern bool ShowWindowAsync(IntPtr hWnd,int nCmdShow);}}' -ErrorAction SilentlyContinue | Out-Null;" ++
-            "$p=Get-Process -Id {d} -ErrorAction Stop;" ++
-            "if($p.MainWindowHandle -eq 0){{exit 2}};" ++
-            "[WebuiUser32]::ShowWindowAsync($p.MainWindowHandle,{d}) | Out-Null;" ++
-            "exit 0;",
-        .{ pid, show_code },
-    ) catch return false;
-    defer allocator.free(script);
-
-    if (runCommandNoCapture(allocator, &.{ "powershell", "-NoProfile", "-NonInteractive", "-Command", script }) catch false) return true;
-    return runCommandNoCapture(allocator, &.{ "pwsh", "-NoProfile", "-NonInteractive", "-Command", script }) catch false;
-}
-
-fn windowsShowWindowCode(cmd: window_style_types.WindowControl) ?i32 {
-    return switch (cmd) {
-        .hide => 0, // SW_HIDE
-        .show => 5, // SW_SHOW
-        .maximize => 3, // SW_MAXIMIZE
-        .minimize => 6, // SW_MINIMIZE
-        .restore => 9, // SW_RESTORE
-        .close => null,
-    };
-}
-
-fn controlBrowserWindowMacos(allocator: std.mem.Allocator, pid: i64, cmd: window_style_types.WindowControl) bool {
-    if (cmd == .close) {
-        terminateBrowserProcessPosix(pid);
-        return true;
-    }
-
-    const script = switch (cmd) {
-        .hide => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first process whose unix id is {d}) to set visible to false",
-            .{pid},
-        ) catch return false,
-        .show => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first process whose unix id is {d}) to set visible to true",
-            .{pid},
-        ) catch return false,
-        .minimize => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXMinimized\" to true",
-            .{pid},
-        ) catch return false,
-        .restore => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXMinimized\" to false",
-            .{pid},
-        ) catch return false,
-        .maximize => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXFullScreen\" to true",
-            .{pid},
-        ) catch return false,
-        .close => unreachable,
-    };
-    defer allocator.free(script);
-
-    if (runCommandNoCapture(allocator, &.{ "osascript", "-e", script }) catch false) return true;
-    if (cmd == .maximize) {
-        const alt = std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXZoomed\" to true",
-            .{pid},
-        ) catch return false;
-        defer allocator.free(alt);
-        return runCommandNoCapture(allocator, &.{ "osascript", "-e", alt }) catch false;
-    }
-    return false;
-}
-
-fn controlBrowserWindowLinux(allocator: std.mem.Allocator, pid: i64, cmd: window_style_types.WindowControl) bool {
-    if (cmd == .close) {
-        terminateBrowserProcessPosix(pid);
-        return true;
-    }
-
-    const win_id = firstLinuxWindowIdForPid(allocator, pid) orelse return false;
-    const win_id_hex = std.fmt.allocPrint(allocator, "0x{x}", .{win_id}) catch return false;
-    defer allocator.free(win_id_hex);
-
-    return switch (cmd) {
-        .minimize => (runCommandNoCapture(allocator, &.{ "xdotool", "windowminimize", win_id_hex }) catch false) or
-            (runCommandNoCapture(allocator, &.{ "wmctrl", "-ir", win_id_hex, "-b", "add,hidden" }) catch false),
-        .maximize => runCommandNoCapture(allocator, &.{ "wmctrl", "-ir", win_id_hex, "-b", "add,maximized_vert,maximized_horz" }) catch false,
-        .restore => runCommandNoCapture(allocator, &.{ "wmctrl", "-ir", win_id_hex, "-b", "remove,maximized_vert,maximized_horz" }) catch false,
-        .hide => runCommandNoCapture(allocator, &.{ "wmctrl", "-ir", win_id_hex, "-b", "add,hidden" }) catch false,
-        .show => (runCommandNoCapture(allocator, &.{ "wmctrl", "-ia", win_id_hex }) catch false) or
-            (runCommandNoCapture(allocator, &.{ "wmctrl", "-ir", win_id_hex, "-b", "remove,hidden" }) catch false),
-        .close => unreachable,
-    };
-}
-
-fn firstLinuxWindowIdForPid(allocator: std.mem.Allocator, pid: i64) ?u64 {
-    const pid_txt = std.fmt.allocPrint(allocator, "{d}", .{pid}) catch return null;
-    defer allocator.free(pid_txt);
-
-    const output = runCommandCaptureStdout(allocator, &.{ "xdotool", "search", "--pid", pid_txt }) catch return null;
-    defer allocator.free(output);
-
-    var it = std.mem.splitScalar(u8, output, '\n');
-    while (it.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (line.len == 0) continue;
-        if (std.fmt.parseInt(u64, line, 10)) |id| return id else |_| {}
-    }
-    return null;
-}
-
-fn parsePidFromOutput(output: []const u8) ?i64 {
-    const trimmed = std.mem.trim(u8, output, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return std.fmt.parseInt(i64, trimmed, 10) catch null;
-}
-
-fn buildPowershellLaunchScript(
-    allocator: std.mem.Allocator,
-    browser_path: []const u8,
-    args: []const []const u8,
-) ![]u8 {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-
-    const w = out.writer();
-    try w.writeAll("$ErrorActionPreference='Stop';$p=Start-Process -FilePath '");
-    try appendPowershellSingleQuoted(allocator, &out, browser_path);
-    try w.writeAll("' -ArgumentList @(");
-
-    for (args, 0..) |arg, i| {
-        if (i != 0) try w.writeAll(",");
-        try w.writeAll("'");
-        try appendPowershellSingleQuoted(allocator, &out, arg);
-        try w.writeAll("'");
-    }
-
-    try w.writeAll(") -PassThru -WindowStyle Hidden;[Console]::Out.Write($p.Id)");
-    return out.toOwnedSlice();
-}
-
-fn appendPowershellSingleQuoted(
-    allocator: std.mem.Allocator,
-    out: *std.array_list.Managed(u8),
-    value: []const u8,
-) !void {
-    _ = allocator;
-    for (value) |ch| {
-        if (ch == '\'') {
-            try out.appendSlice("''");
-        } else {
-            try out.append(ch);
-        }
-    }
-}
-
 fn terminateBrowserProcessPosix(pid_value: i64) void {
     const pid: std.posix.pid_t = @intCast(pid_value);
     std.posix.kill(pid, std.posix.SIG.TERM) catch {};
@@ -1035,41 +829,6 @@ fn linkedChildExitedPosix(pid_value: i64) bool {
     const pid: std.posix.pid_t = @intCast(pid_value);
     const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
     return result.pid == pid;
-}
-
-fn isProcessAliveWindows(allocator: std.mem.Allocator, pid_value: i64) bool {
-    const pid_text = std.fmt.allocPrint(allocator, "{d}", .{pid_value}) catch return false;
-    defer allocator.free(pid_text);
-    const filter = std.fmt.allocPrint(allocator, "PID eq {s}", .{pid_text}) catch return false;
-    defer allocator.free(filter);
-    const out = runCommandCaptureStdout(allocator, &.{ "tasklist", "/FI", filter, "/FO", "CSV", "/NH" }) catch return false;
-    defer allocator.free(out);
-
-    if (std.mem.indexOf(u8, out, "No tasks are running") != null) return false;
-    return std.mem.indexOf(u8, out, pid_text) != null;
-}
-
-fn terminateBrowserProcessWindows(allocator: std.mem.Allocator, pid_value: i64) void {
-    const pid_text = std.fmt.allocPrint(allocator, "{d}", .{pid_value}) catch return;
-    defer allocator.free(pid_text);
-
-    _ = runCommandNoCapture(allocator, &.{ "taskkill", "/PID", pid_text, "/T", "/F" }) catch {};
-}
-
-test "parse pid from output" {
-    try std.testing.expectEqual(@as(?i64, 1234), parsePidFromOutput("1234\n"));
-    try std.testing.expectEqual(@as(?i64, 987), parsePidFromOutput("  987  \r\n"));
-    try std.testing.expectEqual(@as(?i64, null), parsePidFromOutput(""));
-    try std.testing.expectEqual(@as(?i64, null), parsePidFromOutput("not-a-pid"));
-}
-
-test "windows show window command mapping is stable" {
-    try std.testing.expectEqual(@as(?i32, 0), windowsShowWindowCode(.hide));
-    try std.testing.expectEqual(@as(?i32, 5), windowsShowWindowCode(.show));
-    try std.testing.expectEqual(@as(?i32, 6), windowsShowWindowCode(.minimize));
-    try std.testing.expectEqual(@as(?i32, 3), windowsShowWindowCode(.maximize));
-    try std.testing.expectEqual(@as(?i32, 9), windowsShowWindowCode(.restore));
-    try std.testing.expectEqual(@as(?i32, null), windowsShowWindowCode(.close));
 }
 
 test "quiet prompt policy injects suppression flags for chromium family" {

@@ -4,6 +4,14 @@ const linux_webview_host = if (builtin.os.tag == .linux)
     @import("../backends/linux_webview_host.zig")
 else
     struct {};
+const windows_webview_host = if (builtin.os.tag == .windows)
+    @import("../backends/windows_webview_host.zig")
+else
+    struct {};
+const macos_webview_host = if (builtin.os.tag == .macos)
+    @import("../backends/macos_webview_host.zig")
+else
+    struct {};
 
 pub const RuntimeRequirement = struct {
     name: []const u8,
@@ -44,6 +52,24 @@ pub fn list(allocator: std.mem.Allocator, options: ListOptions) ![]RuntimeRequir
             .required = options.uses_managed_browser or options.uses_web_url,
             .available = true,
             .details = "Direct in-process browser spawning path",
+        });
+    }
+
+    if (builtin.os.tag == .windows) {
+        try out.append(.{
+            .name = "windows.webview2_runtime",
+            .required = options.uses_native_webview and options.app_mode_required,
+            .available = windows_webview_host.runtimeAvailable(),
+            .details = "In-process WebView2 runtime availability",
+        });
+    }
+
+    if (builtin.os.tag == .macos) {
+        try out.append(.{
+            .name = "macos.webkit_runtime",
+            .required = options.uses_native_webview and options.app_mode_required,
+            .available = macos_webview_host.runtimeAvailable(),
+            .details = "In-process WebKit runtime availability",
         });
     }
 
