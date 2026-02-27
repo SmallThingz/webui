@@ -5,3 +5,5 @@ zig-out-clean-macos-dyn/
 zig-out-clean-win-dyn/
 zig-out-clean/
 webui/
+src/bridge/generated/
+!src/bridge/generated/.gitkeep
