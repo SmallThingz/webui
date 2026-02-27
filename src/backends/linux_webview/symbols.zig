@@ -255,6 +255,39 @@ pub const Symbols = struct {
         if (self.gtk_widget_set_overflow) |set_overflow| {
             if (webview_widget) |webview| set_overflow(webview, overflow_value);
         }
+
+        if (self.gtk_css_provider_new) |provider_new| {
+            if (self.gtk_css_provider_load_from_data) |load_from_data| {
+                if (self.gtk_style_context_add_provider_for_display) |add_provider| {
+                    if (self.gdk_display_get_default) |get_default| {
+                        if (self.gtk_widget_add_css_class) |add_class| {
+                            add_class(window_widget, "webui-window");
+                            
+                            var css_buf: [256]u8 = undefined;
+                            var css_str: [:0]const u8 = "";
+                            if (style.transparent and radius > 0) {
+                                css_str = std.fmt.bufPrintZ(&css_buf, "window.webui-window, window.webui-window > decoration {{ background-color: transparent; border-radius: {d}px; box-shadow: none; }}\nwebview {{ border-radius: {d}px; background-color: transparent; }}", .{radius, radius}) catch "window.webui-window { background-color: transparent; }";
+                            } else if (style.transparent) {
+                                css_str = "window.webui-window, window.webui-window > decoration { background-color: transparent; box-shadow: none; }\nwebview { background-color: transparent; }";
+                            } else if (radius > 0) {
+                                css_str = std.fmt.bufPrintZ(&css_buf, "window.webui-window, window.webui-window > decoration {{ border-radius: {d}px; box-shadow: none; }}\nwebview {{ border-radius: {d}px; }}", .{radius, radius}) catch "";
+                            }
+
+                            if (css_str.len > 0) {
+                                if (provider_new()) |provider| {
+                                    load_from_data(provider, css_str.ptr, -1);
+                                    if (get_default()) |display| {
+                                        add_provider(display, provider, common.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+                                    }
+                                    if (self.g_object_unref) |unref| unref(provider);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.applyGtk4RoundedSurface(window_widget, style.corner_radius, style.transparent);
     }
 

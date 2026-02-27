@@ -317,11 +317,14 @@ fn onIdleDrain(data: ?*anyopaque) callconv(.c) c_int {
 fn onDestroy(_: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
     const host = data orelse return;
     const typed: *Host = @ptrCast(@alignCast(host));
-    // Keep close-state transitions under the same lock used by enqueue/deinit.
-    typed.mutex.lock();
-    defer typed.mutex.unlock();
+    // Destroy can be emitted while other UI callbacks are active.
+    // Never take a blocking lock here; just publish closed state and
+    // best-effort mark shutdown to avoid recursive-lock deadlocks.
     typed.closed.store(true, .release);
-    typed.shutdown_requested = true;
+    if (typed.mutex.tryLock()) {
+        typed.shutdown_requested = true;
+        typed.mutex.unlock();
+    }
     if (typed.symbols) |symbols| {
         if (typed.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
     }
@@ -378,26 +381,34 @@ fn drainCommandsUiThread(host: *Host) void {
 
 fn executeUiCommand(host: *Host, command: *Command) void {
     host.mutex.lock();
-    defer host.mutex.unlock();
+    const is_closed = host.closed.load(.acquire);
+    const symbols = host.symbols;
+    const webview = host.webview;
+    const window_widget = host.window_widget;
+    const main_loop = host.main_loop;
+    host.mutex.unlock();
 
-    if (host.closed.load(.acquire)) return;
-    const symbols = host.symbols orelse return;
+    if (is_closed) return;
+    const syms = symbols orelse return;
 
     switch (command.*) {
         .navigate => |url| {
-            const webview = host.webview orelse return;
+            const target = webview orelse return;
             const url_z = host.allocator.dupeZ(u8, url) catch return;
             defer host.allocator.free(url_z);
-            symbols.webkit_web_view_load_uri(webview, url_z);
+            syms.webkit_web_view_load_uri(target, url_z);
         },
         .apply_style => |style| applyStyleUiThread(host, style),
         .control => |cmd| applyControlUiThread(host, cmd),
         .shutdown => {
+            host.mutex.lock();
             host.shutdown_requested = true;
-            if (host.window_widget) |window_widget| {
-                symbols.destroyWindow(window_widget);
+            host.mutex.unlock();
+
+            if (window_widget) |widget| {
+                syms.destroyWindow(widget);
             }
-            if (host.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
+            if (main_loop) |loop| syms.g_main_loop_quit(loop);
         },
     }
 }
@@ -471,7 +482,9 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
             symbols.gtk_widget_show(window_widget);
         },
         .close => {
+            host.mutex.lock();
             host.shutdown_requested = true;
+            host.mutex.unlock();
             symbols.destroyWindow(window_widget);
             if (host.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
         },
@@ -547,4 +560,19 @@ fn cleanupIconTempFile(host: *Host) void {
         host.allocator.free(path);
         host.icon_temp_path = null;
     }
+}
+
+test "onDestroy avoids recursive mutex deadlock when lock is already held" {
+    var host: Host = undefined;
+    host.mutex = .{};
+    host.closed = std.atomic.Value(bool).init(false);
+    host.shutdown_requested = false;
+    host.symbols = null;
+    host.main_loop = null;
+
+    host.mutex.lock();
+    defer host.mutex.unlock();
+    onDestroy(null, @ptrCast(&host));
+
+    try std.testing.expect(host.closed.load(.acquire));
 }
