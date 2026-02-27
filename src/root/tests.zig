@@ -265,13 +265,16 @@ test "websocket upgrade survives repeated connect-disconnect churn" {
 test "mixed concurrent http routes remain stable under socket churn" {
     const Shared = struct { failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false) };
     const Ctx = struct {
-        allocator: std.mem.Allocator,
         port: u16,
         start: usize,
         shared: *Shared,
     };
     const Worker = struct {
         fn run(ctx: *Ctx) void {
+            var gpa_thread = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa_thread.deinit();
+            const allocator = gpa_thread.allocator();
+
             var i: usize = 0;
             while (i < 40) : (i += 1) {
                 const route_idx = (ctx.start + i) % 3;
@@ -280,11 +283,11 @@ test "mixed concurrent http routes remain stable under socket churn" {
                     1 => "/webui/window/control",
                     else => "/webui/window/style",
                 };
-                const response = httpRoundTrip(ctx.allocator, ctx.port, "GET", path, null) catch {
+                const response = httpRoundTrip(allocator, ctx.port, "GET", path, null) catch {
                     ctx.shared.failed.store(true, .release);
                     return;
                 };
-                defer ctx.allocator.free(response);
+                defer allocator.free(response);
 
                 if (std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") == null) {
                     ctx.shared.failed.store(true, .release);
@@ -311,7 +314,6 @@ test "mixed concurrent http routes remain stable under socket churn" {
     var threads: [8]std.Thread = undefined;
     for (&contexts, 0..) |*ctx, idx| {
         ctx.* = .{
-            .allocator = gpa.allocator(),
             .port = win.state().server_port,
             .start = idx * 7,
             .shared = &shared,
@@ -364,9 +366,19 @@ test "window control route stays responsive during long running rpc" {
         err: ?anyerror = null,
 
         fn run(ctx: *@This()) void {
-            const result = httpRoundTrip(ctx.allocator, ctx.port, "POST", "/webui/rpc", "{\"name\":\"slow\",\"args\":[]}");
+            var gpa_thread = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa_thread.deinit();
+            const allocator = gpa_thread.allocator();
+
+            const result = httpRoundTrip(allocator, ctx.port, "POST", "/webui/rpc", "{\"name\":\"slow\",\"args\":[]}");
             if (result) |response| {
-                ctx.response = response;
+                const copied = ctx.allocator.dupe(u8, response) catch {
+                    allocator.free(response);
+                    ctx.err = error.OutOfMemory;
+                    return;
+                };
+                allocator.free(response);
+                ctx.response = copied;
             } else |err| {
                 ctx.err = err;
             }
@@ -389,7 +401,7 @@ test "window control route stays responsive during long running rpc" {
     try app.run();
 
     var rpc_call_ctx = RpcCallCtx{
-        .allocator = gpa.allocator(),
+        .allocator = std.heap.page_allocator,
         .port = win.state().server_port,
     };
     const rpc_thread = try std.Thread.spawn(.{}, RpcCallCtx.run, .{&rpc_call_ctx});
@@ -415,7 +427,7 @@ test "window control route stays responsive during long running rpc" {
 
     if (rpc_call_ctx.err) |err| return err;
     const rpc_response = rpc_call_ctx.response orelse return error.InvalidRpcResult;
-    defer gpa.allocator().free(rpc_response);
+    defer rpc_call_ctx.allocator.free(rpc_response);
     try std.testing.expectEqualStrings("\"done\"", httpResponseBody(rpc_response));
 }
 
