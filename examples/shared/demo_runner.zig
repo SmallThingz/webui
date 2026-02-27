@@ -59,17 +59,29 @@ pub const rpc_methods = struct {
 fn parseSurfaceToken(token: []const u8) ?webui.LaunchSurface {
     if (std.mem.eql(u8, token, "webview")) return .native_webview;
     if (std.mem.eql(u8, token, "browser")) return .browser_window;
-    if (std.mem.eql(u8, token, "web-tab")) return .browser_window;
-    if (std.mem.eql(u8, token, "web")) return .browser_window;
+    if (std.mem.eql(u8, token, "web-tab")) return .web_url;
+    if (std.mem.eql(u8, token, "web")) return .web_url;
     if (std.mem.eql(u8, token, "web-url")) return .web_url;
     return null;
 }
 
 fn launchPolicyFromRunModeValue(mode: []const u8) webui.LaunchPolicy {
-    if (std.mem.eql(u8, mode, "webview")) return webui.LaunchPolicy.webviewFirst();
-    if (std.mem.eql(u8, mode, "browser")) return webui.LaunchPolicy.browserFirst();
-    if (std.mem.eql(u8, mode, "web-tab")) return webui.LaunchPolicy.browserFirst();
-    if (std.mem.eql(u8, mode, "web")) return webui.LaunchPolicy.browserFirst();
+    if (std.mem.eql(u8, mode, "webview")) return .{
+        .first = .native_webview,
+        .second = null,
+        .third = null,
+        .allow_dual_surface = false,
+        .app_mode_required = true,
+    };
+    if (std.mem.eql(u8, mode, "browser")) return .{
+        .first = .browser_window,
+        .second = null,
+        .third = null,
+        .allow_dual_surface = false,
+        .app_mode_required = true,
+    };
+    if (std.mem.eql(u8, mode, "web-tab")) return webui.LaunchPolicy.webUrlOnly();
+    if (std.mem.eql(u8, mode, "web")) return webui.LaunchPolicy.webUrlOnly();
     if (std.mem.eql(u8, mode, "web-url")) {
         return webui.LaunchPolicy.webUrlOnly();
     }
@@ -302,17 +314,34 @@ test "run-mode browser launch preference parser supports web-tab" {
 test "run-mode browser maps to browser-first launch policy" {
     const policy = launchPolicyFromRunModeValue("browser");
     try std.testing.expectEqual(@as(webui.LaunchSurface, .browser_window), policy.first);
-    try std.testing.expectEqual(@as(?webui.LaunchSurface, .web_url), policy.second);
-    try std.testing.expectEqual(@as(?webui.LaunchSurface, .native_webview), policy.third);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), policy.second);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), policy.third);
+    try std.testing.expect(policy.app_mode_required);
+}
+
+test "run-mode web alias maps to web-url only launch policy" {
+    const policy = launchPolicyFromRunModeValue("web");
+    try std.testing.expectEqual(@as(webui.LaunchSurface, .web_url), policy.first);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), policy.second);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), policy.third);
     try std.testing.expect(!policy.app_mode_required);
 }
 
-test "run-mode web alias maps to browser-first launch policy" {
-    const policy = launchPolicyFromRunModeValue("web");
-    try std.testing.expectEqual(@as(webui.LaunchSurface, .browser_window), policy.first);
-    try std.testing.expectEqual(@as(?webui.LaunchSurface, .web_url), policy.second);
-    try std.testing.expectEqual(@as(?webui.LaunchSurface, .native_webview), policy.third);
-    try std.testing.expect(!policy.app_mode_required);
+test "single-token run-mode presets are strict with no fallback surfaces" {
+    const webview_policy = launchPolicyFromRunModeValue("webview");
+    try std.testing.expectEqual(@as(webui.LaunchSurface, .native_webview), webview_policy.first);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), webview_policy.second);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), webview_policy.third);
+
+    const browser_policy = launchPolicyFromRunModeValue("browser");
+    try std.testing.expectEqual(@as(webui.LaunchSurface, .browser_window), browser_policy.first);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), browser_policy.second);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), browser_policy.third);
+
+    const web_policy = launchPolicyFromRunModeValue("web");
+    try std.testing.expectEqual(@as(webui.LaunchSurface, .web_url), web_policy.first);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), web_policy.second);
+    try std.testing.expectEqual(@as(?webui.LaunchSurface, null), web_policy.third);
 }
 
 fn styleFor(comptime kind: ExampleKind) webui.WindowStyle {

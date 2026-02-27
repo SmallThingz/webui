@@ -340,7 +340,11 @@ pub const WindowState = struct {
                             .native_webview => .native_webview,
                             .browser_window, .web_url => .browser_fallback,
                         };
+                    } else {
+                        return err;
                     }
+                } else {
+                    return err;
                 }
                 if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
                     state.rpc_state.logf(.warn, "[webui.warning] window={d} {s}\n", .{ state.id, warning });

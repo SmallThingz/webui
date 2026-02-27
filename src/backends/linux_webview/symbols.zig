@@ -44,7 +44,9 @@ pub const Symbols = struct {
     gtk_widget_input_shape_combine_region: ?*const fn (*common.GtkWidget, ?*common.cairo_region_t) callconv(.c) void = null,
     gtk_widget_show: *const fn (*common.GtkWidget) callconv(.c) void,
     gtk_widget_hide: *const fn (*common.GtkWidget) callconv(.c) void,
-    gtk_widget_destroy: *const fn (*common.GtkWidget) callconv(.c) void,
+    gtk_widget_destroy: ?*const fn (*common.GtkWidget) callconv(.c) void = null,
+    gtk_window_destroy: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
+    gtk_window_close: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
 
     webkit_web_view_new: *const fn () callconv(.c) ?*common.GtkWidget,
     webkit_web_view_load_uri: *const fn (*common.WebKitWebView, [*:0]const u8) callconv(.c) void,
@@ -87,12 +89,13 @@ pub const Symbols = struct {
     }
 
     pub fn deinit(self: *Symbols) void {
-        self.cairo.close();
-        self.glib.close();
-        self.gobject.close();
-        self.webkit.close();
-        self.gdk.close();
-        self.gtk.close();
+        _ = self;
+        // Intentionally do not dlclose GTK/WebKit/GLib stacks at runtime.
+        // These GUI libraries may retain internal callbacks/threads beyond our
+        // local loop teardown window; unloading them can cause shutdown-time
+        // crashes when late callbacks land in unmapped code.
+        //
+        // Process-exit cleanup is sufficient for this host runtime.
     }
 
     pub fn initToolkit(self: *const Symbols) void {
@@ -126,6 +129,26 @@ pub const Symbols = struct {
     pub fn showWindow(self: *const Symbols, window_widget: *common.GtkWidget, child_widget: *common.GtkWidget) void {
         self.gtk_widget_show(child_widget);
         self.gtk_widget_show(window_widget);
+    }
+
+    pub fn destroyWindow(self: *const Symbols, window_widget: *common.GtkWidget) void {
+        switch (self.gtk_api) {
+            .gtk3 => {
+                if (self.gtk_widget_destroy) |destroy| destroy(window_widget);
+            },
+            .gtk4 => {
+                const window: *common.GtkWindow = @ptrCast(window_widget);
+                if (self.gtk_window_destroy) |destroy_window| {
+                    destroy_window(window);
+                    return;
+                }
+                if (self.gtk_window_close) |close_window| {
+                    close_window(window);
+                    return;
+                }
+                if (self.gtk_widget_destroy) |destroy| destroy(window_widget);
+            },
+        }
     }
 
     pub fn setWindowPositionCenter(self: *const Symbols, window: *common.GtkWindow) void {
@@ -187,7 +210,9 @@ pub const Symbols = struct {
         if (self.loadDynLibsFor(
             .gtk4,
             &.{ "libgtk-4.so.1", "libgtk-4.so" },
-            &.{ "libgdk-4.so.1", "libgdk-4.so" },
+            // Some distros do not ship a separate libgdk-4 soname and expose
+            // GDK symbols via libgtk-4 instead.
+            &.{ "libgdk-4.so.1", "libgdk-4.so", "libgtk-4.so.1", "libgtk-4.so" },
             &.{ "libwebkitgtk-6.0.so.4", "libwebkitgtk-6.0.so" },
         )) return;
 
@@ -262,7 +287,9 @@ pub const Symbols = struct {
         self.gtk_widget_input_shape_combine_region = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_input_shape_combine_region), "gtk_widget_input_shape_combine_region");
         self.gtk_widget_show = try lookupSym(&self.gtk, @TypeOf(self.gtk_widget_show), "gtk_widget_show");
         self.gtk_widget_hide = try lookupSym(&self.gtk, @TypeOf(self.gtk_widget_hide), "gtk_widget_hide");
-        self.gtk_widget_destroy = try lookupSym(&self.gtk, @TypeOf(self.gtk_widget_destroy), "gtk_widget_destroy");
+        self.gtk_widget_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_widget_destroy), "gtk_widget_destroy");
+        self.gtk_window_destroy = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_destroy), "gtk_window_destroy");
+        self.gtk_window_close = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_close), "gtk_window_close");
 
         self.webkit_web_view_new = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_new), "webkit_web_view_new");
         self.webkit_web_view_load_uri = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_load_uri), "webkit_web_view_load_uri");
@@ -291,6 +318,8 @@ pub const Symbols = struct {
 
         if (self.gtk_api == .gtk3 and self.gtk_window_new_gtk3 == null) return error.MissingDynamicSymbol;
         if (self.gtk_api == .gtk4 and self.gtk_window_new_gtk4 == null) return error.MissingDynamicSymbol;
+        if (self.gtk_api == .gtk3 and self.gtk_widget_destroy == null) return error.MissingDynamicSymbol;
+        if (self.gtk_api == .gtk4 and self.gtk_window_destroy == null and self.gtk_window_close == null and self.gtk_widget_destroy == null) return error.MissingDynamicSymbol;
     }
 };
 

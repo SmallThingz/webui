@@ -7,6 +7,7 @@ const WindowStyle = common.WindowStyle;
 const WindowControl = common.WindowControl;
 const Symbols = symbols_mod.Symbols;
 const Queue = std.array_list.Managed(Command);
+const log = std.log.scoped(.webui_linux_webview);
 
 const default_width: c_int = 980;
 const default_height: c_int = 660;
@@ -50,7 +51,8 @@ pub const Host = struct {
         if (!hasDisplaySession()) return error.NativeBackendUnavailable;
 
         const host = try allocator.create(Host);
-        errdefer allocator.destroy(host);
+        var cleanup_host = true;
+        errdefer if (cleanup_host) allocator.destroy(host);
 
         host.* = .{
             .allocator = allocator,
@@ -58,13 +60,14 @@ pub const Host = struct {
             .style = style,
             .queue = Queue.init(allocator),
         };
-        errdefer {
-            allocator.free(host.title);
-            host.queue.deinit();
-        }
+        var cleanup_title = true;
+        var cleanup_queue = true;
+        errdefer if (cleanup_title) allocator.free(host.title);
+        errdefer if (cleanup_queue) host.queue.deinit();
 
         host.thread = try std.Thread.spawn(.{}, threadMain, .{host});
-        errdefer if (host.thread) |thread| thread.detach();
+        var detach_thread = true;
+        errdefer if (detach_thread) if (host.thread) |thread| thread.detach();
 
         host.mutex.lock();
         while (!host.startup_done) {
@@ -75,13 +78,29 @@ pub const Host = struct {
         host.mutex.unlock();
 
         if (startup_error) |err| {
+            // Hand off cleanup to host.deinit() to avoid errdefer double-free.
+            detach_thread = false;
+            cleanup_queue = false;
+            cleanup_title = false;
+            cleanup_host = false;
             host.deinit();
             return err;
         }
         if (!ready) {
+            // Hand off cleanup to host.deinit() to avoid errdefer double-free.
+            detach_thread = false;
+            cleanup_queue = false;
+            cleanup_title = false;
+            cleanup_host = false;
             host.deinit();
             return error.NativeBackendUnavailable;
         }
+
+        // Success path: caller owns host lifecycle.
+        detach_thread = false;
+        cleanup_queue = false;
+        cleanup_title = false;
+        cleanup_host = false;
         return host;
     }
 
@@ -163,6 +182,7 @@ pub fn runtimeAvailable() bool {
 
 fn threadMain(host: *Host) void {
     const loaded = Symbols.load() catch |err| {
+        log.err("symbol load failed: {s}", .{@errorName(err)});
         failStartup(host, err);
         return;
     };
@@ -175,10 +195,12 @@ fn threadMain(host: *Host) void {
     symbols.initToolkit();
 
     const window_widget = symbols.newTopLevelWindow() orelse {
+        log.err("gtk_window_new returned null", .{});
         failStartup(host, error.NativeBackendUnavailable);
         return;
     };
     const webview_widget = symbols.webkit_web_view_new() orelse {
+        log.err("webkit_web_view_new returned null", .{});
         failStartup(host, error.NativeBackendUnavailable);
         return;
     };
@@ -199,6 +221,7 @@ fn threadMain(host: *Host) void {
     symbols.addWindowChild(window_widget, webview_widget);
 
     const main_loop = symbols.g_main_loop_new(null, 0) orelse {
+        log.err("g_main_loop_new returned null", .{});
         failStartup(host, error.NativeBackendUnavailable);
         return;
     };
@@ -228,11 +251,16 @@ fn threadMain(host: *Host) void {
 
 fn connectWindowSignals(symbols: *const Symbols, window_widget: *common.GtkWidget, host: *Host) void {
     _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "destroy", @ptrCast(&onDestroy), host, null, 0);
-    _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "realize", @ptrCast(&onRealize), host, null, 0);
-    _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "size-allocate", @ptrCast(&onSizeAllocate), host, null, 0);
+    // GTK4 changed the size-allocate ABI; keep GTK3-only callbacks off GTK4 to
+    // avoid undefined behavior from mismatched callback signatures.
+    if (symbols.gtk_api == .gtk3) {
+        _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "realize", @ptrCast(&onRealize), host, null, 0);
+        _ = symbols.g_signal_connect_data(@ptrCast(window_widget), "size-allocate", @ptrCast(&onSizeAllocate), host, null, 0);
+    }
 }
 
 fn failStartup(host: *Host, err: anyerror) void {
+    log.err("startup failed: {s}", .{@errorName(err)});
     host.mutex.lock();
     defer host.mutex.unlock();
 
@@ -357,7 +385,7 @@ fn executeUiCommand(host: *Host, command: *Command) void {
         .shutdown => {
             host.shutdown_requested = true;
             if (host.window_widget) |window_widget| {
-                symbols.gtk_widget_destroy(window_widget);
+                symbols.destroyWindow(window_widget);
             }
             if (host.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
         },
@@ -419,7 +447,7 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
         },
         .close => {
             host.shutdown_requested = true;
-            symbols.gtk_widget_destroy(window_widget);
+            symbols.destroyWindow(window_widget);
             if (host.main_loop) |main_loop| symbols.g_main_loop_quit(main_loop);
         },
         .hide => symbols.gtk_widget_hide(window_widget),
