@@ -672,10 +672,14 @@ pub const WindowState = struct {
     }
 
     pub fn requestLifecycleCloseFromFrontend(self: *WindowState) void {
+        // Frontend lifecycle close is authoritative only for browser-window mode.
+        // In web-url and native-webview modes, backend lifecycle is managed by
+        // explicit controls/process state and should not be closed by unload.
+        if (self.runtime_render_state.active_surface != .browser_window) return;
+
         if (self.launched_browser_pid) |pid| {
             if (core_runtime.isProcessAlive(pid)) {
-                self.rpc_state.logf(.debug, "[webui.lifecycle] ignoring close while tracked pid is alive pid={d}\n", .{pid});
-                return;
+                self.rpc_state.logf(.debug, "[webui.lifecycle] browser-window close requested while tracked pid alive pid={d}\n", .{pid});
             }
         }
 

@@ -669,6 +669,48 @@ test "window_closing lifecycle message is ignored while tracked browser pid is a
     try std.testing.expect(!should_close);
 }
 
+test "window_closing lifecycle message closes backend in browser-window mode" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .browser_window, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "LifecycleCloseBrowserWindow" });
+    try win.showHtml("<html><body>lifecycle-close-browser-window</body></html>");
+    try app.run();
+
+    var child = std.process.Child.init(&.{ "sh", "-c", "sleep 5" }, gpa.allocator());
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    defer {
+        std.posix.kill(@as(std.posix.pid_t, @intCast(child.id)), std.posix.SIG.TERM) catch {};
+        _ = child.wait() catch {};
+    }
+
+    win.state().state_mutex.lock();
+    win.state().launched_browser_pid = @as(i64, @intCast(child.id));
+    win.state().launched_browser_is_child = true;
+    win.state().launched_browser_lifecycle_linked = false;
+    win.state().runtime_render_state.active_surface = .browser_window;
+    win.state().state_mutex.unlock();
+
+    win.state().state_mutex.lock();
+    win.state().requestLifecycleCloseFromFrontend();
+    win.state().state_mutex.unlock();
+
+    win.state().state_mutex.lock();
+    const should_close = win.state().close_requested.load(.acquire);
+    win.state().state_mutex.unlock();
+    try std.testing.expect(should_close);
+}
+
 test "non-linked tracked browser pid death detaches without close in web mode" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 

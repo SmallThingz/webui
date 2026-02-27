@@ -413,14 +413,17 @@ async function __webuiExecuteScriptTask(task) {
 
   if (typeof globalThis.addEventListener === "function") {
     globalThis.addEventListener("beforeunload", () => {
+      // Best-effort lifecycle close signal for browser-window mode.
+      // Do this before marking socket stopped so the backend can terminate
+      // promptly when the user closes the external browser window.
+      __webuiSocketSendObject({
+        type: "lifecycle",
+        event: "window_closing",
+        client_id: __webuiClientId,
+      });
       __webuiSocketStopped = true;
       __webuiSocketOpen = false;
-      if (__webuiSocket && typeof __webuiSocket.close === "function") {
-        try {
-          __webuiSocket.close();
-        } catch (_) {}
-      }
-      __webuiSocket = null;
+      // Let the browser own socket teardown during unload.
     });
   }
   __webuiConnectPushSocket();
