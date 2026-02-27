@@ -360,7 +360,11 @@ test "shutdown in web mode does not terminate tracked browser child process" {
     try child.spawn();
     defer {
         core_runtime.terminateBrowserProcess(gpa.allocator(), @as(i64, @intCast(child.id)));
-        _ = child.wait() catch {};
+        // On macOS this test probes termination using waitpid(WNOHANG) below,
+        // which may already reap the child. Avoid double-wait on that platform.
+        if (builtin.os.tag != .macos) {
+            _ = child.wait() catch {};
+        }
     }
 
     win.state().state_mutex.lock();
@@ -409,11 +413,19 @@ test "shutdown in webview mode terminates tracked browser child process" {
 
     app.shutdown();
 
-    var alive = core_runtime.isProcessAlive(child_pid_i64);
+    const child_pid: std.posix.pid_t = @intCast(child_pid_i64);
+    var alive = true;
     var attempts: usize = 0;
     while (alive and attempts < 100) : (attempts += 1) {
         std.Thread.sleep(10 * std.time.ns_per_ms);
-        alive = core_runtime.isProcessAlive(child_pid_i64);
+        if (builtin.os.tag == .macos) {
+            // macOS can report a killed child as alive until it is reaped; use
+            // waitpid(WNOHANG) as authoritative termination detection.
+            const wait_res = std.posix.waitpid(child_pid, std.posix.W.NOHANG);
+            alive = wait_res.pid == 0;
+        } else {
+            alive = core_runtime.isProcessAlive(child_pid_i64);
+        }
     }
 
     try std.testing.expect(!alive);
