@@ -906,6 +906,18 @@ pub const WindowState = struct {
         }
     }
 
+    pub fn noteWsDisconnectLocked(self: *WindowState, reason: []const u8) void {
+        // Browser-window lifecycle should terminate backend when the window is
+        // gone, even when explicit lifecycle "window_closing" is not delivered
+        // (for example some browser/window-manager close paths).
+        // Keep grace semantics so refresh/reload reconnect can cancel shutdown.
+        if (self.runtime_render_state.active_surface != .browser_window) return;
+        if (self.close_requested.load(.acquire)) return;
+        if (self.ws_connections.items.len != 0) return;
+        self.rpc_state.logf(.debug, "[webui.lifecycle] scheduling close from ws disconnect reason={s}\n", .{reason});
+        self.scheduleLifecycleCloseLocked();
+    }
+
     pub fn closeWsConnectionLocked(self: *WindowState, connection_id: usize) void {
         for (self.ws_connections.items, 0..) |entry, idx| {
             if (entry.connection_id != connection_id) continue;

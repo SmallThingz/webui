@@ -777,6 +777,61 @@ test "window_closing lifecycle message is ignored in web-url mode without tracke
     try std.testing.expect(!should_close);
 }
 
+test "websocket disconnect schedules close in browser-window mode when last client is gone" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .browser_window, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "WsDisconnectCloseBrowserWindow" });
+    try win.showHtml("<html><body>ws-disconnect-close-browser-window</body></html>");
+    try app.run();
+
+    win.state().state_mutex.lock();
+    win.state().runtime_render_state.active_surface = .browser_window;
+    win.state().noteWsDisconnectLocked("test-disconnect");
+    const pending_after_disconnect = win.state().lifecycle_close_pending;
+    const close_immediate = win.state().close_requested.load(.acquire);
+    win.state().state_mutex.unlock();
+
+    try std.testing.expect(pending_after_disconnect);
+    try std.testing.expect(!close_immediate);
+
+    win.state().state_mutex.lock();
+    win.state().lifecycle_close_deadline_ms = std.time.milliTimestamp() - 1;
+    win.state().reconcileChildExit(gpa.allocator());
+    const should_close = win.state().close_requested.load(.acquire);
+    win.state().state_mutex.unlock();
+    try std.testing.expect(should_close);
+}
+
+test "websocket disconnect does not close backend in web-url mode" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "WsDisconnectNoCloseWebUrl" });
+    try win.showHtml("<html><body>ws-disconnect-no-close-web-url</body></html>");
+    try app.run();
+
+    win.state().state_mutex.lock();
+    win.state().runtime_render_state.active_surface = .web_url;
+    win.state().noteWsDisconnectLocked("test-disconnect");
+    const pending = win.state().lifecycle_close_pending;
+    const should_close = win.state().close_requested.load(.acquire);
+    win.state().state_mutex.unlock();
+
+    try std.testing.expect(!pending);
+    try std.testing.expect(!should_close);
+}
+
 test "non-linked tracked browser pid death detaches without close in web mode" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 

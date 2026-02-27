@@ -33,6 +33,7 @@ fn wsConnectionThreadMain(state: anytype, stream: std.net.Stream, connection_id:
     defer {
         state.state_mutex.lock();
         state.unregisterWsConnectionLocked(connection_id);
+        state.noteWsDisconnectLocked("websocket-disconnected");
         state.state_mutex.unlock();
         stream.close();
         state.emitDiagnostic("websocket.disconnected", .websocket, .info, "WebSocket client disconnected");
