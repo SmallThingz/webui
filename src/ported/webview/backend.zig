@@ -20,11 +20,12 @@ pub const NativeBackend = switch (builtin.os.tag) {
 test "native backend selects platform or none" {
     const native = NativeBackend.init(true);
     const fallback = NativeBackend.init(false);
-    try std.testing.expect(fallback == .none);
-    _ = native;
+    try std.testing.expect(native.isNative());
+    try std.testing.expect(!fallback.isNative());
 }
 
 pub const LinuxWebView = struct {
+    native_enabled: bool = false,
     window_id: usize = 0,
     title: []const u8 = "",
     style: style_types.WindowStyle = .{},
@@ -34,6 +35,21 @@ pub const LinuxWebView = struct {
     browser_kind: ?browser_discovery.BrowserKind = null,
     browser_pid: ?i64 = null,
     browser_is_child: bool = false,
+
+    pub fn init(enable_native: bool) LinuxWebView {
+        return .{ .native_enabled = enable_native };
+    }
+
+    pub fn deinit(self: *LinuxWebView) void {
+        self.native_host_ready = false;
+        self.browser_kind = null;
+        self.browser_pid = null;
+        self.browser_is_child = false;
+    }
+
+    pub fn isNative(self: *const LinuxWebView) bool {
+        return self.native_enabled;
+    }
 
     pub fn isReady(self: *const LinuxWebView) bool {
         return self.native_host_ready;
@@ -46,10 +62,12 @@ pub const LinuxWebView = struct {
     }
 
     pub fn showContent(self: *LinuxWebView, content: anytype) !void {
-        switch (content) {
-            .url => |url| self.navigate(url),
-            else => return error.UnsupportedWindowContent,
+        const Content = @TypeOf(content);
+        if (@hasField(Content, "url")) {
+            self.navigate(@field(content, "url"));
+            return;
         }
+        return error.UnsupportedWindowContent;
     }
 
     pub fn attachBrowserProcess(self: *LinuxWebView, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
@@ -201,6 +219,7 @@ pub const LinuxWebView = struct {
 };
 
 pub const Win32WebView = struct {
+    native_enabled: bool = false,
     window_id: usize = 0,
     title: []const u8 = "",
     style: style_types.WindowStyle = .{},
@@ -210,6 +229,21 @@ pub const Win32WebView = struct {
     browser_kind: ?browser_discovery.BrowserKind = null,
     browser_pid: ?i64 = null,
     browser_is_child: bool = false,
+
+    pub fn init(enable_native: bool) Win32WebView {
+        return .{ .native_enabled = enable_native };
+    }
+
+    pub fn deinit(self: *Win32WebView) void {
+        self.native_host_ready = false;
+        self.browser_kind = null;
+        self.browser_pid = null;
+        self.browser_is_child = false;
+    }
+
+    pub fn isNative(self: *const Win32WebView) bool {
+        return self.native_enabled;
+    }
 
     pub fn isReady(self: *const Win32WebView) bool {
         return self.native_host_ready;
@@ -222,10 +256,12 @@ pub const Win32WebView = struct {
     }
 
     pub fn showContent(self: *Win32WebView, content: anytype) !void {
-        switch (content) {
-            .url => |url| self.navigate(url),
-            else => return error.UnsupportedWindowContent,
+        const Content = @TypeOf(content);
+        if (@hasField(Content, "url")) {
+            self.navigate(@field(content, "url"));
+            return;
         }
+        return error.UnsupportedWindowContent;
     }
 
     pub fn attachBrowserProcess(self: *Win32WebView, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
@@ -377,6 +413,7 @@ pub const Win32WebView = struct {
 };
 
 pub const MacWebView = struct {
+    native_enabled: bool = false,
     window_id: usize = 0,
     title: []const u8 = "",
     style: style_types.WindowStyle = .{},
@@ -386,6 +423,21 @@ pub const MacWebView = struct {
     browser_kind: ?browser_discovery.BrowserKind = null,
     browser_pid: ?i64 = null,
     browser_is_child: bool = false,
+
+    pub fn init(enable_native: bool) MacWebView {
+        return .{ .native_enabled = enable_native };
+    }
+
+    pub fn deinit(self: *MacWebView) void {
+        self.native_host_ready = false;
+        self.browser_kind = null;
+        self.browser_pid = null;
+        self.browser_is_child = false;
+    }
+
+    pub fn isNative(self: *const MacWebView) bool {
+        return self.native_enabled;
+    }
 
     pub fn isReady(self: *const MacWebView) bool {
         return self.native_host_ready;
@@ -398,10 +450,12 @@ pub const MacWebView = struct {
     }
 
     pub fn showContent(self: *MacWebView, content: anytype) !void {
-        switch (content) {
-            .url => |url| self.navigate(url),
-            else => return error.UnsupportedWindowContent,
+        const Content = @TypeOf(content);
+        if (@hasField(Content, "url")) {
+            self.navigate(@field(content, "url"));
+            return;
         }
+        return error.UnsupportedWindowContent;
     }
 
     pub fn attachBrowserProcess(self: *MacWebView, kind: ?browser_discovery.BrowserKind, pid: ?i64, is_child_process: bool) void {
@@ -571,4 +625,3 @@ fn supportsChromiumStyle(kind: browser_discovery.BrowserKind) bool {
         else => false,
     };
 }
-

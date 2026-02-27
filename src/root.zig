@@ -14,7 +14,10 @@ const webview_backend = @import("ported/webview/backend.zig");
 const api_types = @import("root/api_types.zig");
 const launch_policy = @import("root/launch_policy.zig");
 const rpc_reflect = @import("root/rpc_reflect.zig");
+const rpc_runtime = @import("root/rpc_runtime.zig");
+const root_utils = @import("root/utils.zig");
 const net_io = @import("root/net_io.zig");
+const server_routes = @import("root/server_routes.zig");
 const runtime_requirements = @import("runtime_requirements.zig");
 
 pub const runtime = core_runtime;
@@ -84,21 +87,10 @@ const launchPolicyOrder = launch_policy.order;
 const launchPolicyContains = launch_policy.contains;
 const launchPolicyNextAfter = launch_policy.nextAfter;
 
-const HttpRequest = net_io.HttpRequest;
-const pathWithoutQuery = net_io.pathWithoutQuery;
-const wsClientTokenFromUrl = net_io.wsClientTokenFromUrl;
-const httpHeaderValue = net_io.httpHeaderValue;
-const readHttpRequest = net_io.readHttpRequest;
-const readWsInboundFrameAlloc = net_io.readWsInboundFrameAlloc;
-const containsTokenIgnoreCase = net_io.containsTokenIgnoreCase;
-const writeWebSocketHandshakeResponse = net_io.writeWebSocketHandshakeResponse;
-const writeHttpResponse = net_io.writeHttpResponse;
-const contentTypeForPath = net_io.contentTypeForPath;
 const readAllFromStream = net_io.readAllFromStream;
 const httpRoundTrip = net_io.httpRoundTrip;
 const httpRoundTripWithHeaders = net_io.httpRoundTripWithHeaders;
 const readHttpHeadersFromStream = net_io.readHttpHeadersFromStream;
-const httpResponseBody = net_io.httpResponseBody;
 
 const EventCallbackState = struct {
     handler: ?EventHandler = null,
@@ -162,38 +154,8 @@ fn backendWarningForError(err: anyerror, will_fallback: bool) ?[]const u8 {
     };
 }
 
-const RpcHandlerEntry = struct {
-    name: []u8,
-    arity: usize,
-    invoker: RpcInvokeFn,
-    ts_arg_signature: []u8,
-    ts_return_type: []u8,
-};
-
-const RpcTask = struct {
-    allocator: std.mem.Allocator,
-    payload_json: []u8,
-    done: bool = false,
-    result_json: ?[]u8 = null,
-    err: ?anyerror = null,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
-
-    fn init(allocator: std.mem.Allocator, payload_json: []const u8) !*RpcTask {
-        const task = try allocator.create(RpcTask);
-        task.* = .{
-            .allocator = allocator,
-            .payload_json = try allocator.dupe(u8, payload_json),
-        };
-        return task;
-    }
-
-    fn deinit(self: *RpcTask) void {
-        self.allocator.free(self.payload_json);
-        if (self.result_json) |result| self.allocator.free(result);
-        self.allocator.destroy(self);
-    }
-};
+const RpcHandlerEntry = rpc_runtime.HandlerEntry;
+const RpcRegistryState = rpc_runtime.State;
 
 const ClientSession = struct {
     token: []u8,
@@ -239,329 +201,6 @@ const ScriptTask = struct {
         if (self.value_json) |value| self.allocator.free(value);
         if (self.error_message) |msg| self.allocator.free(msg);
         self.allocator.destroy(self);
-    }
-};
-
-const RpcRegistryState = struct {
-    handlers: std.array_list.Managed(RpcHandlerEntry),
-    generated_script: ?[]u8,
-    generated_typescript: ?[]u8,
-    bridge_options: BridgeOptions,
-    dispatcher_mode: DispatcherMode,
-    custom_dispatcher: ?CustomDispatcher,
-    custom_context: ?*anyopaque,
-    threaded_poll_interval_ns: u64,
-    invoke_mutex: std.Thread.Mutex,
-
-    queue_mutex: std.Thread.Mutex,
-    queue_cond: std.Thread.Condition,
-    queue: std.array_list.Managed(*RpcTask),
-    worker_thread: ?std.Thread,
-    worker_stop: std.atomic.Value(bool),
-    worker_lifecycle_mutex: std.Thread.Mutex,
-    log_enabled: bool,
-
-    fn init(allocator: std.mem.Allocator, log_enabled: bool) RpcRegistryState {
-        return .{
-            .handlers = std.array_list.Managed(RpcHandlerEntry).init(allocator),
-            .generated_script = null,
-            .generated_typescript = null,
-            .bridge_options = .{},
-            .dispatcher_mode = .sync,
-            .custom_dispatcher = null,
-            .custom_context = null,
-            .threaded_poll_interval_ns = 2 * std.time.ns_per_ms,
-            .invoke_mutex = .{},
-            .queue_mutex = .{},
-            .queue_cond = .{},
-            .queue = std.array_list.Managed(*RpcTask).init(allocator),
-            .worker_thread = null,
-            .worker_stop = std.atomic.Value(bool).init(false),
-            .worker_lifecycle_mutex = .{},
-            .log_enabled = log_enabled,
-        };
-    }
-
-    fn deinit(self: *RpcRegistryState, allocator: std.mem.Allocator) void {
-        self.stopWorker();
-
-        self.queue_mutex.lock();
-        while (self.queue.items.len > 0) {
-            const task = self.queue.items[self.queue.items.len - 1];
-            _ = self.queue.pop();
-            task.deinit();
-        }
-        self.queue_mutex.unlock();
-        self.queue.deinit();
-
-        for (self.handlers.items) |handler| {
-            allocator.free(handler.name);
-            allocator.free(handler.ts_arg_signature);
-            allocator.free(handler.ts_return_type);
-        }
-        self.handlers.deinit();
-
-        if (self.generated_script) |buf| {
-            allocator.free(buf);
-            self.generated_script = null;
-        }
-        if (self.generated_typescript) |buf| {
-            allocator.free(buf);
-            self.generated_typescript = null;
-        }
-    }
-
-    fn addFunction(
-        self: *RpcRegistryState,
-        allocator: std.mem.Allocator,
-        function_name: []const u8,
-        arity: usize,
-        invoker: RpcInvokeFn,
-        ts_arg_signature: []const u8,
-        ts_return_type: []const u8,
-    ) !void {
-        for (self.handlers.items) |*existing| {
-            if (std.mem.eql(u8, existing.name, function_name)) {
-                existing.arity = arity;
-                existing.invoker = invoker;
-                allocator.free(existing.ts_arg_signature);
-                allocator.free(existing.ts_return_type);
-                existing.ts_arg_signature = try allocator.dupe(u8, ts_arg_signature);
-                existing.ts_return_type = try allocator.dupe(u8, ts_return_type);
-                if (self.generated_script) |buf| {
-                    allocator.free(buf);
-                    self.generated_script = null;
-                }
-                if (self.generated_typescript) |buf| {
-                    allocator.free(buf);
-                    self.generated_typescript = null;
-                }
-                return;
-            }
-        }
-
-        try self.handlers.append(.{
-            .name = try allocator.dupe(u8, function_name),
-            .arity = arity,
-            .invoker = invoker,
-            .ts_arg_signature = try allocator.dupe(u8, ts_arg_signature),
-            .ts_return_type = try allocator.dupe(u8, ts_return_type),
-        });
-
-        if (self.generated_script) |buf| {
-            allocator.free(buf);
-            self.generated_script = null;
-        }
-        if (self.generated_typescript) |buf| {
-            allocator.free(buf);
-            self.generated_typescript = null;
-        }
-    }
-
-    fn rebuildScript(self: *RpcRegistryState, allocator: std.mem.Allocator, options: BridgeOptions) !void {
-        self.bridge_options = options;
-
-        if (self.generated_script) |buf| {
-            allocator.free(buf);
-            self.generated_script = null;
-        }
-
-        const metas = try allocator.alloc(bridge_template.RpcFunctionMeta, self.handlers.items.len);
-        defer allocator.free(metas);
-
-        for (self.handlers.items, 0..) |handler, i| {
-            metas[i] = .{
-                .name = handler.name,
-                .arity = handler.arity,
-                .ts_arg_signature = handler.ts_arg_signature,
-                .ts_return_type = handler.ts_return_type,
-            };
-        }
-
-        self.generated_script = try bridge_template.render(allocator, .{
-            .namespace = options.namespace,
-            .rpc_route = options.rpc_route,
-        }, metas);
-    }
-
-    fn rebuildTypeScript(self: *RpcRegistryState, allocator: std.mem.Allocator, options: BridgeOptions) !void {
-        self.bridge_options = options;
-
-        if (self.generated_typescript) |buf| {
-            allocator.free(buf);
-            self.generated_typescript = null;
-        }
-
-        const metas = try allocator.alloc(bridge_template.RpcFunctionMeta, self.handlers.items.len);
-        defer allocator.free(metas);
-
-        for (self.handlers.items, 0..) |handler, i| {
-            metas[i] = .{
-                .name = handler.name,
-                .arity = handler.arity,
-                .ts_arg_signature = handler.ts_arg_signature,
-                .ts_return_type = handler.ts_return_type,
-            };
-        }
-
-        self.generated_typescript = try bridge_template.renderTypeScriptDeclarations(allocator, .{
-            .namespace = options.namespace,
-            .rpc_route = options.rpc_route,
-        }, metas);
-    }
-
-    fn findHandler(self: *const RpcRegistryState, function_name: []const u8) ?RpcHandlerEntry {
-        for (self.handlers.items) |handler| {
-            if (std.mem.eql(u8, handler.name, function_name)) return handler;
-        }
-        return null;
-    }
-
-    fn invokeSync(
-        self: *RpcRegistryState,
-        allocator: std.mem.Allocator,
-        function_name: []const u8,
-        args: []const std.json.Value,
-    ) ![]u8 {
-        const handler = self.findHandler(function_name) orelse return error.UnknownRpcFunction;
-
-        if (self.dispatcher_mode == .custom and self.custom_dispatcher != null) {
-            return try self.custom_dispatcher.?(self.custom_context, function_name, handler.invoker, allocator, args);
-        }
-
-        return try handler.invoker(allocator, args);
-    }
-
-    fn ensureWorkerStarted(self: *RpcRegistryState) !void {
-        self.worker_lifecycle_mutex.lock();
-        defer self.worker_lifecycle_mutex.unlock();
-
-        if (self.dispatcher_mode != .threaded) return;
-        if (self.worker_thread != null) return;
-
-        self.worker_stop.store(false, .release);
-        self.worker_thread = try std.Thread.spawn(.{}, rpcWorkerMain, .{self});
-    }
-
-    fn stopWorker(self: *RpcRegistryState) void {
-        self.worker_lifecycle_mutex.lock();
-        defer self.worker_lifecycle_mutex.unlock();
-
-        self.worker_stop.store(true, .release);
-        self.queue_cond.broadcast();
-        if (self.worker_thread) |thread| {
-            thread.join();
-            self.worker_thread = null;
-        }
-    }
-
-    fn invokeFromJsonPayload(self: *RpcRegistryState, allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
-        if (self.dispatcher_mode != .threaded) {
-            return try self.invokeFromJsonPayloadSync(allocator, payload_json);
-        }
-
-        try self.ensureWorkerStarted();
-
-        const task = try RpcTask.init(allocator, payload_json);
-        errdefer task.deinit();
-
-        self.queue_mutex.lock();
-        try self.queue.append(task);
-        self.queue_cond.signal();
-        self.queue_mutex.unlock();
-
-        task.mutex.lock();
-        const wait_ns = if (self.threaded_poll_interval_ns == 0) std.time.ns_per_ms else self.threaded_poll_interval_ns;
-        while (!task.done) {
-            task.cond.timedWait(&task.mutex, wait_ns) catch {};
-        }
-
-        if (task.err) |err| {
-            task.mutex.unlock();
-            task.deinit();
-            return err;
-        }
-
-        const out = task.result_json orelse {
-            task.mutex.unlock();
-            task.deinit();
-            return error.InvalidRpcResult;
-        };
-        const result = try allocator.dupe(u8, out);
-        task.mutex.unlock();
-        task.deinit();
-        return result;
-    }
-
-    fn invokeFromJsonPayloadSync(self: *RpcRegistryState, allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
-        defer parsed.deinit();
-
-        const root = parsed.value;
-        if (root != .object) return error.InvalidRpcPayload;
-
-        const fn_value = root.object.get("name") orelse return error.InvalidRpcPayload;
-        if (fn_value != .string) return error.InvalidRpcPayload;
-        const function_name = fn_value.string;
-
-        const args_value = root.object.get("args") orelse return error.InvalidRpcPayload;
-        if (args_value != .array) return error.InvalidRpcPayload;
-
-        if (self.log_enabled) {
-            const args_json = try std.json.Stringify.valueAlloc(allocator, args_value, .{});
-            defer allocator.free(args_json);
-            std.debug.print("[webui.rpc] recv name={s} args={s}\n", .{ function_name, args_json });
-        }
-
-        const encoded_value = try self.invokeSync(allocator, function_name, args_value.array.items);
-        defer allocator.free(encoded_value);
-
-        if (self.log_enabled) {
-            std.debug.print("[webui.rpc] send name={s} value={s}\n", .{ function_name, encoded_value });
-        }
-
-        var out = std.array_list.Managed(u8).init(allocator);
-        errdefer out.deinit();
-
-        try out.appendSlice("{\"value\":");
-        try out.appendSlice(encoded_value);
-        try out.appendSlice("}");
-
-        return out.toOwnedSlice();
-    }
-
-    fn rpcWorkerMain(self: *RpcRegistryState) void {
-        const poll_ns = if (self.threaded_poll_interval_ns == 0) std.time.ns_per_ms else self.threaded_poll_interval_ns;
-        while (!self.worker_stop.load(.acquire)) {
-            self.queue_mutex.lock();
-            while (self.queue.items.len == 0 and !self.worker_stop.load(.acquire)) {
-                self.queue_cond.timedWait(&self.queue_mutex, poll_ns) catch {};
-            }
-
-            const task = if (self.queue.items.len == 0) null else blk: {
-                const popped = self.queue.orderedRemove(0);
-                break :blk popped;
-            };
-            self.queue_mutex.unlock();
-
-            if (task == null) continue;
-            const work = task.?;
-
-            const result = self.invokeFromJsonPayloadSync(work.allocator, work.payload_json) catch |err| {
-                work.mutex.lock();
-                work.err = err;
-                work.done = true;
-                work.cond.signal();
-                work.mutex.unlock();
-                continue;
-            };
-
-            work.mutex.lock();
-            work.result_json = result;
-            work.done = true;
-            work.cond.signal();
-            work.mutex.unlock();
-        }
     }
 };
 
@@ -802,7 +441,7 @@ const WindowState = struct {
         return self.runtime_render_state.active_transport == .native_webview and self.backend.isNative();
     }
 
-    fn capabilities(self: *const WindowState) []const WindowCapability {
+    pub fn capabilities(self: *const WindowState) []const WindowCapability {
         if (self.isNativeWindowActive()) {
             if (self.native_capabilities.len > 0) return self.native_capabilities;
             if (self.window_fallback_emulation) return emulated_capabilities[0..];
@@ -859,7 +498,7 @@ const WindowState = struct {
         return false;
     }
 
-    fn applyStyle(self: *WindowState, allocator: std.mem.Allocator, style: WindowStyle) !void {
+    pub fn applyStyle(self: *WindowState, allocator: std.mem.Allocator, style: WindowStyle) !void {
         try self.setStyleOwned(allocator, style);
         self.clearWarning();
         if (self.isNativeWindowActive()) {
@@ -882,7 +521,7 @@ const WindowState = struct {
         return error.UnsupportedWindowStyle;
     }
 
-    fn control(self: *WindowState, cmd: WindowControl) !WindowControlResult {
+    pub fn control(self: *WindowState, cmd: WindowControl) !WindowControlResult {
         self.emit(.window_state, "control", @tagName(cmd));
         self.clearWarning();
 
@@ -940,7 +579,7 @@ const WindowState = struct {
         };
     }
 
-    fn emitDiagnostic(
+    pub fn emitDiagnostic(
         self: *WindowState,
         code: []const u8,
         category: DiagnosticCategory,
@@ -1231,7 +870,7 @@ const WindowState = struct {
         connection_id: usize,
     };
 
-    fn findOrCreateClientSessionLocked(self: *WindowState, token: []const u8) !ClientRef {
+    pub fn findOrCreateClientSessionLocked(self: *WindowState, token: []const u8) !ClientRef {
         const now_ms = std.time.milliTimestamp();
         for (self.client_sessions.items) |*session| {
             if (!std.mem.eql(u8, session.token, token)) continue;
@@ -1293,7 +932,7 @@ const WindowState = struct {
         }
     }
 
-    fn writeWsFrame(stream: std.net.Stream, opcode: websocket.OpCode, payload: []const u8) !void {
+    pub fn writeWsFrame(stream: std.net.Stream, opcode: websocket.OpCode, payload: []const u8) !void {
         var header_buf: [10]u8 = undefined;
         const header = websocket.proto.writeFrameHeader(&header_buf, opcode, payload.len, false);
         try writeSocketAll(stream.handle, header);
@@ -1306,7 +945,7 @@ const WindowState = struct {
         try writeWsFrame(stream, .text, payload);
     }
 
-    fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, stream: std.net.Stream) !void {
+    pub fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, stream: std.net.Stream) !void {
         for (self.ws_connections.items) |*entry| {
             if (entry.connection_id != connection_id) continue;
             entry.stream.close();
@@ -1319,7 +958,7 @@ const WindowState = struct {
         });
     }
 
-    fn unregisterWsConnectionLocked(self: *WindowState, connection_id: usize) void {
+    pub fn unregisterWsConnectionLocked(self: *WindowState, connection_id: usize) void {
         for (self.ws_connections.items, 0..) |entry, idx| {
             if (entry.connection_id != connection_id) continue;
             _ = self.ws_connections.orderedRemove(idx);
@@ -1362,7 +1001,7 @@ const WindowState = struct {
         return null;
     }
 
-    fn dispatchPendingScriptTasksLocked(self: *WindowState) !void {
+    pub fn dispatchPendingScriptTasksLocked(self: *WindowState) !void {
         var idx: usize = 0;
         while (idx < self.script_pending.items.len) {
             const task = self.script_pending.items[idx];
@@ -1543,7 +1182,7 @@ const WindowState = struct {
         task.mutex.unlock();
     }
 
-    fn handleWebSocketClientMessage(self: *WindowState, _: usize, data: []const u8) !void {
+    pub fn handleWebSocketClientMessage(self: *WindowState, _: usize, data: []const u8) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
         defer parsed.deinit();
 
@@ -1772,7 +1411,7 @@ const WindowState = struct {
             self.connection_mutex.unlock();
         }
 
-        const transfer_ownership = handleConnection(self, std.heap.page_allocator, stream) catch {
+        const transfer_ownership = server_routes.handleConnection(self, std.heap.page_allocator, stream, default_client_token) catch {
             stream.close();
             return;
         };
@@ -2781,414 +2420,12 @@ pub const RpcRegistry = struct {
     }
 };
 
-fn bridgeOptionsEqual(lhs: BridgeOptions, rhs: BridgeOptions) bool {
-    return std.mem.eql(u8, lhs.namespace, rhs.namespace) and
-        std.mem.eql(u8, lhs.script_route, rhs.script_route) and
-        std.mem.eql(u8, lhs.rpc_route, rhs.rpc_route);
-}
-
 const buildTsArgSignature = rpc_reflect.buildTsArgSignature;
 const tsTypeNameForReturn = rpc_reflect.tsTypeNameForReturn;
 const makeInvoker = rpc_reflect.makeInvoker;
-
-fn replaceOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
-    if (target.*) |buf| {
-        allocator.free(buf);
-    }
-    target.* = try allocator.dupe(u8, value);
-}
-
-fn isLikelyUrl(url: []const u8) bool {
-    return isHttpUrl(url) or std.mem.startsWith(u8, url, "file://");
-}
-
-fn isHttpUrl(url: []const u8) bool {
-    return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
-}
-
-fn wsConnectionThreadMain(state: *WindowState, stream: std.net.Stream, connection_id: usize) void {
-    defer {
-        state.state_mutex.lock();
-        state.unregisterWsConnectionLocked(connection_id);
-        state.state_mutex.unlock();
-        stream.close();
-        state.emitDiagnostic("websocket.disconnected", .websocket, .info, "WebSocket client disconnected");
-
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.ws] disconnected connection_id={d}\n", .{connection_id});
-        }
-    }
-
-    while (!state.server_stop.load(.acquire)) {
-        const frame = readWsInboundFrameAlloc(state.allocator, stream, 8 * 1024 * 1024) catch |err| {
-            if (state.rpc_state.log_enabled and err != error.Closed) {
-                std.debug.print("[webui.ws] read failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
-            }
-            if (err != error.Closed) {
-                state.emitDiagnostic("websocket.read_error", .websocket, .warn, @errorName(err));
-            }
-            return;
-        };
-        defer state.allocator.free(frame.payload);
-
-        switch (frame.kind) {
-            .text, .binary => {
-                state.handleWebSocketClientMessage(connection_id, frame.payload) catch |err| {
-                    if (state.rpc_state.log_enabled) {
-                        std.debug.print("[webui.ws] message handling failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
-                    }
-                };
-            },
-            .ping => {
-                WindowState.writeWsFrame(stream, .pong, frame.payload) catch return;
-            },
-            .pong => {},
-            .close => {
-                WindowState.writeWsFrame(stream, .close, frame.payload) catch {};
-                return;
-            },
-        }
-    }
-}
-
-fn handleWebSocketUpgradeRoute(state: *WindowState, stream: std.net.Stream, request: HttpRequest, path_only: []const u8) !bool {
-    if (!std.mem.eql(u8, request.method, "GET")) return false;
-    if (!std.mem.eql(u8, path_only, "/webui/ws")) return false;
-
-    const upgrade = httpHeaderValue(request.headers, "Upgrade") orelse {
-        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Upgrade header");
-        return false;
-    };
-    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) {
-        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "invalid Upgrade header");
-        return false;
-    }
-
-    const connection = httpHeaderValue(request.headers, "Connection") orelse {
-        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Connection header");
-        return false;
-    };
-    if (!containsTokenIgnoreCase(connection, "upgrade")) {
-        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "invalid Connection header");
-        return false;
-    }
-
-    const version = httpHeaderValue(request.headers, "Sec-WebSocket-Version") orelse {
-        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Version header");
-        return false;
-    };
-    if (!std.mem.eql(u8, std.mem.trim(u8, version, " \t"), "13")) {
-        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "unsupported websocket version");
-        return false;
-    }
-
-    const sec_key = httpHeaderValue(request.headers, "Sec-WebSocket-Key") orelse {
-        try writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Key header");
-        return false;
-    };
-
-    try writeWebSocketHandshakeResponse(stream, sec_key);
-
-    const token = wsClientTokenFromUrl(request.path, default_client_token);
-    var connection_id: usize = 0;
-    state.state_mutex.lock();
-    {
-        const client_ref = try state.findOrCreateClientSessionLocked(token);
-        connection_id = client_ref.connection_id;
-        try state.registerWsConnectionLocked(connection_id, stream);
-        try state.dispatchPendingScriptTasksLocked();
-    }
-    state.state_mutex.unlock();
-
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.ws] connected connection_id={d}\n", .{connection_id});
-    }
-    state.emitDiagnostic("websocket.connected", .websocket, .info, "WebSocket client connected");
-
-    const thread = try std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, stream, connection_id });
-    thread.detach();
-    return true;
-}
-
-fn handleConnection(state: *WindowState, allocator: std.mem.Allocator, stream: std.net.Stream) !bool {
-    const request = try readHttpRequest(allocator, stream);
-    defer allocator.free(request.raw);
-
-    const path_only = pathWithoutQuery(request.path);
-    if (try handleWebSocketUpgradeRoute(state, stream, request, path_only)) return true;
-
-    // Keep lifecycle/script/job control on WS only. Do not re-introduce HTTP fallback
-    // routes for these flows, because they cause duplicate semantics and polling paths.
-    if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return false;
-    if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body)) return false;
-    if (try handleWindowControlRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
-    if (try handleWindowStyleRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
-    if (try handleWindowContentRoute(state, allocator, stream, request.method, path_only)) return false;
-
-    try writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "not found");
-    return false;
-}
-
-fn handleBridgeScriptRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "GET")) return false;
-    const script_route = state.rpc_state.bridge_options.script_route;
-    if (!std.mem.eql(u8, path_only, script_route)) return false;
-
-    const script_copy = blk: {
-        state.rpc_state.invoke_mutex.lock();
-        defer state.rpc_state.invoke_mutex.unlock();
-
-        if (state.rpc_state.generated_script == null) {
-            try state.rpc_state.rebuildScript(allocator, state.rpc_state.bridge_options);
-        }
-        const script = state.rpc_state.generated_script orelse bridge_template.default_script;
-        break :blk try allocator.dupe(u8, script);
-    };
-    defer allocator.free(script_copy);
-
-    try writeHttpResponse(stream, 200, "application/javascript; charset=utf-8", script_copy);
-    return true;
-}
-
-fn handleRpcRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-    headers: []const u8,
-    body: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "POST")) return false;
-    if (!std.mem.eql(u8, path_only, state.rpc_state.bridge_options.rpc_route)) return false;
-
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.rpc] raw body={s}\n", .{body});
-    }
-
-    const client_token = httpHeaderValue(headers, "x-webui-client-id") orelse default_client_token;
-    state.state_mutex.lock();
-    const client_ref = state.findOrCreateClientSessionLocked(client_token) catch null;
-    state.state_mutex.unlock();
-
-    state.rpc_state.invoke_mutex.lock();
-    const payload = state.rpc_state.invokeFromJsonPayload(allocator, body) catch |err| {
-        state.rpc_state.invoke_mutex.unlock();
-        state.emitDiagnostic("rpc.dispatch.error", .rpc, .warn, @errorName(err));
-        const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-        defer allocator.free(err_body);
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.rpc] error={s}\n", .{@errorName(err)});
-        }
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_body);
-        return true;
-    };
-    state.rpc_state.invoke_mutex.unlock();
-    defer allocator.free(payload);
-
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.rpc] http response={s}\n", .{payload});
-    }
-
-    if (state.event_callback.handler) |handler| {
-        const event = Event{
-            .window_id = state.id,
-            .kind = .rpc,
-            .name = "rpc",
-            .payload = "rpc-dispatch",
-            .client_id = if (client_ref) |ref| ref.client_id else null,
-            .connection_id = if (client_ref) |ref| ref.connection_id else null,
-        };
-        handler(state.event_callback.context, &event);
-    }
-
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-    return true;
-}
-
-fn handleWindowControlRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-    body: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, path_only, "/webui/window/control")) return false;
-
-    if (std.mem.eql(u8, method, "GET")) {
-        state.state_mutex.lock();
-        const caps = state.capabilities();
-        const emulation_enabled = state.window_fallback_emulation;
-        state.state_mutex.unlock();
-        const payload = try std.json.Stringify.valueAlloc(allocator, .{
-            .capabilities = caps,
-            .emulation_enabled = emulation_enabled,
-        }, .{});
-        defer allocator.free(payload);
-        try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-        return true;
-    }
-
-    if (!std.mem.eql(u8, method, "POST")) return false;
-
-    const Req = struct {
-        cmd: []const u8,
-    };
-    var parsed = std.json.parseFromSlice(Req, allocator, body, .{ .ignore_unknown_fields = true }) catch {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_control_request\"}");
-        return true;
-    };
-    defer parsed.deinit();
-
-    const cmd = std.meta.stringToEnum(WindowControl, parsed.value.cmd) orelse {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"unknown_window_control\"}");
-        return true;
-    };
-
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.window] control cmd={s}\n", .{@tagName(cmd)});
-    }
-
-    state.state_mutex.lock();
-    const result = state.control(cmd) catch |err| {
-        state.state_mutex.unlock();
-        const err_payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-        defer allocator.free(err_payload);
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.window] control error={s}\n", .{@errorName(err)});
-        }
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_payload);
-        return true;
-    };
-    state.state_mutex.unlock();
-
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.window] control result success={any} emulation={s} closed={any} warning={s}\n", .{
-            result.success,
-            result.emulation orelse "",
-            result.closed,
-            result.warning orelse "",
-        });
-    }
-
-    const payload = try std.json.Stringify.valueAlloc(allocator, .{
-        .success = result.success,
-        .emulation = result.emulation,
-        .closed = result.closed,
-        .warning = result.warning,
-    }, .{});
-    defer allocator.free(payload);
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-    return true;
-}
-
-fn handleWindowStyleRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-    body: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, path_only, "/webui/window/style")) return false;
-
-    if (std.mem.eql(u8, method, "GET")) {
-        state.state_mutex.lock();
-        const style = state.current_style;
-        state.state_mutex.unlock();
-        const payload = try std.json.Stringify.valueAlloc(allocator, style, .{});
-        defer allocator.free(payload);
-        try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-        return true;
-    }
-
-    if (!std.mem.eql(u8, method, "POST")) return false;
-
-    var parsed = std.json.parseFromSlice(WindowStyle, allocator, body, .{ .ignore_unknown_fields = true }) catch {
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_window_style\"}");
-        return true;
-    };
-    defer parsed.deinit();
-
-    state.state_mutex.lock();
-    state.applyStyle(allocator, parsed.value) catch |err| {
-        state.state_mutex.unlock();
-        const err_payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-        defer allocator.free(err_payload);
-        if (state.rpc_state.log_enabled) {
-            std.debug.print("[webui.window] style error={s}\n", .{@errorName(err)});
-        }
-        try writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_payload);
-        return true;
-    };
-    const style = state.current_style;
-    state.state_mutex.unlock();
-
-    if (state.rpc_state.log_enabled) {
-        std.debug.print("[webui.window] style applied frameless={any} transparent={any} corner_radius={any}\n", .{
-            style.frameless,
-            style.transparent,
-            style.corner_radius,
-        });
-    }
-
-    const payload = try std.json.Stringify.valueAlloc(allocator, style, .{});
-    defer allocator.free(payload);
-    try writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
-    return true;
-}
-
-fn handleWindowContentRoute(
-    state: *WindowState,
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    method: []const u8,
-    path_only: []const u8,
-) !bool {
-    if (!std.mem.eql(u8, method, "GET")) return false;
-    if (!std.mem.eql(u8, path_only, "/") and !std.mem.eql(u8, path_only, "/index.html")) return false;
-
-    state.state_mutex.lock();
-    defer state.state_mutex.unlock();
-
-    if (state.last_html) |html| {
-        try writeHttpResponse(stream, 200, "text/html; charset=utf-8", html);
-        return true;
-    }
-
-    if (state.last_file) |file_path| {
-        const data = std.fs.cwd().readFileAlloc(allocator, file_path, 8 * 1024 * 1024) catch {
-            try writeHttpResponse(stream, 500, "text/plain; charset=utf-8", "failed to read file");
-            return true;
-        };
-        defer allocator.free(data);
-        try writeHttpResponse(stream, 200, contentTypeForPath(file_path), data);
-        return true;
-    }
-
-    if (state.last_url) |url| {
-        if (isHttpUrl(url)) {
-            const redirect = try std.fmt.allocPrint(
-                allocator,
-                "<html><head><meta http-equiv=\"refresh\" content=\"0; url={s}\" /></head><body>Redirecting...</body></html>",
-                .{url},
-            );
-            defer allocator.free(redirect);
-            try writeHttpResponse(stream, 200, "text/html; charset=utf-8", redirect);
-            return true;
-        }
-    }
-
-    try writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "no content");
-    return true;
-}
+const bridgeOptionsEqual = root_utils.bridgeOptionsEqual;
+const replaceOwned = root_utils.replaceOwned;
+const isLikelyUrl = root_utils.isLikelyUrl;
 
 test "window lifecycle" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
