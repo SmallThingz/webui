@@ -179,6 +179,7 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
 
     const allocator = gpa.allocator();
     const app_options = appOptionsFor(kind);
+    const run_mode_spec = parseRunModeSpec(webui.BuildFlags.run_mode);
 
     var service = try webui.Service.init(allocator, RpcMethods, .{
         .app = app_options,
@@ -205,6 +206,11 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
 
     try service.showHtml(html);
     try service.run();
+    if (shouldAutoOpenTab(run_mode_spec)) {
+        service.openInBrowserWithOptions(app_options.browser_launch) catch |err| {
+            std.debug.print("[{s}] web-tab launch failed: {s}\n", .{ tagFor(kind), @errorName(err) });
+        };
+    }
 
     const has_frontend_rpc_demo = kind == .call_js_from_zig or kind == .call_js_oop or kind == .bidirectional_rpc;
     // Keep backend->frontend RPC examples explicit here so future refactors do not
@@ -268,6 +274,13 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
     }
 
     service.shutdown();
+}
+
+fn shouldAutoOpenTab(spec: RunModeSpec) bool {
+    return spec.launch_policy.first == .web_url and
+        spec.launch_policy.second == null and
+        spec.launch_policy.third == null and
+        spec.browser_launch_preference == .web_tab;
 }
 
 fn onEventLog(_: ?*anyopaque, event: *const webui.Event) void {
