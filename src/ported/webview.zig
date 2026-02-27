@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const style_types = @import("../root/window_style.zig");
 const browser_discovery = @import("browser_discovery.zig");
 const core_runtime = @import("webui.zig");
+const linux_webview_host = @import("../backends/linux_webview_host.zig");
 
 pub const WindowContent = union(enum) {
     html: []const u8,
@@ -33,6 +34,7 @@ pub const LinuxWebView = struct {
     hidden: bool = false,
     maximized: bool = false,
     native_host_ready: bool = false,
+    host: ?*linux_webview_host.Host = null,
     browser_kind: ?browser_discovery.BrowserKind = null,
     browser_pid: ?i64 = null,
     browser_is_child: bool = false,
@@ -42,6 +44,10 @@ pub const LinuxWebView = struct {
     }
 
     pub fn deinit(self: *LinuxWebView) void {
+        if (self.host) |host| {
+            host.deinit();
+            self.host = null;
+        }
         self.native_host_ready = false;
         self.browser_kind = null;
         self.browser_pid = null;
@@ -53,19 +59,40 @@ pub const LinuxWebView = struct {
     }
 
     pub fn isReady(self: *const LinuxWebView) bool {
-        return self.native_host_ready;
+        if (!self.native_host_ready) return false;
+        if (self.host) |host| return host.isReady();
+        return false;
     }
 
     pub fn createWindow(self: *LinuxWebView, window_id: usize, title: []const u8, style: style_types.WindowStyle) !void {
         self.window_id = window_id;
         self.title = title;
         self.style = style;
+        if (!self.native_enabled) return;
+        if (builtin.is_test) {
+            self.native_host_ready = false;
+            return;
+        }
+
+        if (self.host == null) {
+            self.host = linux_webview_host.Host.start(std.heap.page_allocator, title, style) catch {
+                self.native_host_ready = false;
+                return error.NativeBackendUnavailable;
+            };
+        }
+        if (self.host) |host| {
+            try host.applyStyle(style);
+            self.native_host_ready = host.isReady();
+            return;
+        }
+        self.native_host_ready = false;
+        return error.NativeBackendUnavailable;
     }
 
     pub fn showContent(self: *LinuxWebView, content: anytype) !void {
         const Content = @TypeOf(content);
         if (@hasField(Content, "url")) {
-            self.navigate(@field(content, "url"));
+            try self.navigate(@field(content, "url"));
             return;
         }
         return error.UnsupportedWindowContent;
@@ -75,26 +102,43 @@ pub const LinuxWebView = struct {
         self.browser_kind = kind;
         self.browser_pid = pid;
         self.browser_is_child = is_child_process;
-        self.native_host_ready = pid != null;
+        if (self.host) |host| {
+            self.native_host_ready = host.isReady();
+        } else {
+            self.native_host_ready = false;
+        }
     }
 
-    pub fn navigate(self: *LinuxWebView, url: []const u8) void {
-        if (!self.native_host_ready) return;
-        if (self.browser_kind) |kind| {
-            _ = core_runtime.openUrlInExistingBrowserKind(std.heap.page_allocator, kind, url);
-        }
+    pub fn navigate(self: *LinuxWebView, url: []const u8) !void {
+        if (!self.native_host_ready) return error.NativeBackendUnavailable;
+        const host = self.host orelse return error.NativeBackendUnavailable;
+        try host.navigate(url);
     }
 
     pub fn applyStyle(self: *LinuxWebView, style: style_types.WindowStyle) !void {
         self.style = style;
         if (!self.native_host_ready) return;
-        if (self.browser_kind) |kind| {
-            if (!core_runtime.supportsRequestedStyleInBrowser(kind, style)) return error.UnsupportedWindowStyle;
-        }
+        const host = self.host orelse return;
+        try host.applyStyle(style);
     }
 
     pub fn control(self: *LinuxWebView, cmd: style_types.WindowControl) !void {
-        if (!self.native_host_ready) return error.NativeBackendUnavailable;
+        if (self.native_host_ready) {
+            const host = self.host orelse return error.NativeBackendUnavailable;
+            try host.control(cmd);
+            switch (cmd) {
+                .close => self.native_host_ready = false,
+                .hide, .minimize => self.hidden = true,
+                .show => self.hidden = false,
+                .maximize => self.maximized = true,
+                .restore => {
+                    self.maximized = false;
+                    self.hidden = false;
+                },
+            }
+            return;
+        }
+
         if (!self.browser_is_child) return error.UnsupportedWindowControl;
         switch (cmd) {
             .close => {
@@ -161,10 +205,19 @@ pub const LinuxWebView = struct {
     }
 
     pub fn pumpEvents(self: *LinuxWebView) !void {
-        _ = self;
+        if (self.host) |host| {
+            if (host.isClosed()) {
+                self.native_host_ready = false;
+                return error.NativeWindowClosed;
+            }
+        }
     }
 
     pub fn destroyWindow(self: *LinuxWebView) void {
+        if (self.host) |host| {
+            host.deinit();
+            self.host = null;
+        }
         self.native_host_ready = false;
         self.browser_kind = null;
         self.browser_pid = null;
@@ -172,8 +225,7 @@ pub const LinuxWebView = struct {
     }
 
     pub fn capabilities(self: *const LinuxWebView) []const style_types.WindowCapability {
-        if (!self.native_host_ready) return &.{};
-        if (self.browser_kind == null) {
+        if (self.native_host_ready and self.host != null) {
             return &.{
                 .native_frameless,
                 .native_transparency,
@@ -183,6 +235,7 @@ pub const LinuxWebView = struct {
                 .native_kiosk,
             };
         }
+        if (!self.native_host_ready) return &.{};
         if (self.browser_kind) |kind| {
             if (supportsChromiumStyle(kind)) {
                 return &.{
@@ -206,10 +259,7 @@ pub const LinuxWebView = struct {
         try std.testing.expectEqual(@as(usize, 0), backend.capabilities().len);
 
         backend.attachBrowserProcess(.chrome, 1234, true);
-        const caps = backend.capabilities();
-        try std.testing.expect(caps.len > 0);
-        try std.testing.expect(style_types.hasCapability(.native_frameless, caps));
-        try std.testing.expect(style_types.hasCapability(.native_minmax, caps));
+        try std.testing.expectEqual(@as(usize, 0), backend.capabilities().len);
     }
 
     test "linux backend control requires child-owned browser process" {

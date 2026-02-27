@@ -2,9 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const browser_discovery = @import("browser_discovery.zig");
 const window_style_types = @import("../root/window_style.zig");
-
-const linux_webview_host_name = "webui_linux_webview_host";
-const linux_browser_host_name = "webui_linux_browser_host";
+const linux_browser_host = @import("../backends/linux_browser_host.zig");
 
 pub const BrowserLaunch = struct {
     pid: ?i64 = null,
@@ -102,13 +100,8 @@ pub fn openInBrowser(
     defer if (installs.len > 0) browser_discovery.freeInstalls(allocator, installs);
 
     if (launch_options.surface_mode == .native_webview_host) {
-        if (builtin.os.tag == .linux) {
-            if (try launchLinuxNativeWebviewHost(allocator, url, style, launch_options.profile_rules)) |launch| {
-                return launch;
-            }
-        }
-
-        // Best-effort fallback to browser app-window launch.
+        // Native-webview mode is handled in-process by platform backends.
+        // Browser launch here is fallback-only when native host init fails.
         for (installs) |install| {
             if (!supportsChromiumAppMode(install.kind)) continue;
             if (try launchBrowserCandidate(
@@ -512,8 +505,13 @@ fn launchWindowsPowershell(allocator: std.mem.Allocator, shell_exe: []const u8, 
 }
 
 fn launchLinuxTracked(allocator: std.mem.Allocator, browser_path: []const u8, args: []const []const u8) !?BrowserLaunch {
-    if (try launchLinuxBrowserHost(allocator, browser_path, args)) |launch| return launch;
-    return launchPosixTracked(allocator, browser_path, args);
+    if (try linux_browser_host.launchTracked(allocator, browser_path, args)) |result| {
+        return .{
+            .pid = result.pid,
+            .is_child_process = result.is_child_process,
+        };
+    }
+    return null;
 }
 
 fn launchPosixTracked(allocator: std.mem.Allocator, browser_path: []const u8, args: []const []const u8) !?BrowserLaunch {
@@ -530,54 +528,6 @@ fn launchPosixTracked(allocator: std.mem.Allocator, browser_path: []const u8, ar
 
     child.spawn() catch return null;
     return .{ .pid = @as(i64, @intCast(child.id)), .is_child_process = true };
-}
-
-fn launchLinuxBrowserHost(
-    allocator: std.mem.Allocator,
-    browser_path: []const u8,
-    args: []const []const u8,
-) !?BrowserLaunch {
-    if (builtin.os.tag != .linux) return null;
-
-    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch return null;
-    defer allocator.free(exe_dir);
-
-    const helper_path = std.fs.path.join(allocator, &.{ exe_dir, linux_browser_host_name }) catch return null;
-    defer allocator.free(helper_path);
-
-    std.fs.cwd().access(helper_path, .{}) catch return null;
-
-    const parent_pid_arg = try std.fmt.allocPrint(allocator, "{d}", .{std.os.linux.getpid()});
-    defer allocator.free(parent_pid_arg);
-
-    var argv = std.array_list.Managed([]const u8).init(allocator);
-    defer argv.deinit();
-
-    try argv.append(helper_path);
-    try argv.append(parent_pid_arg);
-    try argv.append(browser_path);
-    if (args.len > 0) try argv.appendSlice(args);
-
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.pgid = 0;
-
-    child.spawn() catch return null;
-    defer if (child.stdout) |*stdout_file| {
-        stdout_file.close();
-        child.stdout = null;
-    };
-
-    const line = if (child.stdout) |*stdout_file|
-        try stdout_file.readToEndAlloc(allocator, 128)
-    else
-        return null;
-    defer allocator.free(line);
-
-    const pid = parsePidFromOutput(line) orelse return null;
-    return .{ .pid = pid, .is_child_process = true };
 }
 
 fn launchSystemFallback(allocator: std.mem.Allocator, url: []const u8) !?BrowserLaunch {
@@ -610,82 +560,6 @@ fn launchSystemFallback(allocator: std.mem.Allocator, url: []const u8) !?Browser
             break :blk null;
         },
     };
-}
-
-fn launchLinuxNativeWebviewHost(
-    allocator: std.mem.Allocator,
-    url: []const u8,
-    style: window_style_types.WindowStyle,
-    profile_rules: []const ProfileRule,
-) !?BrowserLaunch {
-    if (builtin.os.tag != .linux) return null;
-
-    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch return null;
-    defer allocator.free(exe_dir);
-
-    const helper_path = std.fs.path.join(allocator, &.{ exe_dir, linux_webview_host_name }) catch return null;
-    defer allocator.free(helper_path);
-
-    std.fs.cwd().access(helper_path, .{}) catch return null;
-
-    const width: u32 = if (style.size) |size| size.width else 980;
-    const height: u32 = if (style.size) |size| size.height else 660;
-    const width_arg = try std.fmt.allocPrint(allocator, "{d}", .{width});
-    defer allocator.free(width_arg);
-    const height_arg = try std.fmt.allocPrint(allocator, "{d}", .{height});
-    defer allocator.free(height_arg);
-    const frameless_arg: []const u8 = if (style.frameless) "1" else "0";
-    const transparent_arg: []const u8 = if (style.transparent) "1" else "0";
-    const corner_radius: u16 = style.corner_radius orelse 0;
-    const corner_radius_arg = try std.fmt.allocPrint(allocator, "{d}", .{corner_radius});
-    defer allocator.free(corner_radius_arg);
-    const resizable_arg: []const u8 = if (style.resizable) "1" else "0";
-    const center_arg: []const u8 = if (style.center or style.position == null) "1" else "0";
-    const pos_x: i32 = if (style.position) |p| p.x else 0;
-    const pos_y: i32 = if (style.position) |p| p.y else 0;
-    const pos_x_arg = try std.fmt.allocPrint(allocator, "{d}", .{pos_x});
-    defer allocator.free(pos_x_arg);
-    const pos_y_arg = try std.fmt.allocPrint(allocator, "{d}", .{pos_y});
-    defer allocator.free(pos_y_arg);
-
-    const resolved_profile = try resolveWebviewProfile(allocator, profile_rules);
-    defer if (resolved_profile.user_data_dir) |path| allocator.free(path);
-    const profile_arg = if (resolved_profile.user_data_dir) |path| path else "";
-
-    var child = std.process.Child.init(&.{
-        helper_path,
-        url,
-        width_arg,
-        height_arg,
-        frameless_arg,
-        transparent_arg,
-        corner_radius_arg,
-        resizable_arg,
-        center_arg,
-        pos_x_arg,
-        pos_y_arg,
-        profile_arg,
-    }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch return null;
-    var launch: BrowserLaunch = .{
-        .pid = @as(i64, @intCast(child.id)),
-        .is_child_process = true,
-        .lifecycle_linked = true,
-        .kind = null,
-        .surface_mode = .native_webview_host,
-        .used_system_fallback = false,
-        .profile_dir = null,
-        .profile_ownership = .none,
-    };
-    if (resolved_profile.user_data_dir) |path| {
-        launch.profile_dir = try allocator.dupe(u8, path);
-        launch.profile_ownership = resolved_profile.ownership;
-    }
-    return launch;
 }
 
 fn launchModeForBrowserCandidate(surface_mode: BrowserSurfaceMode) BrowserSurfaceMode {

@@ -224,39 +224,6 @@ pub fn build(b: *Build) void {
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run Zig examples (default: all, override with -Dexample=<name>)");
-    var linux_webview_host_install_step: ?*Build.Step = null;
-    var linux_browser_host_install_step: ?*Build.Step = null;
-
-    if (target.result.os.tag == .linux) {
-        const host = b.addExecutable(.{
-            .name = "webui_linux_webview_host",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tools/linux_webview_host.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-        });
-        host.linkSystemLibrary("gtk-3");
-        host.linkSystemLibrary("webkit2gtk-4.1");
-
-        const host_install = b.addInstallArtifact(host, .{});
-        linux_webview_host_install_step = &host_install.step;
-        run_step.dependOn(&host_install.step);
-
-        const browser_host = b.addExecutable(.{
-            .name = "webui_linux_browser_host",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tools/linux_browser_host.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = false,
-            }),
-        });
-        const browser_host_install = b.addInstallArtifact(browser_host, .{});
-        linux_browser_host_install_step = &browser_host_install.step;
-        run_step.dependOn(&browser_host_install.step);
-    }
 
     const bridge_template_mod = b.createModule(.{
         .root_source_file = b.path("src/bridge/template.zig"),
@@ -310,8 +277,6 @@ pub fn build(b: *Build) void {
 
             const built = addExample(b, example, webui_mod, shared_mod, webui_lib, target, optimize, runtime_helpers_assets.prepare_step);
             examples_step.dependOn(built.install_step);
-            if (linux_webview_host_install_step) |host_install| built.run_step.dependOn(host_install);
-            if (linux_browser_host_install_step) |host_install| built.run_step.dependOn(host_install);
 
             if (selected_example == .all or selected_example == example.selector) {
                 selected_example_found = true;

@@ -832,6 +832,13 @@ pub const Service = struct {
         const state = win.state();
         state.state_mutex.lock();
         defer state.state_mutex.unlock();
+        if (state.isNativeWindowActive()) {
+            state.backend.pumpEvents() catch |err| {
+                if (err == error.NativeWindowClosed) {
+                    _ = state.requestClose();
+                }
+            };
+        }
         // Reconcile tracked process state every loop.
         // `reconcileChildExit()` is mode-aware and only turns PID exit into app close
         // for native-webview-first mode. Browser/web modes only detach PID tracking.
