@@ -46,10 +46,14 @@ pub fn makeInvoker(comptime RpcStruct: type, comptime function_name: []const u8)
 
             if (args.len != fn_info.params.len) return error.InvalidRpcArgCount;
 
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const arg_allocator = arena.allocator();
+
             var tuple: std.meta.ArgsTuple(Fn) = undefined;
             inline for (fn_info.params, 0..) |param, idx| {
                 const param_type = param.type orelse @compileError("RPC parameter type is required");
-                @field(tuple, std.fmt.comptimePrint("{d}", .{idx})) = try coerceJsonArg(param_type, args[idx]);
+                @field(tuple, std.fmt.comptimePrint("{d}", .{idx})) = try coerceJsonArg(param_type, arg_allocator, args[idx]);
             }
 
             const return_type = fn_info.return_type orelse void;
@@ -70,45 +74,10 @@ pub fn makeInvoker(comptime RpcStruct: type, comptime function_name: []const u8)
     }.invoke;
 }
 
-pub fn coerceJsonArg(comptime T: type, value: std.json.Value) !T {
-    return switch (@typeInfo(T)) {
-        .bool => switch (value) {
-            .bool => |b| b,
-            else => error.InvalidRpcArgType,
-        },
-        .int, .comptime_int => switch (value) {
-            .integer => |v| @as(T, @intCast(v)),
-            .float => |v| @as(T, @intFromFloat(v)),
-            else => error.InvalidRpcArgType,
-        },
-        .float, .comptime_float => switch (value) {
-            .float => |v| @as(T, @floatCast(v)),
-            .integer => |v| @as(T, @floatFromInt(v)),
-            else => error.InvalidRpcArgType,
-        },
-        .pointer => |ptr| blk: {
-            if (ptr.size == .slice and ptr.child == u8 and ptr.is_const) {
-                break :blk switch (value) {
-                    .string => |s| s,
-                    else => error.InvalidRpcArgType,
-                };
-            }
-            break :blk error.UnsupportedRpcArgType;
-        },
-        .optional => |opt| blk: {
-            if (value == .null) break :blk @as(T, null);
-            const unwrapped = try coerceJsonArg(opt.child, value);
-            break :blk unwrapped;
-        },
-        .@"enum" => |enum_info| blk: {
-            _ = enum_info;
-            const raw = switch (value) {
-                .string => |s| s,
-                else => break :blk error.InvalidRpcArgType,
-            };
-            break :blk std.meta.stringToEnum(T, raw) orelse error.InvalidRpcArgType;
-        },
-        else => error.UnsupportedRpcArgType,
+pub fn coerceJsonArg(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value) !T {
+    return std.json.parseFromValueLeaky(T, allocator, value, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidRpcArgType;
     };
 }
 

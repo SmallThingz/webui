@@ -11,6 +11,7 @@ pub const BrowserLaunch = struct {
     is_child_process: bool = false,
     lifecycle_linked: bool = false,
     kind: ?browser_discovery.BrowserKind = null,
+    surface_mode: BrowserSurfaceMode = .tab,
     used_system_fallback: bool = false,
     profile_dir: ?[]u8 = null,
     profile_ownership: BrowserLaunchProfileOwnership = .none,
@@ -110,7 +111,15 @@ pub fn openInBrowser(
         // Best-effort fallback to browser app-window launch.
         for (installs) |install| {
             if (!supportsChromiumAppMode(install.kind)) continue;
-            if (try launchBrowserCandidate(allocator, install.kind, install.path, url, style, launch_options)) |launch| {
+            if (try launchBrowserCandidate(
+                allocator,
+                install.kind,
+                install.path,
+                url,
+                style,
+                launch_options,
+                .app_window,
+            )) |launch| {
                 return launch;
             }
         }
@@ -119,7 +128,15 @@ pub fn openInBrowser(
     } else if (launch_options.surface_mode == .app_window) {
         for (installs) |install| {
             if (!supportsChromiumAppMode(install.kind)) continue;
-            if (try launchBrowserCandidate(allocator, install.kind, install.path, url, style, launch_options)) |launch| {
+            if (try launchBrowserCandidate(
+                allocator,
+                install.kind,
+                install.path,
+                url,
+                style,
+                launch_options,
+                .app_window,
+            )) |launch| {
                 return launch;
             }
         }
@@ -130,14 +147,30 @@ pub fn openInBrowser(
     if (needsNativeStyleAwareBrowser(style)) {
         for (installs) |install| {
             if (!supportsRequestedStyleInBrowser(install.kind, style)) continue;
-            if (try launchBrowserCandidate(allocator, install.kind, install.path, url, style, launch_options)) |launch| {
+            if (try launchBrowserCandidate(
+                allocator,
+                install.kind,
+                install.path,
+                url,
+                style,
+                launch_options,
+                launchModeForBrowserCandidate(launch_options.surface_mode),
+            )) |launch| {
                 return launch;
             }
         }
     }
 
     for (installs) |install| {
-        if (try launchBrowserCandidate(allocator, install.kind, install.path, url, style, launch_options)) |launch| {
+        if (try launchBrowserCandidate(
+            allocator,
+            install.kind,
+            install.path,
+            url,
+            style,
+            launch_options,
+            launchModeForBrowserCandidate(launch_options.surface_mode),
+        )) |launch| {
             return launch;
         }
     }
@@ -270,6 +303,7 @@ fn launchBrowserCandidate(
     url: []const u8,
     style: window_style_types.WindowStyle,
     launch_options: BrowserLaunchOptions,
+    result_surface_mode: BrowserSurfaceMode,
 ) !?BrowserLaunch {
     var spec = try launchSpecForKind(allocator, kind, url, style, launch_options);
     defer spec.deinit(allocator);
@@ -284,6 +318,7 @@ fn launchBrowserCandidate(
     if (launch) |result| {
         var tagged = result;
         tagged.kind = kind;
+        tagged.surface_mode = result_surface_mode;
         if (spec.profile_dir) |profile_dir| {
             tagged.profile_dir = try allocator.dupe(u8, profile_dir);
             tagged.profile_ownership = spec.profile_ownership;
@@ -547,13 +582,31 @@ fn launchLinuxBrowserHost(
 
 fn launchSystemFallback(allocator: std.mem.Allocator, url: []const u8) !?BrowserLaunch {
     return switch (builtin.os.tag) {
-        .windows => if (try runCommandNoCapture(allocator, &.{ "cmd", "/C", "start", "", url })) BrowserLaunch{ .used_system_fallback = true } else null,
-        .macos => if (try runCommandNoCapture(allocator, &.{ "open", url })) BrowserLaunch{ .used_system_fallback = true } else null,
+        .windows => if (try runCommandNoCapture(allocator, &.{ "cmd", "/C", "start", "", url })) BrowserLaunch{
+            .surface_mode = .tab,
+            .used_system_fallback = true,
+        } else null,
+        .macos => if (try runCommandNoCapture(allocator, &.{ "open", url })) BrowserLaunch{
+            .surface_mode = .tab,
+            .used_system_fallback = true,
+        } else null,
         else => blk: {
-            if (try runCommandNoCapture(allocator, &.{ "xdg-open", url })) break :blk BrowserLaunch{ .used_system_fallback = true };
-            if (try runCommandNoCapture(allocator, &.{ "gio", "open", url })) break :blk BrowserLaunch{ .used_system_fallback = true };
-            if (try runCommandNoCapture(allocator, &.{ "sensible-browser", url })) break :blk BrowserLaunch{ .used_system_fallback = true };
-            if (try runCommandNoCapture(allocator, &.{ "x-www-browser", url })) break :blk BrowserLaunch{ .used_system_fallback = true };
+            if (try runCommandNoCapture(allocator, &.{ "xdg-open", url })) break :blk BrowserLaunch{
+                .surface_mode = .tab,
+                .used_system_fallback = true,
+            };
+            if (try runCommandNoCapture(allocator, &.{ "gio", "open", url })) break :blk BrowserLaunch{
+                .surface_mode = .tab,
+                .used_system_fallback = true,
+            };
+            if (try runCommandNoCapture(allocator, &.{ "sensible-browser", url })) break :blk BrowserLaunch{
+                .surface_mode = .tab,
+                .used_system_fallback = true,
+            };
+            if (try runCommandNoCapture(allocator, &.{ "x-www-browser", url })) break :blk BrowserLaunch{
+                .surface_mode = .tab,
+                .used_system_fallback = true,
+            };
             break :blk null;
         },
     };
@@ -623,6 +676,7 @@ fn launchLinuxNativeWebviewHost(
         .is_child_process = true,
         .lifecycle_linked = true,
         .kind = null,
+        .surface_mode = .native_webview_host,
         .used_system_fallback = false,
         .profile_dir = null,
         .profile_ownership = .none,
@@ -632,6 +686,14 @@ fn launchLinuxNativeWebviewHost(
         launch.profile_ownership = resolved_profile.ownership;
     }
     return launch;
+}
+
+fn launchModeForBrowserCandidate(surface_mode: BrowserSurfaceMode) BrowserSurfaceMode {
+    return switch (surface_mode) {
+        .native_webview_host => .app_window,
+        .app_window => .app_window,
+        .tab => .tab,
+    };
 }
 
 const ProfileResolutionTarget = union(enum) {

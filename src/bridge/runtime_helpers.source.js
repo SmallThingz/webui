@@ -24,7 +24,18 @@ async function __webuiInvoke(endpoint, name, args) {
     const text = await res.text();
     throw new Error(`RPC ${name} failed: ${res.status} ${text}`);
   }
-  return await res.json();
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    return await res.json();
+  }
+
+  const text = await res.text();
+  if (!text || !text.trim()) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return text;
+  }
 }
 
 async function __webuiJson(endpoint, options) {
@@ -46,15 +57,8 @@ async function __webuiJson(endpoint, options) {
   try {
     return JSON.parse(text);
   } catch (_) {
-    return { value: text };
+    return text;
   }
-}
-
-function __webuiNormalizeResult(result) {
-  if (result && typeof result === "object" && "value" in result) {
-    return result.value;
-  }
-  return result;
 }
 
 const __webuiSocketConnectTimeoutMs = 10000;

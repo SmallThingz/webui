@@ -1,15 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const websocket = @import("websocket");
 
 const core_runtime = @import("../ported/webui.zig");
 const browser_discovery = @import("../ported/browser_discovery.zig");
 const webview_backend = @import("../ported/webview.zig");
+const https_server = @import("../network/https_server.zig");
 const window_style_types = @import("window_style.zig");
 const api_types = @import("api_types.zig");
 const launch_policy = @import("launch_policy.zig");
 const rpc_runtime = @import("rpc_runtime.zig");
 const root_utils = @import("utils.zig");
+const net_io = @import("net_io.zig");
 const server_routes = @import("server_routes.zig");
 
 const LaunchPolicy = api_types.LaunchPolicy;
@@ -137,9 +138,44 @@ pub const ScriptTask = struct {
 
 pub const default_client_token = "default-client";
 
+pub const WsTransport = union(enum) {
+    plain: std.net.Stream,
+    tls: *https_server.Connection,
+
+    pub fn read(self: *WsTransport, buffer: []u8) !usize {
+        return switch (self.*) {
+            .plain => |stream| stream.read(buffer),
+            .tls => |conn| conn.read(buffer),
+        };
+    }
+
+    pub fn writeAll(self: *WsTransport, bytes: []const u8) !void {
+        return switch (self.*) {
+            .plain => |stream| stream.writeAll(bytes),
+            .tls => |conn| conn.writeAll(bytes),
+        };
+    }
+
+    pub fn shutdown(self: *WsTransport) void {
+        switch (self.*) {
+            .plain => |stream| stream.close(),
+            .tls => |conn| {
+                conn.close();
+            },
+        }
+    }
+
+    pub fn destroy(self: *WsTransport, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .plain => {},
+            .tls => |conn| allocator.destroy(conn),
+        }
+    }
+};
+
 pub const WsConnectionState = struct {
     connection_id: usize,
-    stream: std.net.Stream,
+    transport: WsTransport,
 };
 
 pub const WindowState = struct {
@@ -151,6 +187,9 @@ pub const WindowState = struct {
     runtime_render_state: RuntimeRenderState,
     window_fallback_emulation: bool,
     server_port: u16,
+    server_tls_enabled: bool,
+    server_tls_cert_pem: ?[]const u8,
+    server_tls_key_pem: ?[]const u8,
     server_bind_public: bool,
     last_html: ?[]u8,
     last_file: ?[]u8,
@@ -234,6 +273,9 @@ pub const WindowState = struct {
             },
             .window_fallback_emulation = app_options.window_fallback_emulation,
             .server_port = 0,
+            .server_tls_enabled = app_options.tls.enabled and app_options.tls.cert_pem != null and app_options.tls.key_pem != null,
+            .server_tls_cert_pem = app_options.tls.cert_pem,
+            .server_tls_key_pem = app_options.tls.key_pem,
             .server_bind_public = app_options.public_network,
             .last_html = null,
             .last_file = null,
@@ -545,6 +587,13 @@ pub const WindowState = struct {
 
     pub fn setLaunchedBrowserLaunch(self: *WindowState, allocator: std.mem.Allocator, launch: core_runtime.BrowserLaunch) void {
         self.cleanupBrowserProfileDir(allocator);
+        const requested_surface = self.runtime_render_state.active_surface;
+        const launched_surface: LaunchSurface = switch (launch.surface_mode) {
+            .native_webview_host => .native_webview,
+            .app_window => .browser_window,
+            .tab => .web_url,
+        };
+
         if (launch.pid) |pid| {
             if (self.launched_browser_pid) |existing| {
                 if (existing != pid) {
@@ -581,6 +630,26 @@ pub const WindowState = struct {
             }
         else
             null;
+
+        if (requested_surface != launched_surface) {
+            self.runtime_render_state.fallback_applied = true;
+            self.runtime_render_state.fallback_reason = switch (requested_surface) {
+                .native_webview => .native_backend_unavailable,
+                .browser_window, .web_url => .launch_failed,
+            };
+            self.runtime_render_state.active_surface = launched_surface;
+            self.runtime_render_state.active_transport = switch (launched_surface) {
+                .native_webview => .native_webview,
+                .browser_window, .web_url => .browser_fallback,
+            };
+            self.emit(.window_state, "fallback-applied", @tagName(launched_surface));
+        } else {
+            self.runtime_render_state.active_surface = launched_surface;
+            self.runtime_render_state.active_transport = switch (launched_surface) {
+                .native_webview => .native_webview,
+                .browser_window, .web_url => .browser_fallback,
+            };
+        }
 
         if (launch.used_system_fallback) {
             self.rpc_state.logf(.warn, "[webui.browser] system fallback launcher was used (tab-style window may appear)\n", .{});
@@ -717,7 +786,8 @@ pub const WindowState = struct {
     }
 
     pub fn localRenderUrl(self: *const WindowState, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{self.server_port});
+        const scheme = if (self.server_tls_enabled) "https" else "http";
+        return std.fmt.allocPrint(allocator, "{s}://127.0.0.1:{d}/", .{ scheme, self.server_port });
     }
 
     pub fn effectiveBrowserLaunchOptions(self: *const WindowState, base: BrowserLaunchOptions) BrowserLaunchOptions {
@@ -738,8 +808,7 @@ pub const WindowState = struct {
     pub fn shouldOpenBrowser(self: *const WindowState) bool {
         if (self.runtime_render_state.active_surface == .browser_window) return true;
         if (self.runtime_render_state.active_surface == .native_webview) {
-            // Current native backends require a spawned host process to become ready.
-            // Bootstrap it on first render even without dual-surface mode.
+            // Native launch may require host bootstrap on first render.
             if (!self.backend.isReady()) return true;
             if (!self.launch_policy.allow_dual_surface) return false;
             return launchPolicyContains(self.launch_policy, .browser_window);
@@ -850,51 +919,29 @@ pub const WindowState = struct {
         return task;
     }
 
-    pub fn writeSocketAll(handle: std.posix.socket_t, bytes: []const u8) !void {
-        var sent: usize = 0;
-        while (sent < bytes.len) {
-            const n = std.posix.send(handle, bytes[sent..], 0) catch |err| switch (err) {
-                error.WouldBlock => {
-                    std.Thread.sleep(std.time.ns_per_ms);
-                    continue;
-                },
-                error.BrokenPipe,
-                error.ConnectionResetByPeer,
-                => return error.Closed,
-                else => return err,
-            };
-            if (n == 0) return error.Closed;
-            sent += n;
-        }
+    pub fn sendWsTextLocked(_: *WindowState, transport: *WsTransport, payload: []const u8) !void {
+        try net_io.writeWsFrameAny(transport, .text, payload);
     }
 
-    pub fn writeWsFrame(stream: std.net.Stream, opcode: websocket.OpCode, payload: []const u8) !void {
-        var header_buf: [10]u8 = undefined;
-        const header = websocket.proto.writeFrameHeader(&header_buf, opcode, payload.len, false);
-        try writeSocketAll(stream.handle, header);
-        if (payload.len > 0) {
-            try writeSocketAll(stream.handle, payload);
-        }
-    }
-
-    pub fn sendWsTextLocked(_: *WindowState, stream: std.net.Stream, payload: []const u8) !void {
-        try writeWsFrame(stream, .text, payload);
-    }
-
-    pub fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, stream: std.net.Stream) !void {
+    pub fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, transport_value: anytype) !void {
         // Reconnect during unload/refresh grace period means the page is back.
         // Cancel any pending lifecycle close request.
         self.cancelPendingLifecycleCloseLocked("websocket-connected");
+        const transport: WsTransport = switch (@TypeOf(transport_value)) {
+            std.net.Stream => .{ .plain = transport_value },
+            *https_server.Connection => .{ .tls = transport_value },
+            else => @compileError("unsupported websocket transport type"),
+        };
 
         for (self.ws_connections.items) |*entry| {
             if (entry.connection_id != connection_id) continue;
-            entry.stream.close();
-            entry.stream = stream;
+            entry.transport.shutdown();
+            entry.transport = transport;
             return;
         }
         try self.ws_connections.append(.{
             .connection_id = connection_id,
-            .stream = stream,
+            .transport = transport,
         });
     }
 
@@ -919,17 +966,17 @@ pub const WindowState = struct {
     }
 
     pub fn closeWsConnectionLocked(self: *WindowState, connection_id: usize) void {
-        for (self.ws_connections.items, 0..) |entry, idx| {
+        for (self.ws_connections.items, 0..) |*entry, idx| {
             if (entry.connection_id != connection_id) continue;
-            entry.stream.close();
+            entry.transport.shutdown();
             _ = self.ws_connections.orderedRemove(idx);
             return;
         }
     }
 
     pub fn closeAllWsConnectionsLocked(self: *WindowState) void {
-        for (self.ws_connections.items) |entry| {
-            entry.stream.close();
+        for (self.ws_connections.items) |*entry| {
+            entry.transport.shutdown();
         }
         self.ws_connections.clearRetainingCapacity();
     }
@@ -980,7 +1027,7 @@ pub const WindowState = struct {
             }, .{});
             defer self.allocator.free(payload);
 
-            self.sendWsTextLocked(entry.stream, payload) catch |err| {
+            self.sendWsTextLocked(&entry.transport, payload) catch |err| {
                 self.rpc_state.logf(
                     .warn,
                     "[webui.ws] send failed connection_id={d} err={s}\n",
@@ -1021,8 +1068,8 @@ pub const WindowState = struct {
         var sent_any = false;
         var idx: usize = 0;
         while (idx < self.ws_connections.items.len) {
-            const entry = self.ws_connections.items[idx];
-            self.sendWsTextLocked(entry.stream, payload) catch |err| {
+            const entry = &self.ws_connections.items[idx];
+            self.sendWsTextLocked(&entry.transport, payload) catch |err| {
                 self.rpc_state.logf(
                     .warn,
                     "[webui.ws] close signal write failed connection_id={d} err={s}\n",
@@ -1279,6 +1326,9 @@ pub const WindowState = struct {
 
     pub fn ensureServerStarted(self: *WindowState) !void {
         if (self.server_thread != null) return;
+        if (self.server_tls_enabled and (self.server_tls_cert_pem == null or self.server_tls_key_pem == null)) {
+            return error.TlsCertificateMissing;
+        }
 
         self.server_stop.store(false, .release);
 
@@ -1400,11 +1450,72 @@ pub const WindowState = struct {
             self.connection_mutex.unlock();
         }
 
-        const transfer_ownership = server_routes.handleConnection(self, std.heap.page_allocator, stream, default_client_token) catch {
+        if (self.server_tls_enabled) {
+            const first_byte = https_server.peekFirstByte(stream) catch null;
+            if (first_byte) |byte| {
+                if (!https_server.looksLikeTlsClientHello(byte)) {
+                    const request = net_io.readHttpRequest(std.heap.page_allocator, stream) catch {
+                        stream.close();
+                        return;
+                    };
+                    defer std.heap.page_allocator.free(request.raw);
+
+                    const fallback_host = std.fmt.allocPrint(std.heap.page_allocator, "127.0.0.1:{d}", .{self.server_port}) catch {
+                        stream.close();
+                        return;
+                    };
+                    defer std.heap.page_allocator.free(fallback_host);
+                    const host = net_io.httpHeaderValue(request.headers, "Host") orelse fallback_host;
+
+                    const redirect_url = std.fmt.allocPrint(std.heap.page_allocator, "https://{s}{s}", .{ host, request.path }) catch {
+                        stream.close();
+                        return;
+                    };
+                    defer std.heap.page_allocator.free(redirect_url);
+
+                    net_io.writeHttpRedirectAny(stream, redirect_url) catch {};
+                    stream.close();
+                    return;
+                }
+            }
+
+            const cert_pem = self.server_tls_cert_pem orelse {
+                stream.close();
+                return;
+            };
+            const key_pem = self.server_tls_key_pem orelse {
+                stream.close();
+                return;
+            };
+
+            const tls_conn = std.heap.page_allocator.create(https_server.Connection) catch {
+                stream.close();
+                return;
+            };
+            tls_conn.* = https_server.Connection.initServer(std.heap.page_allocator, stream, cert_pem, key_pem) catch |err| {
+                self.emitDiagnostic("tls.handshake.error", .tls, .warn, @errorName(err));
+                std.heap.page_allocator.destroy(tls_conn);
+                stream.close();
+                return;
+            };
+
+            const transfer_tls_ownership = server_routes.handleConnection(self, std.heap.page_allocator, tls_conn, default_client_token) catch {
+                tls_conn.close();
+                std.heap.page_allocator.destroy(tls_conn);
+                return;
+            };
+            if (!transfer_tls_ownership) {
+                tls_conn.close();
+                std.heap.page_allocator.destroy(tls_conn);
+            }
+            return;
+        }
+
+        const transfer_plain_ownership = server_routes.handleConnection(self, std.heap.page_allocator, stream, default_client_token) catch {
             stream.close();
             return;
         };
-        if (!transfer_ownership) {
+        if (!transfer_plain_ownership) {
             stream.close();
         }
     }

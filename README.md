@@ -1,6 +1,6 @@
 # 🚀 WebUI Zig
 
-A Zig-first WebUI runtime with typed RPC, deterministic launch policy, native webview support, and browser/web fallbacks.
+A Zig-first WebUI runtime with typed RPC, deterministic launch policy, native host launch paths, and browser/web fallbacks.
 
 ![Zig](https://img.shields.io/badge/Zig-0.15.2%2B-f7a41d)
 ![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-2ea44f)
@@ -133,7 +133,7 @@ Helpers:
 | Flag | Default | Effect |
 |---|---:|---|
 | `-Ddynamic=true` | `false` | Build shared library (`.so`/`.dylib`/`.dll`) instead of static archive. |
-| `-Denable-tls=true` | `false` | Enable TLS option defaults/runtime TLS state. |
+| `-Denable-tls=true` | `false` | Enable HTTPS/WSS runtime defaults (TLS certificate + secure local transport). |
 | `-Denable-webui-log=true` | `false` | Enable runtime logging defaults. |
 | `-Dminify-embedded-js=true` | `true` | Minify embedded runtime helper JS at build time. |
 | `-Dminify-written-js=true` | `false` | Minify written runtime helper JS artifact. |
@@ -209,7 +209,7 @@ Current strengths:
 
 Still tracked for strict upstream behavioral parity:
 
-- Full end-to-end HTTPS transport parity path
+- Full in-process native host completion on Windows/macOS
 - Visual/window parity items requiring manual GUI verification on real desktops
 
 See:

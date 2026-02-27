@@ -93,6 +93,7 @@ pub const test_helpers = struct {
     pub const httpRoundTrip = net_io.httpRoundTrip;
     pub const httpRoundTripWithHeaders = net_io.httpRoundTripWithHeaders;
     pub const readHttpHeadersFromStream = net_io.readHttpHeadersFromStream;
+    pub const httpResponseBody = net_io.httpResponseBody;
 };
 
 const launchPolicyOrder = launch_policy.order;
@@ -145,14 +146,11 @@ pub const App = struct {
 
         core_runtime.initializeRuntime(resolved_options.tls.enabled, resolved_options.enable_webui_log);
         const tls_state = try tls_runtime.Runtime.init(allocator, resolved_options.tls);
-        if (resolved_options.tls.enabled) {
-            logging_types.emitf(
-                resolved_options.log_sink,
-                resolved_options.enable_webui_log,
-                .warn,
-                "[webui.warning] TLS certificates/runtime state are configured, but active HTTP transport remains plaintext in this build.\n",
-                .{},
-            );
+        if (tls_state.cert_pem) |cert| {
+            resolved_options.tls.cert_pem = cert;
+        }
+        if (tls_state.key_pem) |key| {
+            resolved_options.tls.key_pem = key;
         }
         return .{
             .allocator = allocator,
@@ -181,6 +179,15 @@ pub const App = struct {
         try self.tls_state.setCertificate(cert_pem, key_pem);
         self.options.enable_tls = true;
         self.options.tls.enabled = true;
+        self.options.tls.cert_pem = self.tls_state.cert_pem;
+        self.options.tls.key_pem = self.tls_state.key_pem;
+        for (self.windows.items) |*state| {
+            state.state_mutex.lock();
+            state.server_tls_enabled = self.options.tls.enabled and self.options.tls.cert_pem != null and self.options.tls.key_pem != null;
+            state.server_tls_cert_pem = self.options.tls.cert_pem;
+            state.server_tls_key_pem = self.options.tls.key_pem;
+            state.state_mutex.unlock();
+        }
     }
 
     pub fn tlsInfo(self: *const App) TlsInfo {

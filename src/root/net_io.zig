@@ -23,19 +23,45 @@ pub const WsInboundFrame = struct {
     payload: []u8,
 };
 
-fn readSocketExact(handle: std.posix.socket_t, out: []u8) !void {
+fn readConn(conn: anytype, buffer: []u8) !usize {
+    const Conn = @TypeOf(conn);
+    if (Conn == std.net.Stream) {
+        return conn.read(buffer);
+    }
+    if (Conn == *std.net.Stream) {
+        return conn.read(buffer);
+    }
+    return conn.read(buffer);
+}
+
+fn writeConnAll(conn: anytype, bytes: []const u8) !void {
+    const Conn = @TypeOf(conn);
+    if (Conn == std.net.Stream) {
+        return conn.writeAll(bytes);
+    }
+    if (Conn == *std.net.Stream) {
+        return conn.writeAll(bytes);
+    }
+    return conn.writeAll(bytes);
+}
+
+fn readConnExact(conn: anytype, out: []u8) !void {
     var offset: usize = 0;
     while (offset < out.len) {
-        const n = std.posix.recv(handle, out[offset..], 0) catch |err| switch (err) {
-            error.WouldBlock => {
+        const n = readConn(conn, out[offset..]) catch |err| {
+            const err_name = @errorName(err);
+            if (std.mem.eql(u8, err_name, "WouldBlock")) {
                 std.Thread.sleep(std.time.ns_per_ms);
                 continue;
-            },
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.SocketNotConnected,
-            => return error.Closed,
-            else => return err,
+            }
+            if (std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
+                std.mem.eql(u8, err_name, "ConnectionTimedOut") or
+                std.mem.eql(u8, err_name, "SocketNotConnected") or
+                std.mem.eql(u8, err_name, "EndOfStream"))
+            {
+                return error.Closed;
+            }
+            return err;
         };
         if (n == 0) return error.Closed;
         offset += n;
@@ -53,9 +79,9 @@ fn decodeWsOpcode(byte: u8) !WsInboundType {
     };
 }
 
-pub fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream, max_payload_size: usize) !WsInboundFrame {
+pub fn readWsInboundFrameAllocAny(allocator: std.mem.Allocator, conn: anytype, max_payload_size: usize) !WsInboundFrame {
     var header: [2]u8 = undefined;
-    try readSocketExact(stream.handle, &header);
+    try readConnExact(conn, &header);
 
     const fin = (header[0] & 0x80) != 0;
     if (!fin) return error.UnsupportedWebSocketFragmentation;
@@ -67,11 +93,11 @@ pub fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Str
     var payload_len_u64: u64 = header[1] & 0x7F;
     if (payload_len_u64 == 126) {
         var ext: [2]u8 = undefined;
-        try readSocketExact(stream.handle, &ext);
+        try readConnExact(conn, &ext);
         payload_len_u64 = (@as(u64, ext[0]) << 8) | @as(u64, ext[1]);
     } else if (payload_len_u64 == 127) {
         var ext: [8]u8 = undefined;
-        try readSocketExact(stream.handle, &ext);
+        try readConnExact(conn, &ext);
         payload_len_u64 =
             (@as(u64, ext[0]) << 56) |
             (@as(u64, ext[1]) << 48) |
@@ -87,13 +113,13 @@ pub fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Str
     const payload_len: usize = @intCast(payload_len_u64);
 
     var masking_key: [4]u8 = undefined;
-    try readSocketExact(stream.handle, &masking_key);
+    try readConnExact(conn, &masking_key);
 
     const payload = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(payload);
 
     if (payload_len > 0) {
-        try readSocketExact(stream.handle, payload);
+        try readConnExact(conn, payload);
         for (payload, 0..) |byte, i| {
             payload[i] = byte ^ masking_key[i & 3];
         }
@@ -105,6 +131,10 @@ pub fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Str
     };
 }
 
+pub fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream, max_payload_size: usize) !WsInboundFrame {
+    return readWsInboundFrameAllocAny(allocator, stream, max_payload_size);
+}
+
 pub fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |part| {
@@ -114,25 +144,7 @@ pub fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
     return false;
 }
 
-fn writeSocketAll(handle: std.posix.socket_t, bytes: []const u8) !void {
-    var sent: usize = 0;
-    while (sent < bytes.len) {
-        const n = std.posix.send(handle, bytes[sent..], 0) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(std.time.ns_per_ms);
-                continue;
-            },
-            error.BrokenPipe,
-            error.ConnectionResetByPeer,
-            => return error.Closed,
-            else => return err,
-        };
-        if (n == 0) return error.Closed;
-        sent += n;
-    }
-}
-
-pub fn writeWebSocketHandshakeResponse(stream: std.net.Stream, sec_key: []const u8) !void {
+pub fn writeWebSocketHandshakeResponseAny(conn: anytype, sec_key: []const u8) !void {
     var sha1_digest: [20]u8 = undefined;
     var hasher = std.crypto.hash.Sha1.init(.{});
     hasher.update(sec_key);
@@ -152,7 +164,11 @@ pub fn writeWebSocketHandshakeResponse(stream: std.net.Stream, sec_key: []const 
         .{accept_key},
     );
 
-    try writeSocketAll(stream.handle, response);
+    try writeConnAll(conn, response);
+}
+
+pub fn writeWebSocketHandshakeResponse(stream: std.net.Stream, sec_key: []const u8) !void {
+    try writeWebSocketHandshakeResponseAny(stream, sec_key);
 }
 
 pub fn pathWithoutQuery(path: []const u8) []const u8 {
@@ -186,7 +202,7 @@ pub fn httpHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpRequest {
+pub fn readHttpRequestAny(allocator: std.mem.Allocator, conn: anytype) !HttpRequest {
     var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
 
@@ -195,16 +211,20 @@ pub fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !Ht
     var content_length: usize = 0;
 
     while (true) {
-        const read_n = std.posix.recv(stream.handle, &scratch, 0) catch |err| switch (err) {
-            error.WouldBlock => {
+        const read_n = readConn(conn, &scratch) catch |err| {
+            const err_name = @errorName(err);
+            if (std.mem.eql(u8, err_name, "WouldBlock")) {
                 std.Thread.sleep(std.time.ns_per_ms);
                 continue;
-            },
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.SocketNotConnected,
-            => break,
-            else => return err,
+            }
+            if (std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
+                std.mem.eql(u8, err_name, "ConnectionTimedOut") or
+                std.mem.eql(u8, err_name, "SocketNotConnected") or
+                std.mem.eql(u8, err_name, "EndOfStream"))
+            {
+                break;
+            }
+            return err;
         };
         if (read_n == 0) break;
         try buf.appendSlice(scratch[0..read_n]);
@@ -248,6 +268,10 @@ pub fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !Ht
     };
 }
 
+pub fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpRequest {
+    return readHttpRequestAny(allocator, stream);
+}
+
 fn parseContentLength(headers: []const u8) ?usize {
     var it = std.mem.splitSequence(u8, headers, "\r\n");
     while (it.next()) |line| {
@@ -261,12 +285,14 @@ fn parseContentLength(headers: []const u8) ?usize {
     return null;
 }
 
-pub fn writeHttpResponse(stream: std.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
+pub fn writeHttpResponseAny(conn: anytype, status: u16, content_type: []const u8, body: []const u8) !void {
     var header_buf: [512]u8 = undefined;
     const status_text = switch (status) {
         200 => "OK",
         204 => "No Content",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
+        422 => "Unprocessable Entity",
         404 => "Not Found",
         500 => "Internal Server Error",
         else => "OK",
@@ -278,8 +304,31 @@ pub fn writeHttpResponse(stream: std.net.Stream, status: u16, content_type: []co
         .{ status, status_text, content_type, body.len },
     );
 
-    try writeSocketAll(stream.handle, header);
-    try writeSocketAll(stream.handle, body);
+    try writeConnAll(conn, header);
+    try writeConnAll(conn, body);
+}
+
+pub fn writeHttpResponse(stream: std.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
+    return writeHttpResponseAny(stream, status, content_type, body);
+}
+
+pub fn writeHttpRedirectAny(conn: anytype, location: []const u8) !void {
+    var header_buf: [1024]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 308 Permanent Redirect\r\nLocation: {s}\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        .{location},
+    );
+    try writeConnAll(conn, header);
+}
+
+pub fn writeWsFrameAny(conn: anytype, opcode: websocket.OpCode, payload: []const u8) !void {
+    var header_buf: [10]u8 = undefined;
+    const header = websocket.proto.writeFrameHeader(&header_buf, opcode, payload.len, false);
+    try writeConnAll(conn, header);
+    if (payload.len > 0) {
+        try writeConnAll(conn, payload);
+    }
 }
 
 pub fn contentTypeForPath(path: []const u8) []const u8 {

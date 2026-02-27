@@ -59,7 +59,7 @@ fn renderWithRuntimeHelpers(
             try writer.print("arg{d}", .{i});
         }
 
-        try writer.writeAll(") => __webuiNormalizeResult(await __webuiInvoke(__webuiRpcEndpoint, ");
+        try writer.writeAll(") => await __webuiInvoke(__webuiRpcEndpoint, ");
         try writeJsonLiteral(allocator, writer, fn_meta.name);
         try writer.writeAll(", [");
         i = 0;
@@ -116,7 +116,7 @@ pub fn renderComptime(comptime RpcStruct: type, comptime options: RenderOptions)
             out = out ++ "arg" ++ std.fmt.comptimePrint("{d}", .{i});
         }
 
-        out = out ++ ") => __webuiNormalizeResult(await __webuiInvoke(__webuiRpcEndpoint, \"" ++ decl.name ++ "\", [";
+        out = out ++ ") => await __webuiInvoke(__webuiRpcEndpoint, \"" ++ decl.name ++ "\", [";
 
         i = 0;
         inline while (i < arity) : (i += 1) {
@@ -207,7 +207,7 @@ pub const default_script =
     \\const __webuiRpcEndpoint = "/webui/rpc";
     \\const webuiRpc = {
     \\  async ping() {
-    \\    return __webuiNormalizeResult(await __webuiInvoke(__webuiRpcEndpoint, "ping", []));
+    \\    return await __webuiInvoke(__webuiRpcEndpoint, "ping", []);
     \\  },
     \\};
 ;

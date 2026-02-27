@@ -36,6 +36,10 @@
             .url = "https://github.com/karlseguin/websocket.zig/archive/97fefafa59cc78ce177cff540b8685cd7f699276.tar.gz",
             .hash = "websocket-0.1.0-ZPISdRlzAwBB_Bz2UMMqxYqF6YEVTIBoFsbzwPUJTHIc",
         },
+        .tls = .{
+            .url = "https://github.com/ianic/tls.zig/archive/9d56751.tar.gz",
+            .hash = "tls-0.1.0-ER2e0gNoBQBLuvbg_hPuGQYoCVsn-kHDuupr0hsapu4P",
+        },
     },
     .paths = .{
         "build.zig",

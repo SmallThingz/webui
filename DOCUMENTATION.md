@@ -406,9 +406,9 @@ Implemented capability groups:
 - Proxy launch option equivalent (`BrowserLaunchOptions.proxy_server`).
 - Script command queue + push dispatch (`/webui/ws`) with WS `script_response` routing for modern `runScript`/`evalScript`.
 - TLS runtime state API (`TlsOptions`, `App.setTlsCertificate`, `App.tlsInfo`) with certificate ingest and generated fallback material.
+- HTTPS runtime transport activation on TLS-enabled windows (secure URL scheme + plaintext HTTP `308` redirect on the same port).
 
 Remaining gaps versus full `webui.c` behavior:
-- Real encrypted HTTPS transport path is not complete (TLS state exists, transport still HTTP in active server loop).
 - Full native host completeness on Windows/macOS remains partial.
 - `webui_interface_*` compatibility layer remains deferred by milestone decision.
 
@@ -416,8 +416,8 @@ Remaining gaps versus full `webui.c` behavior:
 Status: **Partial**
 
 Mapped runtime:
-- `src/ported/webview/win32_wv2.zig`
-- `src/ported/webview/backend.zig`
+- `src/ported/webview.zig`.`Win32WebView`
+- `src/ported/webview.zig`
 
 Coverage:
 - Unified backend contract integration done.
@@ -435,8 +435,8 @@ Coverage:
 Status: **Partial**
 
 Mapped runtime:
-- `src/ported/webview/wkwebview.zig`
-- `src/ported/webview/backend.zig`
+- `src/ported/webview.zig`.`MacWebView`
+- `src/ported/webview.zig`
 
 Coverage:
 - Native backend contract integration exists.
@@ -487,18 +487,16 @@ Coverage:
 
 Latest parity report:
 - `total=40`
-- `implemented=35`
-- `partial=5`
+- `implemented=37`
+- `partial=3`
 - `missing=0`
 
 Partial buckets correspond to:
 - Native visual parity completeness on all native backends.
-- TLS transport encryption depth.
 - Deferred C-ABI compatibility layer.
 
 ## Recommendation
 
 Current codebase has no `missing` tracked features in local parity gates, but it is not yet strict 1:1 parity with every upstream capability detail. For full parity, prioritize:
 1. Native backend completion on Windows/macOS.
-2. HTTPS transport activation for TLS-enabled runtime.
-3. Optional compatibility module for `webui_interface_*` if C-wrapper parity is needed.
+2. Optional compatibility module for `webui_interface_*` if C-wrapper parity is needed.

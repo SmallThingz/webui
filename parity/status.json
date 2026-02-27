@@ -23,7 +23,7 @@
     { "id": "server.public_private_modes", "status": "implemented", "tests": ["root.test.public network mode binds server with public listen policy"] },
     { "id": "server.port_management", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
     { "id": "server.proxy_support", "status": "implemented", "tests": ["ported.webui.test.proxy server launch option maps to chromium proxy flag"] },
-    { "id": "server.tls_toggle", "status": "partial", "tests": ["docs.manual_gui_checklist"] },
+    { "id": "server.tls_toggle", "status": "implemented", "tests": ["root.test.tls enabled runtime redirects plaintext http and serves https content on same port"] },
 
     { "id": "event.lifecycle_callbacks", "status": "implemented", "tests": ["root.test.browser fallback serves window html over local http"] },
     { "id": "event.raw_channel", "status": "implemented", "tests": ["root.test.window control and style routes roundtrip"] },

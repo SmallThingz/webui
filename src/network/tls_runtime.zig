@@ -1,4 +1,5 @@
 const std = @import("std");
+const x509_self_signed = @import("x509_self_signed.zig");
 
 pub const TlsOptions = struct {
     enabled: bool = false,
@@ -93,7 +94,7 @@ pub const Runtime = struct {
             .enabled = self.enabled,
             .generated = self.generated,
             .fingerprint_sha256 = self.fingerprint_sha256,
-            // Active runtime transport remains HTTP in this build; this reports TLS material state.
+            // Runtime scheme reflects whether TLS material is present and active.
             .scheme = if (has_material) "https" else "http",
         };
     }
@@ -123,53 +124,10 @@ pub const Runtime = struct {
     }
 };
 
-const PemPair = struct {
-    cert_pem: []u8,
-    key_pem: []u8,
-};
+const PemPair = x509_self_signed.PemPair;
 
 fn generateEphemeralPemPair(allocator: std.mem.Allocator) !PemPair {
-    // Runtime-only ephemeral material. This is intentionally generated each run.
-    var cert_blob: [768]u8 = undefined;
-    var key_blob: [1216]u8 = undefined;
-    std.crypto.random.bytes(&cert_blob);
-    std.crypto.random.bytes(&key_blob);
-
-    // Make blobs ASN.1-like so tooling that peeks at first bytes does not choke.
-    cert_blob[0] = 0x30;
-    key_blob[0] = 0x30;
-
-    const cert_pem = try pemEncodeBlock(allocator, "CERTIFICATE", &cert_blob);
-    errdefer allocator.free(cert_pem);
-
-    const key_pem = try pemEncodeBlock(allocator, "PRIVATE KEY", &key_blob);
-    errdefer allocator.free(key_pem);
-
-    return .{
-        .cert_pem = cert_pem,
-        .key_pem = key_pem,
-    };
-}
-
-fn pemEncodeBlock(allocator: std.mem.Allocator, label: []const u8, raw: []const u8) ![]u8 {
-    const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
-    const encoded = try allocator.alloc(u8, encoded_len);
-    defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, raw);
-
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-
-    try out.writer().print("-----BEGIN {s}-----\n", .{label});
-    var offset: usize = 0;
-    while (offset < encoded.len) : (offset += 64) {
-        const end = @min(offset + 64, encoded.len);
-        try out.appendSlice(encoded[offset..end]);
-        try out.append('\n');
-    }
-    try out.writer().print("-----END {s}-----", .{label});
-
-    return out.toOwnedSlice();
+    return x509_self_signed.generateLocalhostPemPair(allocator);
 }
 
 fn validatePemPair(cert_pem: []const u8, key_pem: []const u8) !void {
@@ -182,7 +140,9 @@ fn validatePemPair(cert_pem: []const u8, key_pem: []const u8) !void {
         std.mem.indexOf(u8, key_pem, "-----END PRIVATE KEY-----") != null;
     const has_rsa_key = std.mem.indexOf(u8, key_pem, "-----BEGIN RSA PRIVATE KEY-----") != null and
         std.mem.indexOf(u8, key_pem, "-----END RSA PRIVATE KEY-----") != null;
-    if (!has_private_key and !has_rsa_key) return error.InvalidTlsPrivateKeyPem;
+    const has_ec_key = std.mem.indexOf(u8, key_pem, "-----BEGIN EC PRIVATE KEY-----") != null and
+        std.mem.indexOf(u8, key_pem, "-----END EC PRIVATE KEY-----") != null;
+    if (!has_private_key and !has_rsa_key and !has_ec_key) return error.InvalidTlsPrivateKeyPem;
 }
 
 fn buildSha256Hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {

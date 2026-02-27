@@ -205,13 +205,11 @@ pub const State = struct {
 
         if (task.err) |err| {
             task.mutex.unlock();
-            task.deinit();
             return err;
         }
 
         const out = task.result_json orelse {
             task.mutex.unlock();
-            task.deinit();
             return error.InvalidRpcResult;
         };
         const result = try allocator.dupe(u8, out);
@@ -221,7 +219,9 @@ pub const State = struct {
     }
 
     fn invokeFromJsonPayloadSync(self: *State, allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch {
+            return error.InvalidRpcPayload;
+        };
         defer parsed.deinit();
 
         const root = parsed.value;
@@ -241,18 +241,10 @@ pub const State = struct {
         }
 
         const encoded_value = try self.invokeSync(allocator, function_name, args_value.array.items);
-        defer allocator.free(encoded_value);
+        errdefer allocator.free(encoded_value);
 
         self.logf(.debug, "[webui.rpc] send name={s} value={s}\n", .{ function_name, encoded_value });
-
-        var out = std.array_list.Managed(u8).init(allocator);
-        errdefer out.deinit();
-
-        try out.appendSlice("{\"value\":");
-        try out.appendSlice(encoded_value);
-        try out.appendSlice("}");
-
-        return out.toOwnedSlice();
+        return encoded_value;
     }
 
     fn rpcWorkerMain(self: *State) void {

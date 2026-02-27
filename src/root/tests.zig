@@ -27,6 +27,7 @@ const readAllFromStream = webui.test_helpers.readAllFromStream;
 const httpRoundTrip = webui.test_helpers.httpRoundTrip;
 const httpRoundTripWithHeaders = webui.test_helpers.httpRoundTripWithHeaders;
 const readHttpHeadersFromStream = webui.test_helpers.readHttpHeadersFromStream;
+const httpResponseBody = webui.test_helpers.httpResponseBody;
 
 fn hasCapability(haystack: []const WindowCapability, needle: WindowCapability) bool {
     for (haystack) |cap| {
@@ -167,6 +168,33 @@ test "websocket upgrade uses same http server port" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
 }
 
+test "tls enabled runtime redirects plaintext http and serves https content on same port" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+        .tls = .{
+            .enabled = true,
+            .auto_generate_if_missing = true,
+        },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "TlsEnabledRuntime" });
+    try win.showHtml("<html><body>tls-runtime-ok</body></html>");
+    try app.run();
+
+    const local_url = try win.browserUrl();
+    defer gpa.allocator().free(local_url);
+    try std.testing.expect(std.mem.startsWith(u8, local_url, "https://127.0.0.1:"));
+
+    const redirect_response = try httpRoundTrip(gpa.allocator(), win.state().server_port, "GET", "/", null);
+    defer gpa.allocator().free(redirect_response);
+    try std.testing.expect(std.mem.indexOf(u8, redirect_response, "HTTP/1.1 308 Permanent Redirect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redirect_response, "Location: https://") != null);
+}
+
 test "window control route stays responsive during long running rpc" {
     const DemoRpc = struct {
         pub fn slow() []const u8 {
@@ -234,7 +262,7 @@ test "window control route stays responsive during long running rpc" {
     if (rpc_call_ctx.err) |err| return err;
     const rpc_response = rpc_call_ctx.response orelse return error.InvalidRpcResult;
     defer gpa.allocator().free(rpc_response);
-    try std.testing.expect(std.mem.indexOf(u8, rpc_response, "\"value\":\"done\"") != null);
+    try std.testing.expectEqualStrings("\"done\"", httpResponseBody(rpc_response));
 }
 
 test "native_webview launch order keeps local runtime reachable" {
@@ -644,6 +672,41 @@ test "browser launch failure fallback advances from active launch surface" {
     try std.testing.expect(!win.state().resolveAfterBrowserLaunchFailure(.web_url));
 }
 
+test "native launch request records fallback when browser app-window is launched" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{
+            .first = .native_webview,
+            .second = .browser_window,
+            .third = .web_url,
+        },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "NativeLaunchFallbackSurface" });
+    win.state().state_mutex.lock();
+    defer win.state().state_mutex.unlock();
+
+    win.state().runtime_render_state.active_surface = .native_webview;
+    win.state().runtime_render_state.active_transport = .native_webview;
+    win.state().runtime_render_state.fallback_applied = false;
+    win.state().runtime_render_state.fallback_reason = null;
+
+    win.state().setLaunchedBrowserLaunch(gpa.allocator(), .{
+        .pid = 1234,
+        .is_child_process = true,
+        .kind = .chrome,
+        .surface_mode = .app_window,
+    });
+
+    try std.testing.expectEqual(@as(LaunchSurface, .browser_window), win.state().runtime_render_state.active_surface);
+    try std.testing.expectEqual(@as(TransportMode, .browser_fallback), win.state().runtime_render_state.active_transport);
+    try std.testing.expect(win.state().runtime_render_state.fallback_applied);
+    try std.testing.expectEqual(@as(?FallbackReason, .native_backend_unavailable), win.state().runtime_render_state.fallback_reason);
+}
+
 test "window_closing lifecycle message is ignored while tracked browser pid is alive" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -757,7 +820,7 @@ test "window_closing lifecycle pending close cancels on websocket reconnect" {
     // used by this test and is removed immediately to avoid shutdown cleanup.
     try win.state().ws_connections.append(.{
         .connection_id = 1,
-        .stream = undefined,
+        .transport = .{ .plain = undefined },
     });
     win.state().reconcileChildExit(gpa.allocator());
     const pending_after_reconnect = win.state().lifecycle_close_pending;
@@ -1107,7 +1170,7 @@ test "typed rpc registration, invocation, and bridge generation" {
     const payload = "{\"name\":\"sum\",\"args\":[2,3]}";
     const result = try win.state().rpc_state.invokeFromJsonPayload(gpa.allocator(), payload);
     defer gpa.allocator().free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"value\":5") != null);
+    try std.testing.expectEqualStrings("5", result);
 }
 
 test "rpc event carries client and connection identifiers" {
@@ -1157,7 +1220,7 @@ test "rpc event carries client and connection identifiers" {
         &.{"x-webui-client-id: rpc-meta-client"},
     );
     defer gpa.allocator().free(rpc_response);
-    try std.testing.expect(std.mem.indexOf(u8, rpc_response, "\"value\":\"pong\"") != null);
+    try std.testing.expectEqualStrings("\"pong\"", httpResponseBody(rpc_response));
     try std.testing.expect(Capture.seen);
     try std.testing.expect(Capture.client_id != null);
     try std.testing.expect(Capture.connection_id != null);
@@ -1221,7 +1284,7 @@ test "threaded dispatcher executes rpc on worker queue" {
     const payload = "{\"name\":\"mul\",\"args\":[6,7]}";
     const result = try win.state().rpc_state.invokeFromJsonPayload(gpa.allocator(), payload);
     defer gpa.allocator().free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"value\":42") != null);
+    try std.testing.expectEqualStrings("42", result);
 }
 
 test "custom dispatcher can wrap default invoker" {
@@ -1259,7 +1322,7 @@ test "custom dispatcher can wrap default invoker" {
     const payload = "{\"name\":\"ping\",\"args\":[]}";
     const result = try win.state().rpc_state.invokeFromJsonPayload(gpa.allocator(), payload);
     defer gpa.allocator().free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"value\":\"pong\"") != null);
+    try std.testing.expectEqualStrings("\"pong\"", result);
 }
 
 test "comptime bridge generation" {
@@ -1677,7 +1740,7 @@ test "rpc route returns value directly with threaded default dispatcher" {
         "{\"name\":\"delayedAdd\",\"args\":[20,22,10]}",
     );
     defer gpa.allocator().free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"value\":42") != null);
+    try std.testing.expectEqualStrings("42", httpResponseBody(response));
     try std.testing.expect(std.mem.indexOf(u8, response, "\"job_id\"") == null);
 }
 
@@ -1739,13 +1802,13 @@ test "threaded dispatcher stress handles concurrent http rpc requests" {
                 };
                 defer allocator.free(response);
 
-                const needle = std.fmt.allocPrint(allocator, "\"value\":{d}", .{lhs * 3}) catch {
+                const needle = std.fmt.allocPrint(allocator, "{d}", .{lhs * 3}) catch {
                     ctx.shared.failed.store(true, .release);
                     return;
                 };
                 defer allocator.free(needle);
 
-                if (std.mem.indexOf(u8, response, needle) == null) {
+                if (!std.mem.eql(u8, httpResponseBody(response), needle)) {
                     ctx.shared.failed.store(true, .release);
                     return;
                 }
@@ -1767,4 +1830,109 @@ test "threaded dispatcher stress handles concurrent http rpc requests" {
 
     for (threads) |thread| thread.join();
     try std.testing.expect(!shared.failed.load(.acquire));
+}
+
+test "rpc flat contract supports structured args and object/array returns" {
+    const DemoRpc = struct {
+        const Mode = enum { fast, slow };
+        const Payload = struct {
+            a: i64,
+            b: ?i64,
+            mode: Mode,
+        };
+        const Out = struct {
+            ok: bool,
+            value: i64,
+        };
+
+        pub fn score(payload: Payload) i64 {
+            return payload.a + (payload.b orelse 0) + (if (payload.mode == .fast) @as(i64, 1) else @as(i64, 2));
+        }
+
+        pub fn obj() Out {
+            return .{ .ok = true, .value = 9 };
+        }
+
+        pub fn arr() [3]i64 {
+            return .{ 1, 2, 3 };
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "RpcFlatStructured" });
+    try win.bindRpc(DemoRpc, .{
+        .bridge_options = .{ .rpc_route = "/webui/rpc" },
+    });
+    try win.showHtml("<html><body>rpc-flat-structured</body></html>");
+    try app.run();
+
+    const score_res = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"score\",\"args\":[{\"a\":10,\"b\":5,\"mode\":\"slow\"}]}");
+    defer gpa.allocator().free(score_res);
+    try std.testing.expectEqualStrings("17", httpResponseBody(score_res));
+
+    const obj_res = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"obj\",\"args\":[]}");
+    defer gpa.allocator().free(obj_res);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"value\":9}", httpResponseBody(obj_res));
+
+    const arr_res = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"arr\",\"args\":[]}");
+    defer gpa.allocator().free(arr_res);
+    try std.testing.expectEqualStrings("[1,2,3]", httpResponseBody(arr_res));
+}
+
+test "rpc errors map to status code with empty body" {
+    const DemoRpc = struct {
+        pub fn add(a: i64, b: i64) i64 {
+            return a + b;
+        }
+
+        pub fn boom() !i64 {
+            return error.Boom;
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "RpcErrorStatusOnly" });
+    try win.bindRpc(DemoRpc, .{
+        .bridge_options = .{ .rpc_route = "/webui/rpc" },
+    });
+    try win.showHtml("<html><body>rpc-error-status-only</body></html>");
+    try app.run();
+
+    const malformed = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{");
+    defer gpa.allocator().free(malformed);
+    try std.testing.expect(std.mem.indexOf(u8, malformed, "HTTP/1.1 400 Bad Request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, malformed, "Content-Length: 0") != null);
+    try std.testing.expectEqualStrings("", httpResponseBody(malformed));
+
+    const unknown = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"missing\",\"args\":[]}");
+    defer gpa.allocator().free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "HTTP/1.1 404 Not Found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "Content-Length: 0") != null);
+    try std.testing.expectEqualStrings("", httpResponseBody(unknown));
+
+    const bad_args = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"add\",\"args\":[\"x\",2]}");
+    defer gpa.allocator().free(bad_args);
+    try std.testing.expect(std.mem.indexOf(u8, bad_args, "HTTP/1.1 422 Unprocessable Entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad_args, "Content-Length: 0") != null);
+    try std.testing.expectEqualStrings("", httpResponseBody(bad_args));
+
+    const failure = try httpRoundTrip(gpa.allocator(), win.state().server_port, "POST", "/webui/rpc", "{\"name\":\"boom\",\"args\":[]}");
+    defer gpa.allocator().free(failure);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "HTTP/1.1 500 Internal Server Error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "Content-Length: 0") != null);
+    try std.testing.expectEqualStrings("", httpResponseBody(failure));
 }

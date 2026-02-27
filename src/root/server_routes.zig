@@ -7,42 +7,51 @@ const window_style_types = @import("window_style.zig");
 pub fn handleConnection(
     state: anytype,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: anytype,
     default_client_token: []const u8,
 ) !bool {
-    const request = try net_io.readHttpRequest(allocator, stream);
+    const request = try net_io.readHttpRequestAny(allocator, conn);
     defer allocator.free(request.raw);
 
     const path_only = net_io.pathWithoutQuery(request.path);
-    if (try handleWebSocketUpgradeRoute(state, stream, request, path_only, default_client_token)) return true;
+    if (try handleWebSocketUpgradeRoute(state, conn, request, path_only, default_client_token)) return true;
 
     // Keep lifecycle/script/job control on WS only. Do not re-introduce HTTP fallback
     // routes for these flows, because they cause duplicate semantics and polling paths.
-    if (try handleBridgeScriptRoute(state, allocator, stream, request.method, path_only)) return false;
-    if (try handleRpcRoute(state, allocator, stream, request.method, path_only, request.headers, request.body, default_client_token)) return false;
-    if (try handleWindowControlRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
-    if (try handleWindowStyleRoute(state, allocator, stream, request.method, path_only, request.body)) return false;
-    if (try handleWindowContentRoute(state, allocator, stream, request.method, path_only)) return false;
+    if (try handleBridgeScriptRoute(state, allocator, conn, request.method, path_only)) return false;
+    if (try handleRpcRoute(state, allocator, conn, request.method, path_only, request.headers, request.body, default_client_token)) return false;
+    if (try handleWindowControlRoute(state, allocator, conn, request.method, path_only, request.body)) return false;
+    if (try handleWindowStyleRoute(state, allocator, conn, request.method, path_only, request.body)) return false;
+    if (try handleWindowContentRoute(state, allocator, conn, request.method, path_only)) return false;
 
-    try net_io.writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "not found");
+    try net_io.writeHttpResponseAny(conn, 404, "text/plain; charset=utf-8", "not found");
     return false;
 }
 
-fn wsConnectionThreadMain(state: anytype, stream: std.net.Stream, connection_id: usize) void {
-    const StateType = @TypeOf(state.*);
+fn closeOwnedTransport(state: anytype, transport: anytype) void {
+    switch (@TypeOf(transport)) {
+        std.net.Stream => transport.close(),
+        else => {
+            transport.close();
+            state.allocator.destroy(transport);
+        },
+    }
+}
+
+fn wsConnectionThreadMain(state: anytype, transport: anytype, connection_id: usize) void {
     defer {
         state.state_mutex.lock();
         state.unregisterWsConnectionLocked(connection_id);
         state.noteWsDisconnectLocked("websocket-disconnected");
         state.state_mutex.unlock();
-        stream.close();
+        closeOwnedTransport(state, transport);
         state.emitDiagnostic("websocket.disconnected", .websocket, .info, "WebSocket client disconnected");
 
         state.rpc_state.logf(.info, "[webui.ws] disconnected connection_id={d}\n", .{connection_id});
     }
 
     while (!state.server_stop.load(.acquire)) {
-        const frame = net_io.readWsInboundFrameAlloc(state.allocator, stream, 8 * 1024 * 1024) catch |err| {
+        const frame = net_io.readWsInboundFrameAllocAny(state.allocator, transport, 8 * 1024 * 1024) catch |err| {
             if (err != error.Closed) {
                 state.rpc_state.logf(.warn, "[webui.ws] read failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
             }
@@ -60,11 +69,11 @@ fn wsConnectionThreadMain(state: anytype, stream: std.net.Stream, connection_id:
                 };
             },
             .ping => {
-                StateType.writeWsFrame(stream, .pong, frame.payload) catch return;
+                net_io.writeWsFrameAny(transport, .pong, frame.payload) catch return;
             },
             .pong => {},
             .close => {
-                StateType.writeWsFrame(stream, .close, frame.payload) catch {};
+                net_io.writeWsFrameAny(transport, .close, frame.payload) catch {};
                 return;
             },
         }
@@ -73,7 +82,7 @@ fn wsConnectionThreadMain(state: anytype, stream: std.net.Stream, connection_id:
 
 fn handleWebSocketUpgradeRoute(
     state: anytype,
-    stream: std.net.Stream,
+    conn: anytype,
     request: net_io.HttpRequest,
     path_only: []const u8,
     default_client_token: []const u8,
@@ -82,38 +91,38 @@ fn handleWebSocketUpgradeRoute(
     if (!std.mem.eql(u8, path_only, "/webui/ws")) return false;
 
     const upgrade = net_io.httpHeaderValue(request.headers, "Upgrade") orelse {
-        try net_io.writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Upgrade header");
+        try net_io.writeHttpResponseAny(conn, 400, "text/plain; charset=utf-8", "missing Upgrade header");
         return false;
     };
     if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) {
-        try net_io.writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "invalid Upgrade header");
+        try net_io.writeHttpResponseAny(conn, 400, "text/plain; charset=utf-8", "invalid Upgrade header");
         return false;
     }
 
     const connection = net_io.httpHeaderValue(request.headers, "Connection") orelse {
-        try net_io.writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Connection header");
+        try net_io.writeHttpResponseAny(conn, 400, "text/plain; charset=utf-8", "missing Connection header");
         return false;
     };
     if (!net_io.containsTokenIgnoreCase(connection, "upgrade")) {
-        try net_io.writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "invalid Connection header");
+        try net_io.writeHttpResponseAny(conn, 400, "text/plain; charset=utf-8", "invalid Connection header");
         return false;
     }
 
     const version = net_io.httpHeaderValue(request.headers, "Sec-WebSocket-Version") orelse {
-        try net_io.writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Version header");
+        try net_io.writeHttpResponseAny(conn, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Version header");
         return false;
     };
     if (!std.mem.eql(u8, std.mem.trim(u8, version, " \t"), "13")) {
-        try net_io.writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "unsupported websocket version");
+        try net_io.writeHttpResponseAny(conn, 400, "text/plain; charset=utf-8", "unsupported websocket version");
         return false;
     }
 
     const sec_key = net_io.httpHeaderValue(request.headers, "Sec-WebSocket-Key") orelse {
-        try net_io.writeHttpResponse(stream, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Key header");
+        try net_io.writeHttpResponseAny(conn, 400, "text/plain; charset=utf-8", "missing Sec-WebSocket-Key header");
         return false;
     };
 
-    try net_io.writeWebSocketHandshakeResponse(stream, sec_key);
+    try net_io.writeWebSocketHandshakeResponseAny(conn, sec_key);
 
     const token = net_io.wsClientTokenFromUrl(request.path, default_client_token);
     var connection_id: usize = 0;
@@ -121,7 +130,7 @@ fn handleWebSocketUpgradeRoute(
     {
         const client_ref = try state.findOrCreateClientSessionLocked(token);
         connection_id = client_ref.connection_id;
-        try state.registerWsConnectionLocked(connection_id, stream);
+        try state.registerWsConnectionLocked(connection_id, conn);
         try state.dispatchPendingScriptTasksLocked();
     }
     state.state_mutex.unlock();
@@ -129,7 +138,7 @@ fn handleWebSocketUpgradeRoute(
     state.rpc_state.logf(.info, "[webui.ws] connected connection_id={d}\n", .{connection_id});
     state.emitDiagnostic("websocket.connected", .websocket, .info, "WebSocket client connected");
 
-    const thread = try std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, stream, connection_id });
+    const thread = try std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, conn, connection_id });
     thread.detach();
     return true;
 }
@@ -137,7 +146,7 @@ fn handleWebSocketUpgradeRoute(
 fn handleBridgeScriptRoute(
     state: anytype,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: anytype,
     method: []const u8,
     path_only: []const u8,
 ) !bool {
@@ -147,14 +156,14 @@ fn handleBridgeScriptRoute(
     if (!std.mem.eql(u8, path_only, script_route)) return false;
 
     // Bridge JS is pre-generated at compile time and stored in rpc_state.
-    try net_io.writeHttpResponse(stream, 200, "application/javascript; charset=utf-8", state.rpc_state.generated_script);
+    try net_io.writeHttpResponseAny(conn, 200, "application/javascript; charset=utf-8", state.rpc_state.generated_script);
     return true;
 }
 
 fn handleRpcRoute(
     state: anytype,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: anytype,
     method: []const u8,
     path_only: []const u8,
     headers: []const u8,
@@ -175,10 +184,9 @@ fn handleRpcRoute(
     const payload = state.rpc_state.invokeFromJsonPayload(allocator, body) catch |err| {
         state.rpc_state.invoke_mutex.unlock();
         state.emitDiagnostic("rpc.dispatch.error", .rpc, .warn, @errorName(err));
-        const err_body = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-        defer allocator.free(err_body);
-        state.rpc_state.logf(.warn, "[webui.rpc] error={s}\n", .{@errorName(err)});
-        try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_body);
+        const status = rpcStatusForError(err);
+        state.rpc_state.logf(.warn, "[webui.rpc] error={s} status={d}\n", .{ @errorName(err), status });
+        try net_io.writeHttpResponseAny(conn, status, "application/json; charset=utf-8", "");
         return true;
     };
     state.rpc_state.invoke_mutex.unlock();
@@ -198,14 +206,23 @@ fn handleRpcRoute(
         handler(state.event_callback.context, &event);
     }
 
-    try net_io.writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+    try net_io.writeHttpResponseAny(conn, 200, "application/json; charset=utf-8", payload);
     return true;
+}
+
+fn rpcStatusForError(err: anyerror) u16 {
+    return switch (err) {
+        error.InvalidRpcPayload => 400,
+        error.UnknownRpcFunction => 404,
+        error.InvalidRpcArgCount, error.InvalidRpcArgType => 422,
+        else => 500,
+    };
 }
 
 fn handleWindowControlRoute(
     state: anytype,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: anytype,
     method: []const u8,
     path_only: []const u8,
     body: []const u8,
@@ -222,7 +239,7 @@ fn handleWindowControlRoute(
             .emulation_enabled = emulation_enabled,
         }, .{});
         defer allocator.free(payload);
-        try net_io.writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+        try net_io.writeHttpResponseAny(conn, 200, "application/json; charset=utf-8", payload);
         return true;
     }
 
@@ -232,13 +249,13 @@ fn handleWindowControlRoute(
         cmd: []const u8,
     };
     var parsed = std.json.parseFromSlice(Req, allocator, body, .{ .ignore_unknown_fields = true }) catch {
-        try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_control_request\"}");
+        try net_io.writeHttpResponseAny(conn, 400, "application/json; charset=utf-8", "");
         return true;
     };
     defer parsed.deinit();
 
     const cmd = std.meta.stringToEnum(window_style_types.WindowControl, parsed.value.cmd) orelse {
-        try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"unknown_window_control\"}");
+        try net_io.writeHttpResponseAny(conn, 422, "application/json; charset=utf-8", "");
         return true;
     };
 
@@ -247,10 +264,14 @@ fn handleWindowControlRoute(
     state.state_mutex.lock();
     const result = state.control(cmd) catch |err| {
         state.state_mutex.unlock();
-        const err_payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-        defer allocator.free(err_payload);
         state.rpc_state.logf(.warn, "[webui.window] control error={s}\n", .{@errorName(err)});
-        try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_payload);
+        const status: u16 = switch (err) {
+            error.UnsupportedWindowControl,
+            error.CloseDenied,
+            => 422,
+            else => 500,
+        };
+        try net_io.writeHttpResponseAny(conn, status, "application/json; charset=utf-8", "");
         return true;
     };
     state.state_mutex.unlock();
@@ -269,14 +290,14 @@ fn handleWindowControlRoute(
         .warning = result.warning,
     }, .{});
     defer allocator.free(payload);
-    try net_io.writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+    try net_io.writeHttpResponseAny(conn, 200, "application/json; charset=utf-8", payload);
     return true;
 }
 
 fn handleWindowStyleRoute(
     state: anytype,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: anytype,
     method: []const u8,
     path_only: []const u8,
     body: []const u8,
@@ -289,14 +310,14 @@ fn handleWindowStyleRoute(
         state.state_mutex.unlock();
         const payload = try std.json.Stringify.valueAlloc(allocator, style, .{});
         defer allocator.free(payload);
-        try net_io.writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+        try net_io.writeHttpResponseAny(conn, 200, "application/json; charset=utf-8", payload);
         return true;
     }
 
     if (!std.mem.eql(u8, method, "POST")) return false;
 
     var parsed = std.json.parseFromSlice(window_style_types.WindowStyle, allocator, body, .{ .ignore_unknown_fields = true }) catch {
-        try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"invalid_window_style\"}");
+        try net_io.writeHttpResponseAny(conn, 400, "application/json; charset=utf-8", "");
         return true;
     };
     defer parsed.deinit();
@@ -304,10 +325,12 @@ fn handleWindowStyleRoute(
     state.state_mutex.lock();
     state.applyStyle(allocator, parsed.value) catch |err| {
         state.state_mutex.unlock();
-        const err_payload = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-        defer allocator.free(err_payload);
         state.rpc_state.logf(.warn, "[webui.window] style error={s}\n", .{@errorName(err)});
-        try net_io.writeHttpResponse(stream, 400, "application/json; charset=utf-8", err_payload);
+        const status: u16 = switch (err) {
+            error.UnsupportedWindowStyle => 422,
+            else => 500,
+        };
+        try net_io.writeHttpResponseAny(conn, status, "application/json; charset=utf-8", "");
         return true;
     };
     const style = state.current_style;
@@ -321,7 +344,7 @@ fn handleWindowStyleRoute(
 
     const payload = try std.json.Stringify.valueAlloc(allocator, style, .{});
     defer allocator.free(payload);
-    try net_io.writeHttpResponse(stream, 200, "application/json; charset=utf-8", payload);
+    try net_io.writeHttpResponseAny(conn, 200, "application/json; charset=utf-8", payload);
     return true;
 }
 
@@ -332,7 +355,7 @@ fn isHttpUrl(url: []const u8) bool {
 fn handleWindowContentRoute(
     state: anytype,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: anytype,
     method: []const u8,
     path_only: []const u8,
 ) !bool {
@@ -343,17 +366,17 @@ fn handleWindowContentRoute(
     defer state.state_mutex.unlock();
 
     if (state.last_html) |html| {
-        try net_io.writeHttpResponse(stream, 200, "text/html; charset=utf-8", html);
+        try net_io.writeHttpResponseAny(conn, 200, "text/html; charset=utf-8", html);
         return true;
     }
 
     if (state.last_file) |file_path| {
         const data = std.fs.cwd().readFileAlloc(allocator, file_path, 8 * 1024 * 1024) catch {
-            try net_io.writeHttpResponse(stream, 500, "text/plain; charset=utf-8", "failed to read file");
+            try net_io.writeHttpResponseAny(conn, 500, "text/plain; charset=utf-8", "failed to read file");
             return true;
         };
         defer allocator.free(data);
-        try net_io.writeHttpResponse(stream, 200, net_io.contentTypeForPath(file_path), data);
+        try net_io.writeHttpResponseAny(conn, 200, net_io.contentTypeForPath(file_path), data);
         return true;
     }
 
@@ -365,11 +388,11 @@ fn handleWindowContentRoute(
                 .{url},
             );
             defer allocator.free(redirect);
-            try net_io.writeHttpResponse(stream, 200, "text/html; charset=utf-8", redirect);
+            try net_io.writeHttpResponseAny(conn, 200, "text/html; charset=utf-8", redirect);
             return true;
         }
     }
 
-    try net_io.writeHttpResponse(stream, 404, "text/plain; charset=utf-8", "no content");
+    try net_io.writeHttpResponseAny(conn, 404, "text/plain; charset=utf-8", "no content");
     return true;
 }

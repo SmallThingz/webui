@@ -159,6 +159,11 @@ pub fn build(b: *Build) void {
         .optimize = optimize,
     });
     const websocket_mod = websocket_dep.module("websocket");
+    const tls_dep = b.dependency("tls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tls_mod = tls_dep.module("tls");
     const websocket_build_opts = b.addOptions();
     websocket_build_opts.addOption(bool, "websocket_blocking", false);
     websocket_mod.addOptions("build", websocket_build_opts);
@@ -171,6 +176,7 @@ pub fn build(b: *Build) void {
     });
     lib_module.addOptions("build_options", build_opts);
     lib_module.addImport("websocket", websocket_mod);
+    lib_module.addImport("tls", tls_mod);
 
     const webui_lib = b.addLibrary(.{
         .name = "webui",
@@ -188,6 +194,7 @@ pub fn build(b: *Build) void {
     });
     webui_mod.addOptions("build_options", build_opts);
     webui_mod.addImport("websocket", websocket_mod);
+    webui_mod.addImport("tls", tls_mod);
 
     const example_shared_source_path = "examples/shared/demo_runner.zig";
     const example_shared_mod: ?*Build.Module = if (pathExists(example_shared_source_path)) b.addModule("example_shared", .{
