@@ -6,11 +6,6 @@ pub const GtkApi = enum {
     gtk4,
 };
 
-pub const WebKitRuntime = enum {
-    webkitgtk_6,
-    webkit2gtk_4x,
-};
-
 pub const Symbols = struct {
     gtk: std.DynLib,
     gdk: std.DynLib,
@@ -19,7 +14,6 @@ pub const Symbols = struct {
     glib: std.DynLib,
     cairo: std.DynLib,
     gtk_api: GtkApi,
-    webkit_runtime: WebKitRuntime = .webkit2gtk_4x,
 
     gtk_init_gtk3: ?*const fn (?*c_int, ?*anyopaque) callconv(.c) void = null,
     gtk_init_gtk4: ?*const fn () callconv(.c) void = null,
@@ -43,7 +37,6 @@ pub const Symbols = struct {
     gtk_window_unfullscreen: ?*const fn (*common.GtkWindow) callconv(.c) void = null,
     gtk_window_set_icon_from_file: ?*const fn (*common.GtkWindow, [*:0]const u8, *?*common.GError) callconv(.c) c_int = null,
     gtk_window_set_icon_name: ?*const fn (*common.GtkWindow, ?[*:0]const u8) callconv(.c) void = null,
-    gtk_window_is_active: ?*const fn (*common.GtkWindow) callconv(.c) c_int = null,
     gtk_window_maximize: *const fn (*common.GtkWindow) callconv(.c) void,
     gtk_window_unmaximize: *const fn (*common.GtkWindow) callconv(.c) void,
 
@@ -190,15 +183,6 @@ pub const Symbols = struct {
         if (self.gtk_widget_queue_draw) |queue_draw| queue_draw(widget);
     }
 
-    pub fn isWebKitGtk6(self: *const Symbols) bool {
-        return self.webkit_runtime == .webkitgtk_6;
-    }
-
-    pub fn windowIsActive(self: *const Symbols, window: *common.GtkWindow) bool {
-        const is_active = self.gtk_window_is_active orelse return false;
-        return is_active(window) != 0;
-    }
-
     pub fn destroyWindow(self: *const Symbols, window_widget: *common.GtkWidget) void {
         switch (self.gtk_api) {
             .gtk3 => {
@@ -269,15 +253,15 @@ pub const Symbols = struct {
                     if (self.gdk_display_get_default) |get_default| {
                         if (self.gtk_widget_add_css_class) |add_class| {
                             add_class(window_widget, "webui-window");
-                            
+
                             var css_buf: [256]u8 = undefined;
                             var css_str: [:0]const u8 = "";
                             if (style.transparent and radius > 0) {
-                                css_str = std.fmt.bufPrintZ(&css_buf, "window.webui-window, window.webui-window > decoration {{ background-color: transparent; border-radius: {d}px; box-shadow: none; }}\nwebview {{ border-radius: {d}px; background-color: transparent; }}", .{radius, radius}) catch "window.webui-window { background-color: transparent; }";
+                                css_str = std.fmt.bufPrintZ(&css_buf, "window.webui-window, window.webui-window > decoration {{ background-color: transparent; border-radius: {d}px; box-shadow: none; }}\nwebview {{ border-radius: {d}px; background-color: transparent; }}", .{ radius, radius }) catch "window.webui-window { background-color: transparent; }";
                             } else if (style.transparent) {
                                 css_str = "window.webui-window, window.webui-window > decoration { background-color: transparent; box-shadow: none; }\nwebview { background-color: transparent; }";
                             } else if (radius > 0) {
-                                css_str = std.fmt.bufPrintZ(&css_buf, "window.webui-window, window.webui-window > decoration {{ border-radius: {d}px; box-shadow: none; }}\nwebview {{ border-radius: {d}px; }}", .{radius, radius}) catch "";
+                                css_str = std.fmt.bufPrintZ(&css_buf, "window.webui-window, window.webui-window > decoration {{ border-radius: {d}px; box-shadow: none; }}\nwebview {{ border-radius: {d}px; }}", .{ radius, radius }) catch "";
                             }
 
                             if (css_str.len > 0) {
@@ -294,7 +278,6 @@ pub const Symbols = struct {
                 }
             }
         }
-
     }
 
     pub fn minimizeWindow(self: *const Symbols, window: *common.GtkWindow) void {
@@ -448,17 +431,18 @@ pub const Symbols = struct {
         // to GTK3/WebKit2GTK compatibility libs.
         if (self.loadDynLibsFor(
             .gtk4,
-            .webkitgtk_6,
             &.{ "libgtk-4.so.1", "libgtk-4.so" },
             // Some distros do not ship a separate libgdk-4 soname and expose
             // GDK symbols via libgtk-4 instead.
             &.{ "libgdk-4.so.1", "libgdk-4.so", "libgtk-4.so.1", "libgtk-4.so" },
+            // NOTE: WebKitGTK 6.0 currently has a known workspace/focus redraw
+            // freeze issue on some environments. We intentionally avoid local
+            // backend hacks here and keep the provider behavior straightforward.
             &.{ "libwebkitgtk-6.0.so.4", "libwebkitgtk-6.0.so" },
         )) return;
 
         if (self.loadDynLibsFor(
             .gtk3,
-            .webkit2gtk_4x,
             &.{ "libgtk-3.so.0", "libgtk-3.so" },
             &.{ "libgdk-3.so.0", "libgdk-3.so" },
             &.{ "libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.1.so", "libwebkit2gtk-4.0.so.37", "libwebkit2gtk-4.0.so" },
@@ -470,7 +454,6 @@ pub const Symbols = struct {
     fn loadDynLibsFor(
         self: *Symbols,
         api: GtkApi,
-        runtime: WebKitRuntime,
         gtk_names: []const []const u8,
         gdk_names: []const []const u8,
         webkit_names: []const []const u8,
@@ -496,7 +479,6 @@ pub const Symbols = struct {
         self.glib = glib;
         self.cairo = cairo;
         self.gtk_api = api;
-        self.webkit_runtime = runtime;
         return true;
     }
 
@@ -523,7 +505,6 @@ pub const Symbols = struct {
         self.gtk_window_unfullscreen = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_unfullscreen), "gtk_window_unfullscreen");
         self.gtk_window_set_icon_from_file = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_set_icon_from_file), "gtk_window_set_icon_from_file");
         self.gtk_window_set_icon_name = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_set_icon_name), "gtk_window_set_icon_name");
-        self.gtk_window_is_active = lookupOptionalSym(&self.gtk, @TypeOf(self.gtk_window_is_active), "gtk_window_is_active");
         self.gtk_window_maximize = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_maximize), "gtk_window_maximize");
         self.gtk_window_unmaximize = try lookupSym(&self.gtk, @TypeOf(self.gtk_window_unmaximize), "gtk_window_unmaximize");
 
