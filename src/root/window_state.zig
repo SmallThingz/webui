@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const websocket = @import("websocket");
 
 const core_runtime = @import("../ported/webui.zig");
@@ -769,6 +770,10 @@ pub const WindowState = struct {
         const url = try self.localRenderUrl(allocator);
         defer allocator.free(url);
         try replaceOwned(allocator, &self.last_url, url);
+
+        // Prevent automated browser popups during `zig test`; tests can still
+        // exercise HTTP/WS routes via the local URL and explicit APIs.
+        if (builtin.is_test) return;
 
         if (self.shouldAttemptBrowserSpawnLocked(allocator, true)) {
             const launch_options = self.effectiveBrowserLaunchOptions(app_options.browser_launch);

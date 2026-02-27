@@ -99,6 +99,12 @@ const launchPolicyOrder = launch_policy.order;
 const launchPolicyContains = launch_policy.contains;
 const launchPolicyNextAfter = launch_policy.nextAfter;
 
+const buildTsArgSignature = rpc_reflect.buildTsArgSignature;
+const tsTypeNameForReturn = rpc_reflect.tsTypeNameForReturn;
+const makeInvoker = rpc_reflect.makeInvoker;
+const replaceOwned = root_utils.replaceOwned;
+const isLikelyUrl = root_utils.isLikelyUrl;
+
 const RpcRegistryState = rpc_runtime.State;
 
 pub const DiagnosticHandler = window_state.DiagnosticHandler;
@@ -432,7 +438,7 @@ pub const Window = struct {
             _ = win_state.backend.showContent(.{ .url = url }) catch {};
         }
 
-        if (win_state.shouldAttemptBrowserSpawnLocked(self.app.allocator, false)) {
+        if (!builtin.is_test and win_state.shouldAttemptBrowserSpawnLocked(self.app.allocator, false)) {
             const launch_options = win_state.effectiveBrowserLaunchOptions(self.app.options.browser_launch);
             if (core_runtime.openInBrowser(self.app.allocator, url, win_state.current_style, launch_options)) |launch| {
                 win_state.setLaunchedBrowserLaunch(self.app.allocator, launch);
@@ -1116,9 +1122,3 @@ pub const RpcRegistry = struct {
         try file.writeAll(script);
     }
 };
-
-const buildTsArgSignature = rpc_reflect.buildTsArgSignature;
-const tsTypeNameForReturn = rpc_reflect.tsTypeNameForReturn;
-const makeInvoker = rpc_reflect.makeInvoker;
-const replaceOwned = root_utils.replaceOwned;
-const isLikelyUrl = root_utils.isLikelyUrl;
