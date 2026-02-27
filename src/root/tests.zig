@@ -36,6 +36,81 @@ fn hasCapability(haystack: []const WindowCapability, needle: WindowCapability) b
     return false;
 }
 
+fn isNativeCloseSmokeChildProcess() bool {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, "WEBUI_NATIVE_CLOSE_SMOKE_CHILD") catch return false;
+    defer std.heap.page_allocator.free(value);
+    return std.mem.eql(u8, value, "1");
+}
+
+fn runNativeCloseSmokeFlow() anyerror!void {
+    const SmokeRpc = struct {
+        pub fn ping() []const u8 {
+            return "pong";
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var service = try Service.init(gpa.allocator(), SmokeRpc, .{
+        .app = .{
+            .launch_policy = .{
+                .first = .native_webview,
+                .second = null,
+                .third = null,
+                .allow_dual_surface = false,
+                .app_mode_required = true,
+            },
+        },
+        .window = .{
+            .title = "native-close-smoke",
+        },
+        .process_signals = false,
+    });
+    defer service.deinit();
+
+    const reqs = try service.listRuntimeRequirements(gpa.allocator());
+    defer gpa.allocator().free(reqs);
+    for (reqs) |req| {
+        if (req.required and !req.available) return error.SkipZigTest;
+    }
+
+    service.showHtml("<html><body>native-close-smoke</body></html>") catch |err| {
+        if (std.mem.eql(u8, @errorName(err), "NativeBackendUnavailable")) return error.SkipZigTest;
+        return err;
+    };
+    try service.run();
+
+    const render_state = service.runtimeRenderState();
+    if (render_state.active_surface != .native_webview) return error.SkipZigTest;
+
+    std.Thread.sleep(120 * std.time.ns_per_ms);
+
+    _ = service.control(.close) catch |err| {
+        const err_name = @errorName(err);
+        if (std.mem.eql(u8, err_name, "NativeBackendUnavailable") or
+            std.mem.eql(u8, err_name, "UnsupportedWindowControl"))
+        {
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+
+    const start_ms = std.time.milliTimestamp();
+    while (!service.shouldExit()) {
+        if (std.time.milliTimestamp() - start_ms > 5000) return error.ServerStartTimeout;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+
+    service.shutdown();
+
+    if (builtin.os.tag == .linux) {
+        // Linux examples exit via _exit in native-webview mode to avoid
+        // WebKitGTK teardown asserts during libc process-exit destructors.
+        std.posix.exit(0);
+    }
+}
+
 fn writeAllStream(stream: std.net.Stream, bytes: []const u8) !void {
     if (builtin.os.tag == .windows) {
         var offset: usize = 0;
@@ -105,6 +180,38 @@ test "browser fallback serves window html over local http" {
     try std.testing.expect(std.mem.indexOf(u8, response, "browser-fallback-ok") != null);
 
     app.shutdown();
+}
+
+test "native webview close smoke child target" {
+    if (!isNativeCloseSmokeChildProcess()) return error.SkipZigTest;
+    try runNativeCloseSmokeFlow();
+}
+
+test "native webview close smoke subprocess exits cleanly" {
+    if (isNativeCloseSmokeChildProcess()) return;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    defer argv.deinit();
+    try argv.append(exe_path);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("WEBUI_NATIVE_CLOSE_SMOKE_CHILD", "1");
+    child.env_map = &env_map;
+
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "browser fallback server is reachable across repeated connects" {
