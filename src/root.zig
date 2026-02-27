@@ -10,7 +10,7 @@ const tls_runtime = @import("network/tls_runtime.zig");
 const websocket = @import("websocket");
 pub const process_signals = @import("process_signals.zig");
 const window_style_types = @import("window_style.zig");
-const webview_backend = @import("ported/webview/backend.zig");
+const webview_backend = @import("ported/webview.zig");
 const api_types = @import("root/api_types.zig");
 const launch_policy = @import("root/launch_policy.zig");
 const rpc_reflect = @import("root/rpc_reflect.zig");
@@ -154,7 +154,6 @@ fn backendWarningForError(err: anyerror, will_fallback: bool) ?[]const u8 {
     };
 }
 
-const RpcHandlerEntry = rpc_runtime.HandlerEntry;
 const RpcRegistryState = rpc_runtime.State;
 
 const ClientSession = struct {
@@ -1766,12 +1765,12 @@ pub const Window = struct {
         try self.rpc().register(RpcStruct, options);
     }
 
-    pub fn rpcClientScript(self: *Window, options: BridgeOptions) []const u8 {
-        return self.rpc().generatedClientScript(options);
+    pub fn rpcClientScript(self: *Window) []const u8 {
+        return self.rpc().generatedClientScript();
     }
 
-    pub fn rpcTypeDeclarations(self: *Window, options: BridgeOptions) []const u8 {
-        return self.rpc().generatedTypeScriptDeclarations(options);
+    pub fn rpcTypeDeclarations(self: *Window) []const u8 {
+        return self.rpc().generatedTypeScriptDeclarations();
     }
 
     pub fn runScript(self: *Window, script: []const u8, options: ScriptOptions) !void {
@@ -2278,14 +2277,14 @@ pub const Service = struct {
         try win.openInBrowserWithOptions(launch_options);
     }
 
-    pub fn rpcClientScript(self: *Service, options: BridgeOptions) []const u8 {
+    pub fn rpcClientScript(self: *Service) []const u8 {
         var win = self.window();
-        return win.rpcClientScript(options);
+        return win.rpcClientScript();
     }
 
-    pub fn rpcTypeDeclarations(self: *Service, options: BridgeOptions) []const u8 {
+    pub fn rpcTypeDeclarations(self: *Service) []const u8 {
         var win = self.window();
-        return win.rpcTypeDeclarations(options);
+        return win.rpcTypeDeclarations();
     }
 
     pub fn generatedClientScriptComptime(comptime rpc_methods: type, comptime options: BridgeOptions) []const u8 {
@@ -2314,6 +2313,14 @@ pub const RpcRegistry = struct {
     state: *RpcRegistryState,
 
     pub fn register(self: RpcRegistry, comptime RpcStruct: type, options: RpcOptions) !void {
+        if (!std.mem.eql(u8, options.bridge_options.namespace, "webuiRpc") or
+            !std.mem.eql(u8, options.bridge_options.script_route, "/webui_bridge.js") or
+            !std.mem.eql(u8, options.bridge_options.rpc_route, "/webui/rpc"))
+        {
+            return error.BridgeOptionsMustUseDefaultsForComptimeGeneration;
+        }
+
+        self.state.bridge_options = options.bridge_options;
         self.state.dispatcher_mode = options.dispatcher_mode;
         self.state.custom_dispatcher = options.custom_dispatcher;
         self.state.custom_context = options.custom_context;
@@ -2350,15 +2357,12 @@ pub const RpcRegistry = struct {
         }
 
         if (registered_count == 0) return error.NoRpcFunctions;
-
-        try self.state.rebuildScript(self.allocator, options.bridge_options);
+        self.state.generated_script = RpcRegistry.generatedClientScriptComptime(RpcStruct, .{});
+        self.state.generated_typescript = RpcRegistry.generatedTypeScriptDeclarationsComptime(RpcStruct, .{});
     }
 
-    pub fn generatedClientScript(self: RpcRegistry, options: BridgeOptions) []const u8 {
-        if (self.state.generated_script == null or !bridgeOptionsEqual(self.state.bridge_options, options)) {
-            self.state.rebuildScript(self.allocator, options) catch {};
-        }
-        return self.state.generated_script orelse bridge_template.default_script;
+    pub fn generatedClientScript(self: RpcRegistry) []const u8 {
+        return self.state.generated_script;
     }
 
     pub fn generatedClientScriptComptime(comptime RpcStruct: type, comptime options: BridgeOptions) []const u8 {
@@ -2368,38 +2372,17 @@ pub const RpcRegistry = struct {
         });
     }
 
-    pub fn writeGeneratedClientScript(self: RpcRegistry, output_path: []const u8, options: BridgeOptions) !void {
-        const metas = try self.allocator.alloc(bridge_template.RpcFunctionMeta, self.state.handlers.items.len);
-        defer self.allocator.free(metas);
-
-        for (self.state.handlers.items, 0..) |handler, i| {
-            metas[i] = .{
-                .name = handler.name,
-                .arity = handler.arity,
-                .ts_arg_signature = handler.ts_arg_signature,
-                .ts_return_type = handler.ts_return_type,
-            };
-        }
-
-        const script = try bridge_template.renderForWrittenOutput(self.allocator, .{
-            .namespace = options.namespace,
-            .rpc_route = options.rpc_route,
-        }, metas);
-        defer self.allocator.free(script);
-
+    pub fn writeGeneratedClientScript(self: RpcRegistry, output_path: []const u8) !void {
         if (std.fs.path.dirname(output_path)) |dir_name| {
             try std.fs.cwd().makePath(dir_name);
         }
         const file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
         defer file.close();
-        try file.writeAll(script);
+        try file.writeAll(self.generatedClientScript());
     }
 
-    pub fn generatedTypeScriptDeclarations(self: RpcRegistry, options: BridgeOptions) []const u8 {
-        if (self.state.generated_typescript == null or !bridgeOptionsEqual(self.state.bridge_options, options)) {
-            self.state.rebuildTypeScript(self.allocator, options) catch {};
-        }
-        return self.state.generated_typescript orelse "export interface WebuiRpcClient {}\n";
+    pub fn generatedTypeScriptDeclarations(self: RpcRegistry) []const u8 {
+        return self.state.generated_typescript;
     }
 
     pub fn generatedTypeScriptDeclarationsComptime(comptime RpcStruct: type, comptime options: BridgeOptions) []const u8 {
@@ -2409,8 +2392,8 @@ pub const RpcRegistry = struct {
         });
     }
 
-    pub fn writeGeneratedTypeScriptDeclarations(self: RpcRegistry, output_path: []const u8, options: BridgeOptions) !void {
-        const script = self.generatedTypeScriptDeclarations(options);
+    pub fn writeGeneratedTypeScriptDeclarations(self: RpcRegistry, output_path: []const u8) !void {
+        const script = self.generatedTypeScriptDeclarations();
         if (std.fs.path.dirname(output_path)) |dir_name| {
             try std.fs.cwd().makePath(dir_name);
         }
@@ -2423,7 +2406,6 @@ pub const RpcRegistry = struct {
 const buildTsArgSignature = rpc_reflect.buildTsArgSignature;
 const tsTypeNameForReturn = rpc_reflect.tsTypeNameForReturn;
 const makeInvoker = rpc_reflect.makeInvoker;
-const bridgeOptionsEqual = root_utils.bridgeOptionsEqual;
 const replaceOwned = root_utils.replaceOwned;
 const isLikelyUrl = root_utils.isLikelyUrl;
 
@@ -3298,29 +3280,24 @@ test "typed rpc registration, invocation, and bridge generation" {
     defer app.deinit();
 
     var win = try app.newWindow(.{});
-    try win.bindRpc(DemoRpc, .{
-        .bridge_options = .{
-            .namespace = "demoRpc",
-            .rpc_route = "/rpc/demo",
-        },
-    });
+    try win.bindRpc(DemoRpc, .{});
 
-    const script = win.rpcClientScript(.{ .namespace = "demoRpc", .rpc_route = "/rpc/demo" });
+    const script = win.rpcClientScript();
     try std.testing.expect(std.mem.indexOf(u8, script, "sum: async (arg0, arg1)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "__webuiRpcEndpoint = \"/rpc/demo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "__webuiRpcEndpoint = \"/webui/rpc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "globalThis.__webuiWindowControl") != null);
 
     const written_path = try std.fmt.allocPrint(gpa.allocator(), ".zig-cache/test_bridge_written_{d}.js", .{std.time.nanoTimestamp()});
     defer gpa.allocator().free(written_path);
     defer std.fs.cwd().deleteFile(written_path) catch {};
-    try win.rpc().writeGeneratedClientScript(written_path, .{ .namespace = "demoRpc", .rpc_route = "/rpc/demo" });
+    try win.rpc().writeGeneratedClientScript(written_path);
     const written_script = try std.fs.cwd().readFileAlloc(gpa.allocator(), written_path, 1024 * 1024);
     defer gpa.allocator().free(written_script);
     try std.testing.expect(std.mem.indexOf(u8, written_script, "async function __webuiInvoke(endpoint, name, args)") != null);
 
-    const dts = win.rpcTypeDeclarations(.{ .namespace = "demoRpc", .rpc_route = "/rpc/demo" });
-    try std.testing.expect(std.mem.indexOf(u8, dts, "sum(arg0: number, arg1: number): Promise<number>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dts, "ping(): Promise<string>;") != null);
+    const dts = win.rpcTypeDeclarations();
+    try std.testing.expect(std.mem.indexOf(u8, dts, "sum(...args: unknown[]): Promise<unknown>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dts, "ping(...args: unknown[]): Promise<unknown>;") != null);
 
     const payload = "{\"name\":\"sum\",\"args\":[2,3]}";
     const result = try win.state().rpc_state.invokeFromJsonPayload(gpa.allocator(), payload);
@@ -3408,7 +3385,7 @@ test "friendly service api with compile-time rpc_methods constant" {
     defer gpa.allocator().free(local_url);
     try std.testing.expect(std.mem.startsWith(u8, local_url, "http://127.0.0.1:"));
 
-    const script_rt = service.rpcClientScript(.{});
+    const script_rt = service.rpcClientScript();
     const script_ct = Service.generatedClientScriptComptime(rpc_methods, .{});
     const dts_ct = Service.generatedTypeScriptDeclarationsComptime(rpc_methods, .{});
     try std.testing.expect(std.mem.indexOf(u8, script_rt, "ping: async") != null);

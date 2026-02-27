@@ -287,9 +287,14 @@ pub const rpc_methods = struct {
 ```
 
 What you can generate:
-- Runtime-generated JS client string: `Window.rpcClientScript(.{})`
+- Compile-time-generated JS client string: `Window.rpcClientScript()`
 - Comptime JS client string: `webui.Service.generatedClientScriptComptime(rpc_methods, .{})`
 - Comptime TypeScript declarations: `webui.Service.generatedTypeScriptDeclarationsComptime(rpc_methods, .{})`
+
+Bridge generation policy:
+- Runtime bridge regeneration is disabled.
+- The served `/webui_bridge.js` payload is the compile-time artifact produced from `rpc_methods`.
+- `RpcOptions.bridge_options` must stay at defaults (`webuiRpc`, `/webui_bridge.js`, `/webui/rpc`) when binding RPC.
 
 Dispatch modes:
 - `sync` (direct execution)

@@ -37,7 +37,7 @@ pub fn main() !void {
     defer service.deinit();
     webui.process_signals.install();
 
-    const script = service.rpcClientScript(.{});
+    const script = service.rpcClientScript();
     const script_comptime = webui.Service.generatedClientScriptComptime(rpc_methods, .{});
     const dts = webui.Service.generatedTypeScriptDeclarationsComptime(rpc_methods, .{});
     std.debug.print("Generated bridge size: {d} bytes\n", .{script.len});

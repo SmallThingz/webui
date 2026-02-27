@@ -176,7 +176,7 @@ pub fn runExample(comptime kind: ExampleKind, comptime RpcMethods: type) !void {
     const html = try htmlFor(allocator, kind);
     defer allocator.free(html);
 
-    const bridge = service.rpcClientScript(.{});
+    const bridge = service.rpcClientScript();
     std.debug.print("[{s}] bridge bytes: {d}\n", .{ tagFor(kind), bridge.len });
 
     try service.showHtml(html);

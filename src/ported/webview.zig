@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const style_types = @import("../../window_style.zig");
-const browser_discovery = @import("../browser_discovery.zig");
-const core_runtime = @import("../webui.zig");
+const style_types = @import("../window_style.zig");
+const browser_discovery = @import("browser_discovery.zig");
+const core_runtime = @import("webui.zig");
 
 pub const WindowContent = union(enum) {
     html: []const u8,

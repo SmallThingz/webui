@@ -1,7 +1,5 @@
 const std = @import("std");
-const websocket = @import("websocket");
 
-const bridge_template = @import("../bridge/template.zig");
 const net_io = @import("net_io.zig");
 const api_types = @import("api_types.zig");
 const window_style_types = @import("../window_style.zig");
@@ -148,23 +146,13 @@ fn handleBridgeScriptRoute(
     method: []const u8,
     path_only: []const u8,
 ) !bool {
+    _ = allocator;
     if (!std.mem.eql(u8, method, "GET")) return false;
     const script_route = state.rpc_state.bridge_options.script_route;
     if (!std.mem.eql(u8, path_only, script_route)) return false;
 
-    const script_copy = blk: {
-        state.rpc_state.invoke_mutex.lock();
-        defer state.rpc_state.invoke_mutex.unlock();
-
-        if (state.rpc_state.generated_script == null) {
-            try state.rpc_state.rebuildScript(allocator, state.rpc_state.bridge_options);
-        }
-        const script = state.rpc_state.generated_script orelse bridge_template.default_script;
-        break :blk try allocator.dupe(u8, script);
-    };
-    defer allocator.free(script_copy);
-
-    try net_io.writeHttpResponse(stream, 200, "application/javascript; charset=utf-8", script_copy);
+    // Bridge JS is pre-generated at compile time and stored in rpc_state.
+    try net_io.writeHttpResponse(stream, 200, "application/javascript; charset=utf-8", state.rpc_state.generated_script);
     return true;
 }
 

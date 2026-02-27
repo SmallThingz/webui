@@ -37,8 +37,8 @@ const Task = struct {
 
 pub const State = struct {
     handlers: std.array_list.Managed(HandlerEntry),
-    generated_script: ?[]u8,
-    generated_typescript: ?[]u8,
+    generated_script: []const u8,
+    generated_typescript: []const u8,
     bridge_options: api_types.BridgeOptions,
     dispatcher_mode: api_types.DispatcherMode,
     custom_dispatcher: ?api_types.CustomDispatcher,
@@ -57,8 +57,8 @@ pub const State = struct {
     pub fn init(allocator: std.mem.Allocator, log_enabled: bool) State {
         return .{
             .handlers = std.array_list.Managed(HandlerEntry).init(allocator),
-            .generated_script = null,
-            .generated_typescript = null,
+            .generated_script = bridge_template.default_script,
+            .generated_typescript = "export interface WebuiRpcClient {}\n",
             .bridge_options = .{},
             .dispatcher_mode = .sync,
             .custom_dispatcher = null,
@@ -93,15 +93,6 @@ pub const State = struct {
             allocator.free(handler.ts_return_type);
         }
         self.handlers.deinit();
-
-        if (self.generated_script) |buf| {
-            allocator.free(buf);
-            self.generated_script = null;
-        }
-        if (self.generated_typescript) |buf| {
-            allocator.free(buf);
-            self.generated_typescript = null;
-        }
     }
 
     pub fn addFunction(
@@ -121,14 +112,6 @@ pub const State = struct {
                 allocator.free(existing.ts_return_type);
                 existing.ts_arg_signature = try allocator.dupe(u8, ts_arg_signature);
                 existing.ts_return_type = try allocator.dupe(u8, ts_return_type);
-                if (self.generated_script) |buf| {
-                    allocator.free(buf);
-                    self.generated_script = null;
-                }
-                if (self.generated_typescript) |buf| {
-                    allocator.free(buf);
-                    self.generated_typescript = null;
-                }
                 return;
             }
         }
@@ -140,67 +123,6 @@ pub const State = struct {
             .ts_arg_signature = try allocator.dupe(u8, ts_arg_signature),
             .ts_return_type = try allocator.dupe(u8, ts_return_type),
         });
-
-        if (self.generated_script) |buf| {
-            allocator.free(buf);
-            self.generated_script = null;
-        }
-        if (self.generated_typescript) |buf| {
-            allocator.free(buf);
-            self.generated_typescript = null;
-        }
-    }
-
-    pub fn rebuildScript(self: *State, allocator: std.mem.Allocator, options: api_types.BridgeOptions) !void {
-        self.bridge_options = options;
-
-        if (self.generated_script) |buf| {
-            allocator.free(buf);
-            self.generated_script = null;
-        }
-
-        const metas = try allocator.alloc(bridge_template.RpcFunctionMeta, self.handlers.items.len);
-        defer allocator.free(metas);
-
-        for (self.handlers.items, 0..) |handler, i| {
-            metas[i] = .{
-                .name = handler.name,
-                .arity = handler.arity,
-                .ts_arg_signature = handler.ts_arg_signature,
-                .ts_return_type = handler.ts_return_type,
-            };
-        }
-
-        self.generated_script = try bridge_template.render(allocator, .{
-            .namespace = options.namespace,
-            .rpc_route = options.rpc_route,
-        }, metas);
-    }
-
-    pub fn rebuildTypeScript(self: *State, allocator: std.mem.Allocator, options: api_types.BridgeOptions) !void {
-        self.bridge_options = options;
-
-        if (self.generated_typescript) |buf| {
-            allocator.free(buf);
-            self.generated_typescript = null;
-        }
-
-        const metas = try allocator.alloc(bridge_template.RpcFunctionMeta, self.handlers.items.len);
-        defer allocator.free(metas);
-
-        for (self.handlers.items, 0..) |handler, i| {
-            metas[i] = .{
-                .name = handler.name,
-                .arity = handler.arity,
-                .ts_arg_signature = handler.ts_arg_signature,
-                .ts_return_type = handler.ts_return_type,
-            };
-        }
-
-        self.generated_typescript = try bridge_template.renderTypeScriptDeclarations(allocator, .{
-            .namespace = options.namespace,
-            .rpc_route = options.rpc_route,
-        }, metas);
     }
 
     fn findHandler(self: *const State, function_name: []const u8) ?HandlerEntry {
