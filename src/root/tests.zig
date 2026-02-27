@@ -669,7 +669,7 @@ test "window_closing lifecycle message is ignored while tracked browser pid is a
     try std.testing.expect(!should_close);
 }
 
-test "window_closing lifecycle message closes backend in browser-window mode" {
+test "window_closing lifecycle message uses grace delay in browser-window mode" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -703,12 +703,54 @@ test "window_closing lifecycle message closes backend in browser-window mode" {
 
     win.state().state_mutex.lock();
     win.state().requestLifecycleCloseFromFrontend();
+    const pending_after_request = win.state().lifecycle_close_pending;
+    const close_immediate = win.state().close_requested.load(.acquire);
     win.state().state_mutex.unlock();
 
+    try std.testing.expect(pending_after_request);
+    try std.testing.expect(!close_immediate);
+
     win.state().state_mutex.lock();
+    win.state().lifecycle_close_deadline_ms = std.time.milliTimestamp() - 1;
+    win.state().reconcileChildExit(gpa.allocator());
     const should_close = win.state().close_requested.load(.acquire);
     win.state().state_mutex.unlock();
     try std.testing.expect(should_close);
+}
+
+test "window_closing lifecycle pending close cancels on websocket reconnect" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .browser_window, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "LifecycleCloseReconnectCancel" });
+    try win.showHtml("<html><body>lifecycle-close-reconnect-cancel</body></html>");
+    try app.run();
+
+    win.state().state_mutex.lock();
+    win.state().runtime_render_state.active_surface = .browser_window;
+    win.state().requestLifecycleCloseFromFrontend();
+    try std.testing.expect(win.state().lifecycle_close_pending);
+    try std.testing.expect(!win.state().close_requested.load(.acquire));
+
+    // Simulate reconnect before grace deadline. The socket stream handle is not
+    // used by this test and is removed immediately to avoid shutdown cleanup.
+    try win.state().ws_connections.append(.{
+        .connection_id = 1,
+        .stream = undefined,
+    });
+    win.state().reconcileChildExit(gpa.allocator());
+    const pending_after_reconnect = win.state().lifecycle_close_pending;
+    const close_after_reconnect = win.state().close_requested.load(.acquire);
+    _ = win.state().ws_connections.orderedRemove(0);
+    win.state().state_mutex.unlock();
+
+    try std.testing.expect(!pending_after_reconnect);
+    try std.testing.expect(!close_after_reconnect);
 }
 
 test "non-linked tracked browser pid death detaches without close in web mode" {

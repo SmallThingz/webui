@@ -414,8 +414,8 @@ async function __webuiExecuteScriptTask(task) {
   if (typeof globalThis.addEventListener === "function") {
     globalThis.addEventListener("beforeunload", () => {
       // Best-effort lifecycle close signal for browser-window mode.
-      // Do this before marking socket stopped so the backend can terminate
-      // promptly when the user closes the external browser window.
+      // Backend intentionally applies a grace timeout before honoring this
+      // close so page refresh/reload can reconnect without killing runtime.
       __webuiSocketSendObject({
         type: "lifecycle",
         event: "window_closing",

@@ -182,6 +182,8 @@ pub const WindowState = struct {
     next_close_signal_id: u64,
     last_close_ack_id: u64,
     close_ack_cond: std.Thread.Condition,
+    lifecycle_close_pending: bool,
+    lifecycle_close_deadline_ms: i64,
     ws_connections: std.array_list.Managed(WsConnectionState),
 
     state_mutex: std.Thread.Mutex,
@@ -203,6 +205,10 @@ pub const WindowState = struct {
         .native_minmax,
         .native_kiosk,
     };
+
+    // Browser window unload fires for both tab close and page refresh. We keep
+    // a short grace window so refresh/reload reconnects do not kill the backend.
+    const lifecycle_close_grace_ms: i64 = 2500;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -262,6 +268,8 @@ pub const WindowState = struct {
             .next_close_signal_id = 1,
             .last_close_ack_id = 0,
             .close_ack_cond = .{},
+            .lifecycle_close_pending = false,
+            .lifecycle_close_deadline_ms = 0,
             .ws_connections = std.array_list.Managed(WsConnectionState).init(allocator),
             .state_mutex = .{},
             .connection_mutex = .{},
@@ -642,6 +650,8 @@ pub const WindowState = struct {
     }
 
     pub fn reconcileChildExit(self: *WindowState, allocator: std.mem.Allocator) void {
+        self.reconcilePendingLifecycleCloseLocked();
+
         const pid = self.launched_browser_pid orelse return;
 
         // IMPORTANT:
@@ -672,9 +682,8 @@ pub const WindowState = struct {
     }
 
     pub fn requestLifecycleCloseFromFrontend(self: *WindowState) void {
-        // Frontend lifecycle close is authoritative only for browser-window mode.
-        // In web-url and native-webview modes, backend lifecycle is managed by
-        // explicit controls/process state and should not be closed by unload.
+        // Frontend lifecycle close is only used for browser-window mode.
+        // For browser refresh, this should *not* terminate backend immediately.
         if (self.runtime_render_state.active_surface != .browser_window) return;
 
         if (self.launched_browser_pid) |pid| {
@@ -683,7 +692,7 @@ pub const WindowState = struct {
             }
         }
 
-        _ = self.requestClose();
+        self.scheduleLifecycleCloseLocked();
     }
 
     pub fn terminateLaunchedBrowser(self: *WindowState, allocator: std.mem.Allocator) void {
@@ -873,6 +882,10 @@ pub const WindowState = struct {
     }
 
     pub fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, stream: std.net.Stream) !void {
+        // Reconnect during unload/refresh grace period means the page is back.
+        // Cancel any pending lifecycle close request.
+        self.cancelPendingLifecycleCloseLocked("websocket-connected");
+
         for (self.ws_connections.items) |*entry| {
             if (entry.connection_id != connection_id) continue;
             entry.stream.close();
@@ -1026,6 +1039,46 @@ pub const WindowState = struct {
             self.close_ack_cond.timedWait(&self.state_mutex, remaining) catch break;
         }
         return self.last_close_ack_id >= signal_id;
+    }
+
+    fn scheduleLifecycleCloseLocked(self: *WindowState) void {
+        if (self.close_requested.load(.acquire)) return;
+        self.lifecycle_close_pending = true;
+        self.lifecycle_close_deadline_ms = std.time.milliTimestamp() + lifecycle_close_grace_ms;
+        self.rpc_state.logf(
+            .debug,
+            "[webui.lifecycle] scheduled browser-window close grace_ms={d}\n",
+            .{lifecycle_close_grace_ms},
+        );
+    }
+
+    fn cancelPendingLifecycleCloseLocked(self: *WindowState, reason: []const u8) void {
+        if (!self.lifecycle_close_pending) return;
+        self.lifecycle_close_pending = false;
+        self.lifecycle_close_deadline_ms = 0;
+        self.rpc_state.logf(.debug, "[webui.lifecycle] canceled pending close reason={s}\n", .{reason});
+    }
+
+    fn reconcilePendingLifecycleCloseLocked(self: *WindowState) void {
+        if (!self.lifecycle_close_pending) return;
+        if (self.runtime_render_state.active_surface != .browser_window) {
+            self.cancelPendingLifecycleCloseLocked("non-browser-surface");
+            return;
+        }
+        if (self.close_requested.load(.acquire)) {
+            self.cancelPendingLifecycleCloseLocked("close-already-requested");
+            return;
+        }
+        if (self.ws_connections.items.len > 0) {
+            self.cancelPendingLifecycleCloseLocked("websocket-reconnected");
+            return;
+        }
+        if (std.time.milliTimestamp() < self.lifecycle_close_deadline_ms) return;
+
+        self.lifecycle_close_pending = false;
+        self.lifecycle_close_deadline_ms = 0;
+        self.rpc_state.logf(.debug, "[webui.lifecycle] pending close grace elapsed; requesting close\n", .{});
+        _ = self.requestClose();
     }
 
     pub fn notifyFrontendCloseLocked(self: *WindowState, reason: []const u8, timeout_ms: u32) void {
