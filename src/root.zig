@@ -84,6 +84,7 @@ pub const WindowControlResult = api_types.WindowControlResult;
 pub const ScriptTarget = api_types.ScriptTarget;
 pub const ScriptOptions = api_types.ScriptOptions;
 pub const ScriptEvalResult = api_types.ScriptEvalResult;
+pub const FrontendCallResult = api_types.FrontendCallResult;
 pub const RuntimeRequirement = api_types.RuntimeRequirement;
 pub const EffectiveCapabilities = api_types.EffectiveCapabilities;
 pub const ServiceOptions = api_types.ServiceOptions;
@@ -111,6 +112,7 @@ const RpcRegistryState = rpc_runtime.State;
 pub const DiagnosticHandler = window_state.DiagnosticHandler;
 const DiagnosticCallbackState = window_state.DiagnosticCallbackState;
 const WindowState = window_state.WindowState;
+const ScriptTask = window_state.ScriptTask;
 
 const PinnedStructOwner = enum {
     app,
@@ -504,6 +506,134 @@ pub const Window = struct {
         _ = try win_state.queueScriptLocked(self.app.allocator, script, target_connection, false);
     }
 
+    pub fn callFrontend(
+        self: *Window,
+        allocator: std.mem.Allocator,
+        function_name: []const u8,
+        args: anytype,
+        options: ScriptOptions,
+    ) !ScriptEvalResult {
+        if (function_name.len == 0) return error.EmptyFrontendFunctionName;
+        const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
+        defer self.app.allocator.free(args_json);
+        const script = try self.buildFrontendInvokeScript(function_name, args_json, true);
+        defer self.app.allocator.free(script);
+        return self.evalScript(allocator, script, options);
+    }
+
+    pub fn callFrontendFireAndForget(
+        self: *Window,
+        function_name: []const u8,
+        args: anytype,
+        options: ScriptOptions,
+    ) !void {
+        if (function_name.len == 0) return error.EmptyFrontendFunctionName;
+        const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
+        defer self.app.allocator.free(args_json);
+        const script = try self.buildFrontendInvokeScript(function_name, args_json, false);
+        defer self.app.allocator.free(script);
+        try self.runScript(script, options);
+    }
+
+    pub fn callFrontendOnConnections(
+        self: *Window,
+        function_name: []const u8,
+        args: anytype,
+        connection_ids: []const usize,
+    ) !void {
+        if (connection_ids.len == 0) return error.NoTargetConnections;
+        if (function_name.len == 0) return error.EmptyFrontendFunctionName;
+
+        const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
+        defer self.app.allocator.free(args_json);
+        const script = try self.buildFrontendInvokeScript(function_name, args_json, false);
+        defer self.app.allocator.free(script);
+
+        const win_state = self.state();
+        win_state.state_mutex.lock();
+        defer win_state.state_mutex.unlock();
+        for (connection_ids) |connection_id| {
+            _ = try win_state.queueScriptLocked(self.app.allocator, script, connection_id, false);
+        }
+    }
+
+    pub fn callFrontendAll(self: *Window, function_name: []const u8, args: anytype) !void {
+        const connection_ids = try self.snapshotConnectedConnectionIds(self.app.allocator);
+        defer self.app.allocator.free(connection_ids);
+        try self.callFrontendOnConnections(function_name, args, connection_ids);
+    }
+
+    pub fn callFrontendAwaitConnections(
+        self: *Window,
+        allocator: std.mem.Allocator,
+        function_name: []const u8,
+        args: anytype,
+        connection_ids: []const usize,
+        timeout_ms: ?u32,
+    ) ![]FrontendCallResult {
+        if (connection_ids.len == 0) return error.NoTargetConnections;
+        if (function_name.len == 0) return error.EmptyFrontendFunctionName;
+
+        const args_json = try std.json.Stringify.valueAlloc(self.app.allocator, args, .{});
+        defer self.app.allocator.free(args_json);
+        const script = try self.buildFrontendInvokeScript(function_name, args_json, true);
+        defer self.app.allocator.free(script);
+
+        const win_state = self.state();
+        const tasks = try allocator.alloc(*ScriptTask, connection_ids.len);
+        defer allocator.free(tasks);
+
+        win_state.state_mutex.lock();
+        var queued: usize = 0;
+        errdefer {
+            while (queued > 0) : (queued -= 1) {
+                const task = tasks[queued - 1];
+                _ = win_state.removeScriptPendingLocked(task);
+                _ = win_state.removeScriptInflightLocked(task);
+                task.deinit();
+            }
+            win_state.state_mutex.unlock();
+        }
+        for (connection_ids, 0..) |connection_id, idx| {
+            tasks[idx] = try win_state.queueScriptLocked(self.app.allocator, script, connection_id, true);
+            queued += 1;
+        }
+        win_state.state_mutex.unlock();
+
+        var built: usize = 0;
+        const results = try allocator.alloc(FrontendCallResult, connection_ids.len);
+        errdefer {
+            for (results[0..built]) |item| {
+                if (item.result.value) |value| allocator.free(value);
+                if (item.result.error_message) |msg| allocator.free(msg);
+            }
+            allocator.free(results);
+        }
+
+        for (connection_ids, 0..) |connection_id, idx| {
+            const result = try self.awaitScriptTaskResult(allocator, win_state, tasks[idx], timeout_ms);
+            results[idx] = .{
+                .connection_id = connection_id,
+                .result = result,
+            };
+            built += 1;
+        }
+
+        return results;
+    }
+
+    pub fn callFrontendAwaitAll(
+        self: *Window,
+        allocator: std.mem.Allocator,
+        function_name: []const u8,
+        args: anytype,
+        timeout_ms: ?u32,
+    ) ![]FrontendCallResult {
+        const connection_ids = try self.snapshotConnectedConnectionIds(allocator);
+        defer allocator.free(connection_ids);
+        return self.callFrontendAwaitConnections(allocator, function_name, args, connection_ids, timeout_ms);
+    }
+
     pub fn evalScript(
         self: *Window,
         allocator: std.mem.Allocator,
@@ -522,11 +652,21 @@ pub const Window = struct {
         const task = try win_state.queueScriptLocked(self.app.allocator, script, target_connection, true);
         win_state.state_mutex.unlock();
 
+        return self.awaitScriptTaskResult(allocator, win_state, task, options.timeout_ms);
+    }
+
+    fn awaitScriptTaskResult(
+        self: *Window,
+        allocator: std.mem.Allocator,
+        win_state: *WindowState,
+        task: *ScriptTask,
+        timeout_ms: ?u32,
+    ) !ScriptEvalResult {
         var timed_out = false;
         task.mutex.lock();
 
-        if (options.timeout_ms) |timeout_ms| {
-            const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
+        if (timeout_ms) |timeout| {
+            const timeout_ns: u64 = @as(u64, timeout) * std.time.ns_per_ms;
             const deadline = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
             while (!task.done) {
                 const now = std.time.nanoTimestamp();
@@ -565,7 +705,50 @@ pub const Window = struct {
         win_state.state_mutex.unlock();
         task.deinit();
 
+        _ = self;
         return result;
+    }
+
+    fn snapshotConnectedConnectionIds(self: *Window, allocator: std.mem.Allocator) ![]usize {
+        const win_state = self.state();
+        win_state.state_mutex.lock();
+        defer win_state.state_mutex.unlock();
+        if (win_state.ws_connections.items.len == 0) return error.NoTargetConnections;
+        const ids = try allocator.alloc(usize, win_state.ws_connections.items.len);
+        for (win_state.ws_connections.items, 0..) |entry, idx| {
+            ids[idx] = entry.connection_id;
+        }
+        return ids;
+    }
+
+    fn buildFrontendInvokeScript(
+        self: *Window,
+        function_name: []const u8,
+        args_json: []const u8,
+        expect_result: bool,
+    ) ![]u8 {
+        const function_name_json = try std.json.Stringify.valueAlloc(self.app.allocator, function_name, .{});
+        defer self.app.allocator.free(function_name_json);
+
+        var out = std.array_list.Managed(u8).init(self.app.allocator);
+        errdefer out.deinit();
+        const writer = out.writer();
+
+        try writer.writeAll("const webuiPath=");
+        try writer.writeAll(function_name_json);
+        try writer.writeAll(";\nconst webuiArgsRaw=");
+        try writer.writeAll(args_json);
+        try writer.writeAll(";\nconst webuiArgs=Array.isArray(webuiArgsRaw)?webuiArgsRaw:[webuiArgsRaw];\n");
+        try writer.writeAll("let webuiFn=globalThis;\nfor(const segment of webuiPath.split('.')){if(!segment)continue;webuiFn=webuiFn?.[segment];}\n");
+        try writer.writeAll("if(typeof webuiFn!=='function'){throw new Error('frontend function not found: '+webuiPath);}\n");
+        if (expect_result) {
+            try writer.writeAll("return await webuiFn(...webuiArgs);\n");
+        } else {
+            try writer.writeAll(
+                "try{await webuiFn(...webuiArgs);}catch(webuiErr){if(typeof console!=='undefined'&&console&&typeof console.error==='function'){console.error('[webui.frontend]',webuiErr);}}\n",
+            );
+        }
+        return out.toOwnedSlice();
     }
 
     pub fn sendRaw(self: *Window, bytes: []const u8) !void {
@@ -984,6 +1167,69 @@ pub const Service = struct {
     pub fn runScript(self: *Service, script: []const u8, options: ScriptOptions) !void {
         var win = self.window();
         try win.runScript(script, options);
+    }
+
+    pub fn callFrontend(
+        self: *Service,
+        allocator: std.mem.Allocator,
+        function_name: []const u8,
+        args: anytype,
+        options: ScriptOptions,
+    ) !ScriptEvalResult {
+        var win = self.window();
+        return win.callFrontend(allocator, function_name, args, options);
+    }
+
+    pub fn callFrontendFireAndForget(
+        self: *Service,
+        function_name: []const u8,
+        args: anytype,
+        options: ScriptOptions,
+    ) !void {
+        var win = self.window();
+        try win.callFrontendFireAndForget(function_name, args, options);
+    }
+
+    pub fn callFrontendOnConnections(
+        self: *Service,
+        function_name: []const u8,
+        args: anytype,
+        connection_ids: []const usize,
+    ) !void {
+        var win = self.window();
+        try win.callFrontendOnConnections(function_name, args, connection_ids);
+    }
+
+    pub fn callFrontendAll(
+        self: *Service,
+        function_name: []const u8,
+        args: anytype,
+    ) !void {
+        var win = self.window();
+        try win.callFrontendAll(function_name, args);
+    }
+
+    pub fn callFrontendAwaitConnections(
+        self: *Service,
+        allocator: std.mem.Allocator,
+        function_name: []const u8,
+        args: anytype,
+        connection_ids: []const usize,
+        timeout_ms: ?u32,
+    ) ![]FrontendCallResult {
+        var win = self.window();
+        return win.callFrontendAwaitConnections(allocator, function_name, args, connection_ids, timeout_ms);
+    }
+
+    pub fn callFrontendAwaitAll(
+        self: *Service,
+        allocator: std.mem.Allocator,
+        function_name: []const u8,
+        args: anytype,
+        timeout_ms: ?u32,
+    ) ![]FrontendCallResult {
+        var win = self.window();
+        return win.callFrontendAwaitAll(allocator, function_name, args, timeout_ms);
     }
 
     pub fn evalScript(

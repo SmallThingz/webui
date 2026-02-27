@@ -208,6 +208,11 @@ pub const ScriptEvalResult = struct {
     error_message: ?[]u8,
 };
 
+pub const FrontendCallResult = struct {
+    connection_id: usize,
+    result: ScriptEvalResult,
+};
+
 pub const RuntimeRequirement = runtime_requirements.RuntimeRequirement;
 
 pub const EffectiveCapabilities = struct {

@@ -446,16 +446,18 @@ fn defaultMessageFor(comptime kind: ExampleKind) []const u8 {
 
 const COMMON_SCRIPT =
     "const out=document.getElementById('out');const status=document.getElementById('status');" ++
-    "async function control(cmd){try{if(globalThis.__webuiWindowControl){const r=await globalThis.__webuiWindowControl(cmd);if(cmd==='close')return;r&&r.warning&&(out.textContent='warning: '+r.warning);return;}}catch(e){out.textContent='control '+cmd+' failed: '+e;}}" ++
+    "function webuiRpcClient(){return globalThis.webuiRpc??(typeof webuiRpc!=='undefined'?webuiRpc:undefined);}" ++
+    "async function webuiRpcCall(name,...args){const rpc=webuiRpcClient();if(!rpc||typeof rpc[name]!=='function'){throw new Error('RPC bridge unavailable');}return await rpc[name](...args);}" ++
+    "async function control(cmd){try{if(globalThis.webuiWindowControl){const r=await globalThis.webuiWindowControl(cmd);if(cmd==='close')return;r&&r.warning&&(out.textContent='warning: '+r.warning);return;}}catch(e){out.textContent='control '+cmd+' failed: '+e;}}" ++
     "document.getElementById('min')?.addEventListener('click',()=>control('minimize'));" ++
     "document.getElementById('max')?.addEventListener('click',()=>control(document.fullscreenElement?'restore':'maximize'));" ++
     "document.getElementById('close')?.addEventListener('click',()=>control('close'));" ++
-    "document.getElementById('ping')?.addEventListener('click',async()=>{try{out.textContent='ping => '+await globalThis.webuiRpc.ping();}catch(e){out.textContent='ping failed: '+e;}});" ++
-    "document.getElementById('sum')?.addEventListener('click',async()=>{try{out.textContent='add(100,23) => '+await globalThis.webuiRpc.add(100,23);}catch(e){out.textContent='add failed: '+e;}});" ++
-    "document.getElementById('wc')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='word_count => '+await globalThis.webuiRpc.word_count(msg);}catch(e){out.textContent='word_count failed: '+e;}});" ++
-    "document.getElementById('save')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='save_note => '+await globalThis.webuiRpc.save_note(msg);}catch(e){out.textContent='save_note failed: '+e;}});" ++
-    "document.getElementById('echo')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='echo => '+await globalThis.webuiRpc.echo(msg);}catch(e){out.textContent='echo failed: '+e;}});" ++
-    "(async()=>{try{status.textContent='Backend: '+await globalThis.webuiRpc.ping();}catch(e){status.textContent='Backend unavailable: '+e;}})();";
+    "document.getElementById('ping')?.addEventListener('click',async()=>{try{out.textContent='ping => '+await webuiRpcCall('ping');}catch(e){out.textContent='ping failed: '+e;}});" ++
+    "document.getElementById('sum')?.addEventListener('click',async()=>{try{out.textContent='add(100,23) => '+await webuiRpcCall('add',100,23);}catch(e){out.textContent='add failed: '+e;}});" ++
+    "document.getElementById('wc')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='word_count => '+await webuiRpcCall('word_count',msg);}catch(e){out.textContent='word_count failed: '+e;}});" ++
+    "document.getElementById('save')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='save_note => '+await webuiRpcCall('save_note',msg);}catch(e){out.textContent='save_note failed: '+e;}});" ++
+    "document.getElementById('echo')?.addEventListener('click',async()=>{try{const msg=document.getElementById('msg')?.value||'';out.textContent='echo => '+await webuiRpcCall('echo',msg);}catch(e){out.textContent='echo failed: '+e;}});" ++
+    "(async()=>{try{status.textContent='Backend: '+await webuiRpcCall('ping');}catch(e){status.textContent='Backend unavailable: '+e;}})();";
 
 const HTML_FRAMELESS =
     "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Frameless</title><script src=\"/webui_bridge.js\"></script>" ++
@@ -486,4 +488,15 @@ const HTML_TRANSLUCENT_ROUNDED =
 const HTML_TEXT_EDITOR =
     "<!doctype html><html><head><meta charset=\"utf-8\"/><title>Text Editor</title><script src=\"/webui_bridge.js\"></script>" ++
     "<style>*{box-sizing:border-box}body{font-family:Arial;background:#0f141a;color:#eee;padding:20px;margin:0}textarea{width:100%;min-height:260px}button{margin-top:8px;padding:8px 12px;border:0;background:#53d3ff;color:#06213a;font-weight:700;cursor:pointer}pre{min-height:90px;background:#111b2a;padding:10px}</style></head>" ++
-    "<body><h3>Text Editor Example</h3><p id=\"status\">Checking backend...</p><textarea id=\"msg\" placeholder=\"Type...\"></textarea><br/><button id=\"stats\">Word Count</button><button id=\"save\">Save</button><pre id=\"out\"></pre><script>const st=document.getElementById('status');const out=document.getElementById('out');(async()=>{try{st.textContent='Backend: '+await globalThis.webuiRpc.ping();}catch(e){st.textContent='Backend unavailable: '+e;}})();document.getElementById('stats').onclick=async()=>{out.textContent='words => '+await globalThis.webuiRpc.word_count(document.getElementById('msg').value);};document.getElementById('save').onclick=async()=>{out.textContent='save => '+await globalThis.webuiRpc.save_note(document.getElementById('msg').value);};</script></body></html>";
+    "<body><h3>Text Editor Example</h3><p id=\"status\">Checking backend...</p><textarea id=\"msg\" placeholder=\"Type...\"></textarea><br/><button id=\"stats\">Word Count</button><button id=\"save\">Save</button><pre id=\"out\"></pre><script>const st=document.getElementById('status');const out=document.getElementById('out');const rpc=()=>globalThis.webuiRpc??(typeof webuiRpc!=='undefined'?webuiRpc:undefined);const call=async(name,...args)=>{const c=rpc();if(!c||typeof c[name]!=='function')throw new Error('RPC bridge unavailable');return await c[name](...args);};(async()=>{try{st.textContent='Backend: '+await call('ping');}catch(e){st.textContent='Backend unavailable: '+e;}})();document.getElementById('stats').onclick=async()=>{out.textContent='words => '+await call('word_count',document.getElementById('msg').value);};document.getElementById('save').onclick=async()=>{out.textContent='save => '+await call('save_note',document.getElementById('msg').value);};</script></body></html>";
+
+test "common example script resolves rpc bridge robustly" {
+    try std.testing.expect(std.mem.indexOf(u8, COMMON_SCRIPT, "webuiRpcClient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, COMMON_SCRIPT, "typeof webuiRpc!=='undefined'?webuiRpc:undefined") != null);
+    try std.testing.expect(std.mem.indexOf(u8, COMMON_SCRIPT, "webuiRpcCall('ping')") != null);
+}
+
+test "text editor script handles missing globalThis bridge binding" {
+    try std.testing.expect(std.mem.indexOf(u8, HTML_TEXT_EDITOR, "typeof webuiRpc!=='undefined'?webuiRpc:undefined") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HTML_TEXT_EDITOR, "RPC bridge unavailable") != null);
+}

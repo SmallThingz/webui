@@ -1,4 +1,4 @@
-const __webuiClientId = (() => {
+const webuiClientId = (() => {
   try {
     if (typeof globalThis !== "undefined" && globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
       return globalThis.crypto.randomUUID();
@@ -7,17 +7,17 @@ const __webuiClientId = (() => {
   return `webui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 })();
 
-function __webuiRequestHeaders(extraHeaders) {
+function webuiRequestHeaders(extraHeaders) {
   const headers = Object.assign({}, extraHeaders || {});
-  headers["x-webui-client-id"] = __webuiClientId;
+  headers["x-webui-client-id"] = webuiClientId;
   return headers;
 }
 
-async function __webuiInvoke(endpoint, name, args) {
+async function webuiInvoke(endpoint, name, args) {
   const payload = JSON.stringify({ name, args });
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: __webuiRequestHeaders({ "content-type": "application/json" }),
+    headers: webuiRequestHeaders({ "content-type": "application/json" }),
     body: payload,
   });
   if (!res.ok) {
@@ -38,9 +38,9 @@ async function __webuiInvoke(endpoint, name, args) {
   }
 }
 
-async function __webuiJson(endpoint, options) {
+async function webuiJson(endpoint, options) {
   const reqOptions = Object.assign({}, options || {});
-  reqOptions.headers = __webuiRequestHeaders(reqOptions.headers || {});
+  reqOptions.headers = webuiRequestHeaders(reqOptions.headers || {});
   const res = await fetch(endpoint, reqOptions);
   if (!res.ok) {
     const text = await res.text();
@@ -61,47 +61,47 @@ async function __webuiJson(endpoint, options) {
   }
 }
 
-const __webuiSocketConnectTimeoutMs = 10000;
+const webuiSocketConnectTimeoutMs = 10000;
 
-function __webuiSleep(ms) {
+function webuiSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function __webuiWaitForSocketReady(timeoutMs) {
-  const deadline = Date.now() + Math.max(50, timeoutMs || __webuiSocketConnectTimeoutMs);
+async function webuiWaitForSocketReady(timeoutMs) {
+  const deadline = Date.now() + Math.max(50, timeoutMs || webuiSocketConnectTimeoutMs);
   while (Date.now() < deadline) {
-    if (__webuiSocketOpen && __webuiSocket && __webuiSocket.readyState === globalThis.WebSocket.OPEN) return;
-    if (__webuiSocketStopped) break;
-    __webuiConnectPushSocket();
-    await __webuiSleep(40);
+    if (webuiSocketOpen && webuiSocket && webuiSocket.readyState === globalThis.WebSocket.OPEN) return;
+    if (webuiSocketStopped) break;
+    webuiConnectPushSocket();
+    await webuiSleep(40);
   }
   throw new Error("WebSocket unavailable");
 }
 
-async function __webuiSendObjectWithBackoff(message, timeoutMs, label) {
-  const totalTimeout = Math.max(200, timeoutMs || __webuiSocketConnectTimeoutMs);
+async function webuiSendObjectWithBackoff(message, timeoutMs, label) {
+  const totalTimeout = Math.max(200, timeoutMs || webuiSocketConnectTimeoutMs);
   const deadline = Date.now() + totalTimeout;
   let delayMs = 40;
 
   while (Date.now() < deadline) {
-    if (__webuiSocketOpen && __webuiSocketSendObject(message)) return;
+    if (webuiSocketOpen && webuiSocketSendObject(message)) return;
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     try {
-      await __webuiWaitForSocketReady(Math.min(remaining, 1200));
+      await webuiWaitForSocketReady(Math.min(remaining, 1200));
     } catch (_) {}
-    if (__webuiSocketOpen && __webuiSocketSendObject(message)) return;
-    await __webuiSleep(Math.min(delayMs, Math.max(10, deadline - Date.now())));
+    if (webuiSocketOpen && webuiSocketSendObject(message)) return;
+    await webuiSleep(Math.min(delayMs, Math.max(10, deadline - Date.now())));
     delayMs = Math.min(500, Math.floor(delayMs * 1.7));
   }
 
   throw new Error(`${label || "socket send"} timed out`);
 }
 
-let __webuiWindowRuntimeEmulationEnabled = true;
-let __webuiWindowRuntimeLoaded = false;
+let webuiWindowRuntimeEmulationEnabled = true;
+let webuiWindowRuntimeLoaded = false;
 
-function __webuiApplyStyleEmulation(style) {
+function webuiApplyStyleEmulation(style) {
   if (!style || typeof document === "undefined") return;
   const root = document.documentElement;
   const body = document.body;
@@ -132,7 +132,7 @@ function __webuiApplyStyleEmulation(style) {
   }
 }
 
-async function __webuiRunControlEmulation(mode) {
+async function webuiRunControlEmulation(mode) {
   if (mode === "minimize_blur") {
     if (typeof globalThis.blur === "function") globalThis.blur();
     return;
@@ -167,15 +167,15 @@ async function __webuiRunControlEmulation(mode) {
   }
 
   if (mode === "close_window") {
-    await __webuiNotifyLifecycle("window_closing");
+    await webuiNotifyLifecycle("window_closing");
   }
 }
 
-async function __webuiWindowControl(cmd) {
+async function webuiWindowControl(cmd) {
   const body = JSON.stringify({ cmd });
   let result;
   try {
-    result = await __webuiJson("/webui/window/control", {
+    result = await webuiJson("/webui/window/control", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body,
@@ -184,7 +184,7 @@ async function __webuiWindowControl(cmd) {
   } catch (err) {
     if (cmd === "close") {
       try {
-        await __webuiNotifyLifecycle("window_closing");
+        await webuiNotifyLifecycle("window_closing");
       } catch (_) {}
       return {
         success: false,
@@ -197,7 +197,7 @@ async function __webuiWindowControl(cmd) {
   }
 
   if (result && typeof result === "object" && typeof result.emulation === "string") {
-    await __webuiRunControlEmulation(result.emulation);
+    await webuiRunControlEmulation(result.emulation);
   }
 
   if (result && typeof result === "object" && typeof result.warning === "string" && result.warning.length > 0) {
@@ -211,65 +211,65 @@ async function __webuiWindowControl(cmd) {
   return result;
 }
 
-async function __webuiWindowStyle(stylePatch) {
-  if (!__webuiWindowRuntimeLoaded) {
-    await __webuiGetWindowCapabilities().catch(() => {});
+async function webuiWindowStyle(stylePatch) {
+  if (!webuiWindowRuntimeLoaded) {
+    await webuiGetWindowCapabilities().catch(() => {});
   }
-  const base = await __webuiGetWindowStyle().catch(() => ({}));
+  const base = await webuiGetWindowStyle().catch(() => ({}));
   const merged = Object.assign({}, base || {}, stylePatch || {});
   const body = JSON.stringify(merged);
-  const style = await __webuiJson("/webui/window/style", {
+  const style = await webuiJson("/webui/window/style", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
   });
-  if (__webuiWindowRuntimeEmulationEnabled) {
-    __webuiApplyStyleEmulation(style);
+  if (webuiWindowRuntimeEmulationEnabled) {
+    webuiApplyStyleEmulation(style);
   }
   return style;
 }
 
-async function __webuiGetWindowStyle() {
-  if (!__webuiWindowRuntimeLoaded) {
-    await __webuiGetWindowCapabilities().catch(() => {});
+async function webuiGetWindowStyle() {
+  if (!webuiWindowRuntimeLoaded) {
+    await webuiGetWindowCapabilities().catch(() => {});
   }
-  const style = await __webuiJson("/webui/window/style");
-  if (__webuiWindowRuntimeEmulationEnabled) {
-    __webuiApplyStyleEmulation(style);
+  const style = await webuiJson("/webui/window/style");
+  if (webuiWindowRuntimeEmulationEnabled) {
+    webuiApplyStyleEmulation(style);
   }
   return style;
 }
 
-async function __webuiGetWindowCapabilities() {
-  const payload = await __webuiJson("/webui/window/control");
+async function webuiGetWindowCapabilities() {
+  const payload = await webuiJson("/webui/window/control");
   if (payload && typeof payload === "object") {
     if ("emulation_enabled" in payload) {
-      __webuiWindowRuntimeEmulationEnabled = !!payload.emulation_enabled;
+      webuiWindowRuntimeEmulationEnabled = !!payload.emulation_enabled;
     }
   }
-  __webuiWindowRuntimeLoaded = true;
+  webuiWindowRuntimeLoaded = true;
   return payload;
 }
 
-let __webuiSocket = null;
-let __webuiSocketOpen = false;
-let __webuiSocketStopped = false;
-let __webuiSocketReconnectDelayMs = 120;
+let webuiSocket = null;
+let webuiSocketOpen = false;
+let webuiSocketStopped = false;
+let webuiSocketReconnectDelayMs = 120;
 
-function __webuiSocketUrl() {
+function webuiSocketUrl() {
   try {
     if (typeof globalThis === "undefined" || !globalThis.location) return null;
     const url = new URL(globalThis.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = "/webui/ws";
-    url.search = `client_id=${encodeURIComponent(__webuiClientId)}`;
+    url.search = `client_id=${encodeURIComponent(webuiClientId)}`;
     return url.toString();
   } catch (_) {
     return null;
   }
 }
 
-function __webuiSocketSendObject(value) {
+function webuiSocketSendObject(value) {
   let payload;
   try {
     payload = JSON.stringify(value);
@@ -277,9 +277,9 @@ function __webuiSocketSendObject(value) {
     return false;
   }
 
-  if (__webuiSocketOpen && __webuiSocket && typeof __webuiSocket.send === "function") {
+  if (webuiSocketOpen && webuiSocket && typeof webuiSocket.send === "function") {
     try {
-      __webuiSocket.send(payload);
+      webuiSocket.send(payload);
       return true;
     } catch (_) {
       return false;
@@ -288,19 +288,19 @@ function __webuiSocketSendObject(value) {
   return false;
 }
 
-function __webuiSendCloseAck(closeSignalId) {
+function webuiSendCloseAck(closeSignalId) {
   const id = Number(closeSignalId);
   if (!Number.isFinite(id) || id <= 0) return false;
-  return __webuiSocketSendObject({
+  return webuiSocketSendObject({
     type: "close_ack",
     id: Math.trunc(id),
-    client_id: __webuiClientId,
+    client_id: webuiClientId,
   });
 }
 
-function __webuiHandleBackendClose(message) {
-  __webuiSendCloseAck(message && message.id);
-  __webuiSocketStopped = true;
+function webuiHandleBackendClose(message) {
+  webuiSendCloseAck(message && message.id);
+  webuiSocketStopped = true;
   setTimeout(() => {
     if (typeof globalThis.close === "function") {
       try {
@@ -310,7 +310,7 @@ function __webuiHandleBackendClose(message) {
   }, 0);
 }
 
-function __webuiHandleSocketMessage(raw) {
+function webuiHandleSocketMessage(raw) {
   let payload = raw;
   if (payload && typeof payload !== "string" && typeof payload.data === "string") {
     payload = payload.data;
@@ -326,60 +326,60 @@ function __webuiHandleSocketMessage(raw) {
 
   if (!message || typeof message !== "object") return;
   if (message.type === "backend_close") {
-    __webuiHandleBackendClose(message);
+    webuiHandleBackendClose(message);
     return;
   }
   if (message.type !== "script_task") return;
   if (typeof message.script !== "string") return;
-  void __webuiExecuteScriptTask(message);
+  void webuiExecuteScriptTask(message);
 }
 
-function __webuiConnectPushSocket() {
+function webuiConnectPushSocket() {
   if (typeof globalThis === "undefined") return;
-  if (__webuiSocketStopped) return;
+  if (webuiSocketStopped) return;
   if (typeof globalThis.WebSocket !== "function") return;
-  if (__webuiSocket && (__webuiSocket.readyState === globalThis.WebSocket.CONNECTING || __webuiSocket.readyState === globalThis.WebSocket.OPEN)) return;
+  if (webuiSocket && (webuiSocket.readyState === globalThis.WebSocket.CONNECTING || webuiSocket.readyState === globalThis.WebSocket.OPEN)) return;
 
-  const url = __webuiSocketUrl();
+  const url = webuiSocketUrl();
   if (!url) return;
 
   let socket;
   try {
     socket = new globalThis.WebSocket(url);
   } catch (_) {
-    setTimeout(__webuiConnectPushSocket, Math.min(2000, __webuiSocketReconnectDelayMs * 2));
+    setTimeout(webuiConnectPushSocket, Math.min(2000, webuiSocketReconnectDelayMs * 2));
     return;
   }
 
-  __webuiSocket = socket;
+  webuiSocket = socket;
   socket.onopen = () => {
-    __webuiSocketOpen = true;
-    __webuiSocketReconnectDelayMs = 120;
+    webuiSocketOpen = true;
+    webuiSocketReconnectDelayMs = 120;
   };
   socket.onmessage = (event) => {
-    __webuiHandleSocketMessage(event);
+    webuiHandleSocketMessage(event);
   };
   socket.onerror = () => {};
   socket.onclose = () => {
-    __webuiSocketOpen = false;
-    __webuiSocket = null;
-    if (__webuiSocketStopped) return;
-    const delay = Math.min(1500, __webuiSocketReconnectDelayMs);
-    __webuiSocketReconnectDelayMs = Math.min(2500, __webuiSocketReconnectDelayMs * 2);
-    setTimeout(__webuiConnectPushSocket, delay);
+    webuiSocketOpen = false;
+    webuiSocket = null;
+    if (webuiSocketStopped) return;
+    const delay = Math.min(1500, webuiSocketReconnectDelayMs);
+    webuiSocketReconnectDelayMs = Math.min(2500, webuiSocketReconnectDelayMs * 2);
+    setTimeout(webuiConnectPushSocket, delay);
   };
 }
 
-async function __webuiNotifyLifecycle(eventName) {
+async function webuiNotifyLifecycle(eventName) {
   // WS-only lifecycle signaling: no fetch/sendBeacon fallback.
-  await __webuiSendObjectWithBackoff({
+  await webuiSendObjectWithBackoff({
     type: "lifecycle",
     event: eventName,
-    client_id: __webuiClientId,
-  }, __webuiSocketConnectTimeoutMs, "lifecycle send");
+    client_id: webuiClientId,
+  }, webuiSocketConnectTimeoutMs, "lifecycle send");
 }
 
-async function __webuiExecuteScriptTask(task) {
+async function webuiExecuteScriptTask(task) {
   let js_error = false;
   let value = null;
   let error_message = null;
@@ -400,44 +400,44 @@ async function __webuiExecuteScriptTask(task) {
     js_error,
     value,
     error_message,
-    client_id: __webuiClientId,
+    client_id: webuiClientId,
     connection_id: task.connection_id,
   };
   try {
     // WS-only script response path. Backend dispatches tasks over WS and expects
     // completion over WS using the same request id.
-    await __webuiSendObjectWithBackoff(responsePayload, __webuiSocketConnectTimeoutMs, `script response ${task.id}`);
+    await webuiSendObjectWithBackoff(responsePayload, webuiSocketConnectTimeoutMs, `script response ${task.id}`);
   } catch (_) {}
 }
 
-(function __webuiInstallPushChannel() {
+(function webuiInstallPushChannel() {
   if (typeof globalThis === "undefined") return;
-  if (globalThis.__webuiPushInstalled) return;
-  globalThis.__webuiPushInstalled = true;
+  if (globalThis.webuiPushInstalled) return;
+  globalThis.webuiPushInstalled = true;
 
   if (typeof globalThis.addEventListener === "function") {
     globalThis.addEventListener("beforeunload", () => {
       // Best-effort lifecycle close signal for browser-window mode.
       // Backend intentionally applies a grace timeout before honoring this
       // close so page refresh/reload can reconnect without killing runtime.
-      __webuiSocketSendObject({
+      webuiSocketSendObject({
         type: "lifecycle",
         event: "window_closing",
-        client_id: __webuiClientId,
+        client_id: webuiClientId,
       });
-      __webuiSocketStopped = true;
-      __webuiSocketOpen = false;
+      webuiSocketStopped = true;
+      webuiSocketOpen = false;
       // Let the browser own socket teardown during unload.
     });
   }
-  __webuiConnectPushSocket();
+  webuiConnectPushSocket();
 })();
 
-(function __webuiInstallLifecycleHooks() {
+(function webuiInstallLifecycleHooks() {
   if (typeof globalThis === "undefined") return;
-  globalThis.__webuiNotifyLifecycle = __webuiNotifyLifecycle;
-  globalThis.__webuiWindowControl = __webuiWindowControl;
-  globalThis.__webuiWindowStyle = __webuiWindowStyle;
-  globalThis.__webuiGetWindowStyle = __webuiGetWindowStyle;
-  globalThis.__webuiGetWindowCapabilities = __webuiGetWindowCapabilities;
+  globalThis.webuiNotifyLifecycle = webuiNotifyLifecycle;
+  globalThis.webuiWindowControl = webuiWindowControl;
+  globalThis.webuiWindowStyle = webuiWindowStyle;
+  globalThis.webuiGetWindowStyle = webuiGetWindowStyle;
+  globalThis.webuiGetWindowCapabilities = webuiGetWindowCapabilities;
 })();

@@ -1152,9 +1152,10 @@ test "typed rpc registration, invocation, and bridge generation" {
 
     const script = win.rpcClientScript();
     try std.testing.expect(std.mem.indexOf(u8, script, "sum: async (arg0, arg1)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "__webuiRpcEndpoint = \"/webui/rpc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "await webuiInvoke(webuiRpcEndpoint, \"sum\", [arg0, arg1]),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "webuiRpcEndpoint = \"/webui/rpc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "globalThis.webuiRpc = webuiRpc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "globalThis.__webuiWindowControl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "globalThis.webuiWindowControl") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "export default") == null);
 
     const written_path = try std.fmt.allocPrint(gpa.allocator(), ".zig-cache/test_bridge_written_{d}.js", .{std.time.nanoTimestamp()});
@@ -1163,7 +1164,7 @@ test "typed rpc registration, invocation, and bridge generation" {
     try win.rpc().writeGeneratedClientScript(written_path);
     const written_script = try std.fs.cwd().readFileAlloc(gpa.allocator(), written_path, 1024 * 1024);
     defer gpa.allocator().free(written_script);
-    try std.testing.expect(std.mem.indexOf(u8, written_script, "async function __webuiInvoke(endpoint, name, args)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written_script, "async function webuiInvoke(endpoint, name, args)") != null);
 
     const dts = win.rpcTypeDeclarations();
     try std.testing.expect(std.mem.indexOf(u8, dts, "sum(...args: unknown[]): Promise<unknown>;") != null);
@@ -1356,10 +1357,10 @@ test "comptime bridge generation" {
 test "runtime helper exposes window style/control helpers" {
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webui-window-rounded") == null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webui-transparent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "__webuiWindowStyle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "__webuiGetWindowStyle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "__webui_style_scaffold") == null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "__webuiRefreshAppRegions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webuiWindowStyle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webuiGetWindowStyle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webui_style_scaffold") == null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_helpers_js, "webuiRefreshAppRegions") == null);
 }
 
 test "raw channel callback" {
@@ -1405,6 +1406,81 @@ test "evalScript times out when no client is polling" {
     try std.testing.expect(result.timed_out);
     try std.testing.expect(!result.js_error);
     try std.testing.expect(result.value == null);
+}
+
+test "callFrontend fire-and-forget queues targeted ws task" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{});
+    try win.callFrontendFireAndForget("ui.echo", .{"hello"}, .{
+        .target = .{ .client_connection = 77 },
+    });
+
+    const state = win.state();
+    state.state_mutex.lock();
+    defer state.state_mutex.unlock();
+
+    try std.testing.expectEqual(@as(usize, 1), state.script_pending.items.len);
+    const task = state.script_pending.items[0];
+    try std.testing.expect(!task.expect_result);
+    try std.testing.expectEqual(@as(?usize, 77), task.target_connection);
+    try std.testing.expect(std.mem.indexOf(u8, task.script, "ui.echo") != null);
+}
+
+test "callFrontend await on selected connections returns per-connection results" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{});
+    const targets = [_]usize{ 11, 22 };
+    const results = try win.callFrontendAwaitConnections(
+        gpa.allocator(),
+        "ui.echo",
+        .{"payload"},
+        targets[0..],
+        10,
+    );
+    defer {
+        for (results) |entry| {
+            if (entry.result.value) |value| gpa.allocator().free(value);
+            if (entry.result.error_message) |msg| gpa.allocator().free(msg);
+        }
+        gpa.allocator().free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(usize, 11), results[0].connection_id);
+    try std.testing.expectEqual(@as(usize, 22), results[1].connection_id);
+    try std.testing.expect(results[0].result.timed_out);
+    try std.testing.expect(results[1].result.timed_out);
+}
+
+test "callFrontend all requires active ws connections" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{});
+    try std.testing.expectError(error.NoTargetConnections, win.callFrontendAll("ui.echo", .{"x"}));
+    try std.testing.expectError(
+        error.NoTargetConnections,
+        win.callFrontendAwaitAll(gpa.allocator(), "ui.echo", .{"x"}, 10),
+    );
 }
 
 test "script response websocket message completes queued eval task" {

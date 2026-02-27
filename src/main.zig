@@ -53,9 +53,11 @@ pub fn main() !void {
                 "<title>WebUI Zig</title><script src=\"/webui_bridge.js\"></script></head>" ++
                 "<body><h1>WebUI Zig Runtime</h1><button id=\"btn\">Call RPC add(7, 9)</button>" ++
                 "<pre id=\"out\">ready</pre><script>" ++
+                "const rpc=()=>globalThis.webuiRpc??(typeof webuiRpc!=='undefined'?webuiRpc:undefined);" ++
+                "const call=async(name,...args)=>{const c=rpc();if(!c||typeof c[name]!=='function')throw new Error('RPC bridge unavailable');return await c[name](...args);};" ++
                 "document.getElementById('btn').addEventListener('click', async () => {" ++
-                "const n = await globalThis.webuiRpc.add(7, 9);" ++
-                "const v = await globalThis.webuiRpc.version();" ++
+                "const n = await call('add',7,9);" ++
+                "const v = await call('version');" ++
                 "document.getElementById('out').textContent = 'add=' + n + ', version=' + v;" ++
                 "});</script></body></html>",
         });

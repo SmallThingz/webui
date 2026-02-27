@@ -1,10 +1,28 @@
 const std = @import("std");
-const browser_discovery = @import("../ported/browser_discovery.zig");
-const macos_browser_host = @import("macos_browser_host.zig");
+const builtin = @import("builtin");
 const window_style_types = @import("../root/window_style.zig");
+const objc = @import("macos_webview/bindings.zig");
 
 const WindowStyle = window_style_types.WindowStyle;
 const WindowControl = window_style_types.WindowControl;
+
+const default_width: f64 = 980;
+const default_height: f64 = 660;
+
+const NSWindowStyleMaskTitled: u64 = 1 << 0;
+const NSWindowStyleMaskClosable: u64 = 1 << 1;
+const NSWindowStyleMaskMiniaturizable: u64 = 1 << 2;
+const NSWindowStyleMaskResizable: u64 = 1 << 3;
+const NSWindowStyleMaskBorderless: u64 = 0;
+
+const NSBackingStoreBuffered: u64 = 2;
+const NSApplicationActivationPolicyRegular: i64 = 0;
+const NSEventMaskAny: u64 = std.math.maxInt(u64);
+
+const NSViewWidthSizable: u64 = 1 << 1;
+const NSViewHeightSizable: u64 = 1 << 4;
+
+const ObjcBool = u8;
 
 const Command = union(enum) {
     navigate: []u8,
@@ -18,6 +36,21 @@ const Command = union(enum) {
             .apply_style, .control, .shutdown => {},
         }
     }
+};
+
+const NSPoint = extern struct {
+    x: f64,
+    y: f64,
+};
+
+const NSSize = extern struct {
+    width: f64,
+    height: f64,
+};
+
+const NSRect = extern struct {
+    origin: NSPoint,
+    size: NSSize,
 };
 
 pub const Host = struct {
@@ -36,9 +69,13 @@ pub const Host = struct {
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: bool = false,
 
-    browser_path: ?[]u8 = null,
-    browser_kind: ?browser_discovery.BrowserKind = null,
-    browser_pid: ?i64 = null,
+    symbols: ?objc.Symbols = null,
+
+    ns_app: ?*anyopaque = null,
+    ns_window: ?*anyopaque = null,
+    wk_webview: ?*anyopaque = null,
+
+    explicit_hidden: bool = false,
 
     pub fn start(allocator: std.mem.Allocator, title: []const u8, style: WindowStyle) !*Host {
         if (!runtimeAvailable()) return error.NativeBackendUnavailable;
@@ -73,6 +110,7 @@ pub const Host = struct {
             host.deinit();
             return error.NativeBackendUnavailable;
         }
+
         return host;
     }
 
@@ -90,7 +128,6 @@ pub const Host = struct {
         self.mutex.unlock();
 
         self.queue.deinit();
-        if (self.browser_path) |path| self.allocator.free(path);
         self.allocator.free(self.title);
         self.allocator.destroy(self);
     }
@@ -135,77 +172,199 @@ pub const Host = struct {
 };
 
 pub fn runtimeAvailable() bool {
-    return @import("builtin").os.tag == .macos;
+    if (builtin.os.tag != .macos) return false;
+    var symbols = objc.Symbols.load() catch return false;
+    symbols.deinit();
+    return true;
 }
 
 fn threadMain(host: *Host) void {
+    const symbols = objc.Symbols.load() catch {
+        failStartup(host, error.NativeBackendUnavailable);
+        return;
+    };
+
+    host.mutex.lock();
+    host.symbols = symbols;
+    host.mutex.unlock();
+    defer {
+        host.mutex.lock();
+        if (host.symbols) |*syms| syms.deinit();
+        host.symbols = null;
+        host.mutex.unlock();
+    }
+
+    if (!initializeApp(host)) {
+        failStartup(host, error.NativeBackendUnavailable);
+        return;
+    }
+
+    if (!createWindowAndWebView(host)) {
+        failStartup(host, error.NativeBackendUnavailable);
+        return;
+    }
+
     host.mutex.lock();
     host.ui_ready = true;
     host.startup_done = true;
     host.cond.broadcast();
     host.mutex.unlock();
 
+    var idle_ticks: usize = 0;
     while (true) {
-        host.mutex.lock();
-        while (host.queue.items.len == 0 and !host.shutdown_requested) {
-            host.cond.wait(&host.mutex);
+        var had_activity = false;
+
+        drainCommandsUiThread(host, &had_activity);
+        if (pumpEvents(host)) {
+            had_activity = true;
         }
-        if (host.shutdown_requested and host.queue.items.len == 0) {
+
+        if (windowUserClosed(host)) {
+            host.mutex.lock();
+            host.shutdown_requested = true;
+            host.closed.store(true, .release);
+            host.cond.broadcast();
             host.mutex.unlock();
-            break;
         }
 
-        var cmd = host.queue.orderedRemove(0);
+        host.mutex.lock();
+        const stop = host.shutdown_requested;
         host.mutex.unlock();
+        if (stop) break;
 
-        executeCommand(host, &cmd);
-        cmd.deinit(host.allocator);
+        if (!had_activity) {
+            idle_ticks += 1;
+            if (idle_ticks > 5) {
+                std.Thread.sleep(8 * std.time.ns_per_ms);
+            }
+        } else {
+            idle_ticks = 0;
+        }
+    }
+
+    cleanupUiThread(host);
+}
+
+fn failStartup(host: *Host, err: anyerror) void {
+    host.mutex.lock();
+    defer host.mutex.unlock();
+
+    host.startup_error = err;
+    host.startup_done = true;
+    host.ui_ready = false;
+    host.closed.store(true, .release);
+    host.cond.broadcast();
+}
+
+fn initializeApp(host: *Host) bool {
+    const app_class = objcClass(host, "NSApplication") orelse return false;
+    const app = msgSendId(host, app_class, sel(host, "sharedApplication"));
+    if (app == null) return false;
+
+    host.ns_app = app;
+
+    msgSendVoidI64(host, app, sel(host, "setActivationPolicy:"), NSApplicationActivationPolicyRegular);
+    msgSendVoid(host, app, sel(host, "finishLaunching"));
+    msgSendVoidBool(host, app, sel(host, "activateIgnoringOtherApps:"), true);
+    return true;
+}
+
+fn createWindowAndWebView(host: *Host) bool {
+    const frame = styleRect(host.style);
+    const style_mask = computeWindowStyleMask(host.style);
+
+    const window_class = objcClass(host, "NSWindow") orelse return false;
+    const window_alloc = msgSendId(host, window_class, sel(host, "alloc")) orelse return false;
+
+    const window = msgSendIdRectU64U64Bool(
+        host,
+        window_alloc,
+        sel(host, "initWithContentRect:styleMask:backing:defer:"),
+        frame,
+        style_mask,
+        NSBackingStoreBuffered,
+        false,
+    ) orelse return false;
+
+    host.ns_window = window;
+    msgSendVoidBool(host, window, sel(host, "setReleasedWhenClosed:"), false);
+
+    if (host.style.frameless) {
+        msgSendVoidBool(host, window, sel(host, "setMovableByWindowBackground:"), true);
+    }
+
+    const title = nsString(host, host.title) orelse return false;
+    msgSendVoidId(host, window, sel(host, "setTitle:"), title);
+
+    const webview_class = objcClass(host, "WKWebView") orelse return false;
+    const webview_alloc = msgSendId(host, webview_class, sel(host, "alloc")) orelse return false;
+    const webview = msgSendIdRect(host, webview_alloc, sel(host, "initWithFrame:"), frame) orelse return false;
+
+    host.wk_webview = webview;
+
+    msgSendVoidU64(host, webview, sel(host, "setAutoresizingMask:"), NSViewWidthSizable | NSViewHeightSizable);
+
+    const content_view = msgSendId(host, window, sel(host, "contentView")) orelse return false;
+    msgSendVoidId(host, content_view, sel(host, "addSubview:"), webview);
+
+    applyStyleUiThread(host, host.style);
+
+    if (host.style.hidden) {
+        host.explicit_hidden = true;
+        msgSendVoidId(host, window, sel(host, "orderOut:"), null);
+    } else {
+        host.explicit_hidden = false;
+        msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
+    }
+
+    return true;
+}
+
+fn cleanupUiThread(host: *Host) void {
+    if (host.wk_webview) |webview| {
+        msgSendVoid(host, webview, sel(host, "release"));
+        host.wk_webview = null;
+    }
+
+    if (host.ns_window) |window| {
+        msgSendVoidId(host, window, sel(host, "orderOut:"), null);
+        msgSendVoid(host, window, sel(host, "close"));
+        msgSendVoid(host, window, sel(host, "release"));
+        host.ns_window = null;
     }
 
     host.mutex.lock();
-    host.closed.store(true, .release);
     host.ui_ready = false;
+    host.closed.store(true, .release);
+    host.shutdown_requested = true;
     host.cond.broadcast();
     host.mutex.unlock();
 }
 
-fn executeCommand(host: *Host, command: *Command) void {
+fn drainCommandsUiThread(host: *Host, had_activity: *bool) void {
+    while (true) {
+        host.mutex.lock();
+        if (host.queue.items.len == 0) {
+            host.mutex.unlock();
+            return;
+        }
+        var cmd = host.queue.orderedRemove(0);
+        host.mutex.unlock();
+
+        had_activity.* = true;
+        executeCommandUiThread(host, &cmd);
+        cmd.deinit(host.allocator);
+    }
+}
+
+fn executeCommandUiThread(host: *Host, command: *Command) void {
     switch (command.*) {
         .navigate => |url| {
-            if (!launchOrNavigate(host, url)) {
-                host.mutex.lock();
-                host.startup_error = error.NativeBackendUnavailable;
-                host.closed.store(true, .release);
-                host.shutdown_requested = true;
-                host.cond.broadcast();
-                host.mutex.unlock();
-            }
+            _ = navigateUiThread(host, url);
         },
-        .apply_style => |style| {
-            host.style = style;
-            if (host.browser_pid) |pid| {
-                if (style.hidden) {
-                    _ = macos_browser_host.controlWindow(host.allocator, pid, .hide);
-                } else {
-                    _ = macos_browser_host.controlWindow(host.allocator, pid, .show);
-                }
-            }
-        },
-        .control => |cmd| {
-            if (host.browser_pid) |pid| {
-                _ = macos_browser_host.controlWindow(host.allocator, pid, cmd);
-                if (cmd == .close) {
-                    host.mutex.lock();
-                    host.closed.store(true, .release);
-                    host.shutdown_requested = true;
-                    host.mutex.unlock();
-                }
-            }
-        },
+        .apply_style => |style| applyStyleUiThread(host, style),
+        .control => |cmd| applyControlUiThread(host, cmd),
         .shutdown => {
-            if (host.browser_pid) |pid| {
-                macos_browser_host.terminateProcess(host.allocator, pid);
-            }
             host.mutex.lock();
             host.shutdown_requested = true;
             host.closed.store(true, .release);
@@ -215,81 +374,301 @@ fn executeCommand(host: *Host, command: *Command) void {
     }
 }
 
-fn launchOrNavigate(host: *Host, url: []const u8) bool {
-    if (host.browser_path) |path| {
-        if (macos_browser_host.openUrlInExistingInstall(host.allocator, path, url)) return true;
-    }
+fn navigateUiThread(host: *Host, url: []const u8) bool {
+    const webview = host.wk_webview orelse return false;
 
-    const installs = browser_discovery.discoverInstalledBrowsers(host.allocator) catch return false;
-    defer if (installs.len > 0) browser_discovery.freeInstalls(host.allocator, installs);
+    const ns_url_str = nsString(host, url) orelse return false;
+    const nsurl_class = objcClass(host, "NSURL") orelse return false;
+    const nsurl = msgSendIdId(host, nsurl_class, sel(host, "URLWithString:"), ns_url_str) orelse return false;
 
-    var selected: ?browser_discovery.BrowserInstall = null;
-    for (installs) |install| {
-        if (!supportsChromiumAppMode(install.kind)) continue;
-        selected = install;
-        break;
-    }
-    if (selected == null and installs.len > 0) selected = installs[0];
+    const request_class = objcClass(host, "NSURLRequest") orelse return false;
+    const request = msgSendIdId(host, request_class, sel(host, "requestWithURL:"), nsurl) orelse return false;
 
-    const chosen = selected orelse return false;
-
-    var args = std.array_list.Managed([]const u8).init(host.allocator);
-    defer args.deinit();
-    var owned = std.array_list.Managed([]u8).init(host.allocator);
-    defer {
-        for (owned.items) |buf| host.allocator.free(buf);
-        owned.deinit();
-    }
-
-    if (supportsChromiumAppMode(chosen.kind)) {
-        args.append("--new-window") catch return false;
-
-        const app_arg = std.fmt.allocPrint(host.allocator, "--app={s}", .{url}) catch return false;
-        owned.append(app_arg) catch return false;
-        args.append(app_arg) catch return false;
-
-        if (host.style.kiosk) args.append("--kiosk") catch return false;
-        if (host.style.hidden) args.append("--start-minimized") catch return false;
-        if (host.style.size) |size| {
-            const size_arg = std.fmt.allocPrint(host.allocator, "--window-size={d},{d}", .{ size.width, size.height }) catch return false;
-            owned.append(size_arg) catch return false;
-            args.append(size_arg) catch return false;
-        }
-        if (host.style.position) |pos| {
-            const pos_arg = std.fmt.allocPrint(host.allocator, "--window-position={d},{d}", .{ pos.x, pos.y }) catch return false;
-            owned.append(pos_arg) catch return false;
-            args.append(pos_arg) catch return false;
-        }
-    } else {
-        args.append(url) catch return false;
-    }
-
-    const launched = macos_browser_host.launchTracked(host.allocator, chosen.path, args.items) catch null;
-    const result = launched orelse return false;
-
-    if (host.browser_path) |path| host.allocator.free(path);
-    host.browser_path = host.allocator.dupe(u8, chosen.path) catch null;
-    host.browser_kind = chosen.kind;
-    host.browser_pid = result.pid;
+    msgSendVoidId(host, webview, sel(host, "loadRequest:"), request);
     return true;
 }
 
-fn supportsChromiumAppMode(kind: browser_discovery.BrowserKind) bool {
-    return switch (kind) {
-        .chrome,
-        .edge,
-        .chromium,
-        .opera,
-        .brave,
-        .vivaldi,
-        .epic,
-        .yandex,
-        .duckduckgo,
-        .arc,
-        .sidekick,
-        .shift,
-        .operagx,
-        => true,
-        else => false,
+fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
+    host.style = style;
+
+    const window = host.ns_window orelse return;
+
+    msgSendVoidU64(host, window, sel(host, "setStyleMask:"), computeWindowStyleMask(style));
+
+    if (style.size) |size| {
+        const ns_size = NSSize{ .width = @floatFromInt(size.width), .height = @floatFromInt(size.height) };
+        msgSendVoidSize(host, window, sel(host, "setContentSize:"), ns_size);
+    }
+
+    if (style.center) {
+        msgSendVoid(host, window, sel(host, "center"));
+    } else if (style.position) |pos| {
+        msgSendVoidPoint(host, window, sel(host, "setFrameTopLeftPoint:"), .{ .x = @floatFromInt(pos.x), .y = @floatFromInt(pos.y) });
+    }
+
+    if (style.transparent) {
+        const ns_color_class = objcClass(host, "NSColor") orelse return;
+        const clear = msgSendId(host, ns_color_class, sel(host, "clearColor"));
+        msgSendVoidBool(host, window, sel(host, "setOpaque:"), false);
+        if (clear) |clear_color| msgSendVoidId(host, window, sel(host, "setBackgroundColor:"), clear_color);
+        if (host.wk_webview) |webview| {
+            msgSendVoidBool(host, webview, sel(host, "setOpaque:"), false);
+        }
+    } else {
+        msgSendVoidBool(host, window, sel(host, "setOpaque:"), true);
+    }
+
+    applyCornerRadius(host, style.corner_radius);
+
+    if (style.hidden) {
+        host.explicit_hidden = true;
+        msgSendVoidId(host, window, sel(host, "orderOut:"), null);
+    } else {
+        host.explicit_hidden = false;
+        msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
+    }
+}
+
+fn applyCornerRadius(host: *Host, radius: ?u16) void {
+    const window = host.ns_window orelse return;
+    const content_view = msgSendId(host, window, sel(host, "contentView")) orelse return;
+
+    if (radius == null) {
+        msgSendVoidBool(host, content_view, sel(host, "setWantsLayer:"), false);
+        return;
+    }
+
+    msgSendVoidBool(host, content_view, sel(host, "setWantsLayer:"), true);
+    const layer = msgSendId(host, content_view, sel(host, "layer")) orelse return;
+
+    msgSendVoidF64(host, layer, sel(host, "setCornerRadius:"), @floatFromInt(radius.?));
+    msgSendVoidBool(host, layer, sel(host, "setMasksToBounds:"), true);
+}
+
+fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
+    const window = host.ns_window orelse return;
+
+    switch (cmd) {
+        .minimize => {
+            host.explicit_hidden = true;
+            msgSendVoidId(host, window, sel(host, "miniaturize:"), null);
+        },
+        .maximize => {
+            host.explicit_hidden = false;
+            msgSendVoidId(host, window, sel(host, "zoom:"), null);
+        },
+        .restore => {
+            host.explicit_hidden = false;
+            msgSendVoidId(host, window, sel(host, "deminiaturize:"), null);
+            msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
+        },
+        .close => {
+            host.mutex.lock();
+            host.shutdown_requested = true;
+            host.closed.store(true, .release);
+            host.cond.broadcast();
+            host.mutex.unlock();
+            msgSendVoid(host, window, sel(host, "close"));
+        },
+        .hide => {
+            host.explicit_hidden = true;
+            msgSendVoidId(host, window, sel(host, "orderOut:"), null);
+        },
+        .show => {
+            host.explicit_hidden = false;
+            msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
+        },
+    }
+}
+
+fn windowUserClosed(host: *Host) bool {
+    if (host.explicit_hidden) return false;
+    const window = host.ns_window orelse return false;
+    const visible = msgSendBool(host, window, sel(host, "isVisible"));
+    if (visible) return false;
+
+    const miniaturized = msgSendBool(host, window, sel(host, "isMiniaturized"));
+    return !miniaturized;
+}
+
+fn pumpEvents(host: *Host) bool {
+    const app = host.ns_app orelse return false;
+
+    const date_class = objcClass(host, "NSDate") orelse return false;
+    const distant_past = msgSendId(host, date_class, sel(host, "distantPast")) orelse return false;
+
+    const default_mode = nsString(host, "kCFRunLoopDefaultMode") orelse return false;
+
+    const event = msgSendIdU64IdIdBool(
+        host,
+        app,
+        sel(host, "nextEventMatchingMask:untilDate:inMode:dequeue:"),
+        NSEventMaskAny,
+        distant_past,
+        default_mode,
+        true,
+    );
+
+    if (event == null) return false;
+
+    msgSendVoidId(host, app, sel(host, "sendEvent:"), event);
+    msgSendVoid(host, app, sel(host, "updateWindows"));
+    return true;
+}
+
+fn styleRect(style: WindowStyle) NSRect {
+    const width: f64 = if (style.size) |s| @floatFromInt(s.width) else default_width;
+    const height: f64 = if (style.size) |s| @floatFromInt(s.height) else default_height;
+    const x: f64 = if (style.position) |p| @floatFromInt(p.x) else 160;
+    const y: f64 = if (style.position) |p| @floatFromInt(p.y) else 120;
+    return .{
+        .origin = .{ .x = x, .y = y },
+        .size = .{ .width = width, .height = height },
     };
+}
+
+fn computeWindowStyleMask(style: WindowStyle) u64 {
+    if (style.frameless) {
+        var out: u64 = NSWindowStyleMaskBorderless;
+        if (style.resizable) out |= NSWindowStyleMaskResizable;
+        return out;
+    }
+
+    var out: u64 = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
+    if (style.resizable) out |= NSWindowStyleMaskResizable;
+    return out;
+}
+
+fn nsString(host: *Host, value: []const u8) ?*anyopaque {
+    const cls = objcClass(host, "NSString") orelse return null;
+
+    const z = host.allocator.dupeZ(u8, value) catch return null;
+    defer host.allocator.free(z);
+
+    return msgSendIdCString(host, cls, sel(host, "stringWithUTF8String:"), z.ptr);
+}
+
+fn objcClass(host: *Host, name: [*:0]const u8) ?*anyopaque {
+    const syms = host.symbols orelse return null;
+    return syms.objc_get_class(name);
+}
+
+fn sel(host: *Host, name: [*:0]const u8) objc.SEL {
+    return host.symbols.?.sel_register_name(name);
+}
+
+fn asBool(value: bool) ObjcBool {
+    return if (value) 1 else 0;
+}
+
+fn msgSendId(host: *Host, receiver: ?*anyopaque, selector: objc.SEL) ?*anyopaque {
+    const Fn = *const fn (?*anyopaque, objc.SEL) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector);
+}
+
+fn msgSendBool(host: *Host, receiver: ?*anyopaque, selector: objc.SEL) bool {
+    const Fn = *const fn (?*anyopaque, objc.SEL) callconv(.c) ObjcBool;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector) != 0;
+}
+
+fn msgSendVoid(host: *Host, receiver: ?*anyopaque, selector: objc.SEL) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector);
+}
+
+fn msgSendVoidBool(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: bool) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, ObjcBool) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, asBool(value));
+}
+
+fn msgSendVoidI64(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: i64) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, i64) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, value);
+}
+
+fn msgSendVoidU64(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: u64) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, u64) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, value);
+}
+
+fn msgSendVoidF64(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: f64) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, f64) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, value);
+}
+
+fn msgSendVoidId(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: ?*anyopaque) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, ?*anyopaque) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, value);
+}
+
+fn msgSendVoidPoint(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: NSPoint) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, NSPoint) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, value);
+}
+
+fn msgSendVoidSize(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, value: NSSize) void {
+    const Fn = *const fn (?*anyopaque, objc.SEL, NSSize) callconv(.c) void;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    f(receiver, selector, value);
+}
+
+fn msgSendIdId(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, arg: ?*anyopaque) ?*anyopaque {
+    const Fn = *const fn (?*anyopaque, objc.SEL, ?*anyopaque) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector, arg);
+}
+
+fn msgSendIdCString(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, arg: [*:0]const u8) ?*anyopaque {
+    const Fn = *const fn (?*anyopaque, objc.SEL, [*:0]const u8) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector, arg);
+}
+
+fn msgSendIdRect(host: *Host, receiver: ?*anyopaque, selector: objc.SEL, rect: NSRect) ?*anyopaque {
+    const Fn = *const fn (?*anyopaque, objc.SEL, NSRect) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector, rect);
+}
+
+fn msgSendIdRectU64U64Bool(
+    host: *Host,
+    receiver: ?*anyopaque,
+    selector: objc.SEL,
+    rect: NSRect,
+    style_mask: u64,
+    backing: u64,
+    defer_flag: bool,
+) ?*anyopaque {
+    const Fn = *const fn (?*anyopaque, objc.SEL, NSRect, u64, u64, ObjcBool) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector, rect, style_mask, backing, asBool(defer_flag));
+}
+
+fn msgSendIdU64IdIdBool(
+    host: *Host,
+    receiver: ?*anyopaque,
+    selector: objc.SEL,
+    mask: u64,
+    date: ?*anyopaque,
+    mode: ?*anyopaque,
+    dequeue: bool,
+) ?*anyopaque {
+    const Fn = *const fn (?*anyopaque, objc.SEL, u64, ?*anyopaque, ?*anyopaque, ObjcBool) callconv(.c) ?*anyopaque;
+    const f: Fn = @ptrCast(@alignCast(host.symbols.?.objc_msg_send));
+    return f(receiver, selector, mask, date, mode, asBool(dequeue));
+}
+
+test "runtimeAvailable false on non-macos targets" {
+    if (builtin.os.tag != .macos) {
+        try std.testing.expect(!runtimeAvailable());
+    }
 }

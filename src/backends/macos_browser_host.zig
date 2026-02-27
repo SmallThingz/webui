@@ -21,6 +21,7 @@ pub fn launchTracked(
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
+    child.pgid = 0;
 
     child.spawn() catch return null;
     return .{ .pid = @as(i64, @intCast(child.id)), .is_child_process = true };
@@ -63,47 +64,59 @@ pub fn controlWindow(allocator: std.mem.Allocator, pid: i64, cmd: window_style_t
         return true;
     }
 
-    const script = switch (cmd) {
-        .hide => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first process whose unix id is {d}) to set visible to false",
-            .{pid},
-        ) catch return false,
-        .show => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first process whose unix id is {d}) to set visible to true",
-            .{pid},
-        ) catch return false,
-        .minimize => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXMinimized\" to true",
-            .{pid},
-        ) catch return false,
-        .restore => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXMinimized\" to false",
-            .{pid},
-        ) catch return false,
-        .maximize => std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXFullScreen\" to true",
-            .{pid},
-        ) catch return false,
-        .close => unreachable,
-    };
+    const script = buildAppleScriptForControl(allocator, pid, cmd) catch return false;
     defer allocator.free(script);
 
     if (runCommandNoCapture(allocator, &.{ "osascript", "-e", script }) catch false) return true;
     if (cmd == .maximize) {
-        const alt = std.fmt.allocPrint(
-            allocator,
-            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXZoomed\" to true",
-            .{pid},
-        ) catch return false;
+        const alt = buildAppleScriptForZoomFallback(allocator, pid) catch return false;
         defer allocator.free(alt);
         return runCommandNoCapture(allocator, &.{ "osascript", "-e", alt }) catch false;
     }
     return false;
+}
+
+fn buildAppleScriptForControl(
+    allocator: std.mem.Allocator,
+    pid: i64,
+    cmd: window_style_types.WindowControl,
+) ![]u8 {
+    return switch (cmd) {
+        .hide => std.fmt.allocPrint(
+            allocator,
+            "tell application \"System Events\" to tell (first process whose unix id is {d}) to set visible to false",
+            .{pid},
+        ),
+        .show => std.fmt.allocPrint(
+            allocator,
+            "tell application \"System Events\" to tell (first process whose unix id is {d}) to set visible to true",
+            .{pid},
+        ),
+        .minimize => std.fmt.allocPrint(
+            allocator,
+            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXMinimized\" to true",
+            .{pid},
+        ),
+        .restore => std.fmt.allocPrint(
+            allocator,
+            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXMinimized\" to false",
+            .{pid},
+        ),
+        .maximize => std.fmt.allocPrint(
+            allocator,
+            "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXFullScreen\" to true",
+            .{pid},
+        ),
+        .close => error.InvalidWindowControl,
+    };
+}
+
+fn buildAppleScriptForZoomFallback(allocator: std.mem.Allocator, pid: i64) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "tell application \"System Events\" to tell (first window of (first process whose unix id is {d})) to set value of attribute \"AXZoomed\" to true",
+        .{pid},
+    );
 }
 
 fn runCommandNoCapture(allocator: std.mem.Allocator, argv: []const []const u8) !bool {
@@ -117,4 +130,23 @@ fn runCommandNoCapture(allocator: std.mem.Allocator, argv: []const []const u8) !
         .Exited => |code| code == 0,
         else => false,
     };
+}
+
+test "applescript control template contains target pid and command semantics" {
+    const script = try buildAppleScriptForControl(std.testing.allocator, 4242, .minimize);
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "unix id is 4242") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "AXMinimized") != null);
+}
+
+test "applescript zoom fallback template contains target pid" {
+    const script = try buildAppleScriptForZoomFallback(std.testing.allocator, 3001);
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "unix id is 3001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "AXZoomed") != null);
+}
+
+test "process alive rejects non-positive pid" {
+    try std.testing.expect(!isProcessAlive(std.testing.allocator, 0));
+    try std.testing.expect(!isProcessAlive(std.testing.allocator, -9));
 }
