@@ -290,6 +290,17 @@ fn threadMain(host: *Host) void {
     if (host.main_loop) |loop_ptr| {
         symbols.g_main_loop_run(loop_ptr);
     }
+    // Allow GLib/WebKit deferred destroys to execute on the UI-affine thread
+    // before host teardown. This reduces shutdown-time aborts during process
+    // exit when windows are closed externally.
+    if (host.symbols) |syms| {
+        if (syms.g_main_context_iteration) |iterate| {
+            var spins: usize = 0;
+            while (spins < 128) : (spins += 1) {
+                if (iterate(null, 0) == 0) break;
+            }
+        }
+    }
     finishThreadShutdown(host);
 }
 
@@ -322,6 +333,10 @@ fn failStartup(host: *Host, err: anyerror) void {
 fn finishThreadShutdown(host: *Host) void {
     host.mutex.lock();
     defer host.mutex.unlock();
+
+    if (host.symbols) |symbols| {
+        disconnectHostSignals(host, &symbols);
+    }
 
     host.closed.store(true, .release);
     host.ui_ready = false;
@@ -384,6 +399,7 @@ fn onRealize(widget: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
 
     host.mutex.lock();
     defer host.mutex.unlock();
+    if (host.closed.load(.acquire) or host.shutdown_requested) return;
     const symbols = host.symbols orelse return;
     const clip_widget = host.content_widget orelse window_widget;
     if (host.style.transparent) symbols.applyTransparentVisual(window_widget);
@@ -400,6 +416,7 @@ fn onSizeAllocate(widget: ?*anyopaque, allocation: ?*anyopaque, data: ?*anyopaqu
 
     host.mutex.lock();
     defer host.mutex.unlock();
+    if (host.closed.load(.acquire) or host.shutdown_requested) return;
     const symbols = host.symbols orelse return;
 
     if (allocation) |raw_alloc| {
@@ -569,6 +586,19 @@ fn applyRoundedShape(symbols: *const Symbols, corner_radius: ?u16, window_widget
         symbols.gtk_widget_get_allocated_width(window_widget),
         symbols.gtk_widget_get_allocated_height(window_widget),
     );
+}
+
+fn disconnectHostSignals(host: *Host, symbols: *const Symbols) void {
+    const disconnect = symbols.g_signal_handlers_disconnect_by_data orelse return;
+    if (host.window_widget) |window_widget| {
+        _ = disconnect(@ptrCast(window_widget), host);
+    }
+    if (host.content_widget) |content_widget| {
+        _ = disconnect(@ptrCast(content_widget), host);
+    }
+    if (host.webview) |webview| {
+        _ = disconnect(@ptrCast(webview), host);
+    }
 }
 
 fn queueDrawTargets(host: *Host, symbols: *const Symbols, window_widget: *common.GtkWidget, clip_widget: *common.GtkWidget) void {

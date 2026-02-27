@@ -121,11 +121,13 @@ pub const Symbols = struct {
         ?*const anyopaque,
         c_uint,
     ) callconv(.c) c_ulong,
+    g_signal_handlers_disconnect_by_data: ?*const fn (*anyopaque, ?*anyopaque) callconv(.c) c_uint = null,
     g_idle_add: *const fn (*const fn (?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) c_uint,
     g_main_loop_new: *const fn (?*anyopaque, c_int) callconv(.c) ?*common.GMainLoop,
     g_main_loop_run: *const fn (*common.GMainLoop) callconv(.c) void,
     g_main_loop_quit: *const fn (*common.GMainLoop) callconv(.c) void,
     g_main_loop_unref: *const fn (*common.GMainLoop) callconv(.c) void,
+    g_main_context_iteration: ?*const fn (?*anyopaque, c_int) callconv(.c) c_int = null,
     g_error_free: ?*const fn (?*common.GError) callconv(.c) void = null,
     g_list_append: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) ?*anyopaque = null,
     g_list_free: ?*const fn (?*anyopaque) callconv(.c) void = null,
@@ -562,12 +564,22 @@ pub const Symbols = struct {
         self.webkit_web_view_set_background_color = try lookupSym(&self.webkit, @TypeOf(self.webkit_web_view_set_background_color), "webkit_web_view_set_background_color");
 
         self.g_signal_connect_data = try lookupSym(&self.gobject, @TypeOf(self.g_signal_connect_data), "g_signal_connect_data");
+        self.g_signal_handlers_disconnect_by_data = lookupOptionalSym(
+            &self.gobject,
+            @TypeOf(self.g_signal_handlers_disconnect_by_data),
+            "g_signal_handlers_disconnect_by_data",
+        );
         self.g_object_unref = lookupOptionalSym(&self.gobject, @TypeOf(self.g_object_unref), "g_object_unref");
         self.g_idle_add = try lookupSym(&self.glib, @TypeOf(self.g_idle_add), "g_idle_add");
         self.g_main_loop_new = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_new), "g_main_loop_new");
         self.g_main_loop_run = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_run), "g_main_loop_run");
         self.g_main_loop_quit = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_quit), "g_main_loop_quit");
         self.g_main_loop_unref = try lookupSym(&self.glib, @TypeOf(self.g_main_loop_unref), "g_main_loop_unref");
+        self.g_main_context_iteration = lookupOptionalSym(
+            &self.glib,
+            @TypeOf(self.g_main_context_iteration),
+            "g_main_context_iteration",
+        );
         self.g_error_free = lookupOptionalSym(&self.glib, @TypeOf(self.g_error_free), "g_error_free");
         self.g_list_append = lookupOptionalSym(&self.glib, @TypeOf(self.g_list_append), "g_list_append");
         self.g_list_free = lookupOptionalSym(&self.glib, @TypeOf(self.g_list_free), "g_list_free");

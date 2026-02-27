@@ -205,6 +205,8 @@ pub const Host = struct {
     environment: ?*wv2.ICoreWebView2Environment = null,
     controller: ?*wv2.ICoreWebView2Controller = null,
     webview: ?*wv2.ICoreWebView2 = null,
+    title_changed_token: wv2.EventRegistrationToken = .{ .value = 0 },
+    title_handler_attached: bool = false,
 
     pending_url: ?[]u8 = null,
 
@@ -485,8 +487,11 @@ fn cleanupUiThread(host: *Host) void {
     host.hwnd = null;
 
     if (hwnd) |handle| {
+        _ = SetWindowLongPtrW(handle, GWLP_USERDATA, 0);
         _ = DestroyWindow(handle);
     }
+
+    detachTitleHandlerUiThread(host);
 
     if (host.webview) |webview| {
         _ = webview.lpVtbl.Release(webview);
@@ -978,7 +983,25 @@ fn attachTitleHandler(host: *Host, webview: *wv2.ICoreWebView2) void {
         _ = titleHandlerRelease(&handler.iface);
         return;
     }
+    host.title_changed_token = token;
+    host.title_handler_attached = true;
     _ = titleHandlerRelease(&handler.iface);
+}
+
+fn detachTitleHandlerUiThread(host: *Host) void {
+    if (!host.title_handler_attached) return;
+    const webview = host.webview orelse {
+        host.title_handler_attached = false;
+        host.title_changed_token = .{ .value = 0 };
+        return;
+    };
+    if (@intFromPtr(webview.lpVtbl.remove_DocumentTitleChanged) != 0) {
+        const RemoveFn = *const fn (*wv2.ICoreWebView2, wv2.EventRegistrationToken) callconv(.winapi) wv2.HRESULT;
+        const remove_handler: RemoveFn = @ptrCast(@alignCast(webview.lpVtbl.remove_DocumentTitleChanged));
+        _ = remove_handler(webview, host.title_changed_token);
+    }
+    host.title_handler_attached = false;
+    host.title_changed_token = .{ .value = 0 };
 }
 
 fn titleHandlerQueryInterface(
