@@ -180,7 +180,18 @@ pub const State = struct {
         defer self.worker_lifecycle_mutex.unlock();
 
         self.worker_stop.store(true, .release);
+        self.queue_mutex.lock();
+        for (self.queue.items) |task| {
+            task.mutex.lock();
+            if (!task.done) {
+                task.err = error.RpcDispatcherStopped;
+                task.done = true;
+                task.cond.signal();
+            }
+            task.mutex.unlock();
+        }
         self.queue_cond.broadcast();
+        self.queue_mutex.unlock();
         if (self.worker_thread) |thread| {
             thread.join();
             self.worker_thread = null;
@@ -262,6 +273,11 @@ pub const State = struct {
             self.queue_mutex.lock();
             while (self.queue.items.len == 0 and !self.worker_stop.load(.acquire)) {
                 self.queue_cond.timedWait(&self.queue_mutex, poll_ns) catch {};
+            }
+
+            if (self.worker_stop.load(.acquire)) {
+                self.queue_mutex.unlock();
+                break;
             }
 
             const task = if (self.queue.items.len == 0) null else blk: {

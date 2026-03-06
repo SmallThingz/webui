@@ -1118,6 +1118,7 @@ test "window_closing lifecycle pending close cancels on websocket reconnect" {
     // used by this test and is removed immediately to avoid shutdown cleanup.
     try win.state().ws_connections.append(.{
         .connection_id = 1,
+        .generation = 1,
         .transport = .{ .plain = undefined },
     });
     win.state().reconcileChildExit(gpa.allocator());

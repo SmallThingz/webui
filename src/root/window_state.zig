@@ -227,15 +227,17 @@ pub const WsTransport = union(enum) {
     }
 
     pub fn destroy(self: *WsTransport, allocator: std.mem.Allocator) void {
+        _ = allocator;
         switch (self.*) {
             .plain => {},
-            .tls => |conn| allocator.destroy(conn),
+            .tls => |conn| std.heap.page_allocator.destroy(conn),
         }
     }
 };
 
 pub const WsConnectionState = struct {
     connection_id: usize,
+    generation: u64,
     transport: WsTransport,
 };
 
@@ -275,6 +277,7 @@ pub const WindowState = struct {
     last_warning: ?[]const u8,
     next_client_id: usize,
     next_connection_id: usize,
+    next_ws_generation: u64,
     client_sessions: std.array_list.Managed(ClientSession),
     next_script_id: u64,
     script_pending: std.array_list.Managed(*ScriptTask),
@@ -293,6 +296,7 @@ pub const WindowState = struct {
     connection_mutex: std.Thread.Mutex,
     connection_cond: std.Thread.Condition,
     active_connection_workers: usize,
+    active_ws_workers: usize,
     server_thread: ?std.Thread,
     server_stop: std.atomic.Value(bool),
     server_ready_mutex: std.Thread.Mutex,
@@ -367,6 +371,7 @@ pub const WindowState = struct {
             .last_warning = null,
             .next_client_id = 1,
             .next_connection_id = 1,
+            .next_ws_generation = 1,
             .client_sessions = std.array_list.Managed(ClientSession).init(allocator),
             .next_script_id = 1,
             .script_pending = std.array_list.Managed(*ScriptTask).init(allocator),
@@ -384,6 +389,7 @@ pub const WindowState = struct {
             .connection_mutex = .{},
             .connection_cond = .{},
             .active_connection_workers = 0,
+            .active_ws_workers = 0,
             .server_thread = null,
             .server_stop = std.atomic.Value(bool).init(false),
             .server_ready_mutex = .{},
@@ -398,7 +404,7 @@ pub const WindowState = struct {
         state.resolveActiveTransportLocked();
         state.native_capabilities = state.backend.capabilities();
         try state.setStyleOwned(allocator, options.style);
-        if (state.isNativeWindowActive()) {
+        if (state.nativeTransportSelected()) {
             state.backend.createWindow(state.id, state.title, state.current_style) catch |err| {
                 if (err == error.NativeBackendUnavailable) {
                     if (launchPolicyNextAfter(state.launch_policy, .native_webview)) |next_surface| {
@@ -419,6 +425,7 @@ pub const WindowState = struct {
                     state.rpc_state.logf(.warn, "[webui.warning] window={d} {s}\n", .{ state.id, warning });
                 }
             };
+            state.native_capabilities = state.backend.capabilities();
             state.backend.applyStyle(state.current_style) catch |err| {
                 if (backendWarningForError(err, state.window_fallback_emulation)) |warning| {
                     state.rpc_state.logf(.warn, "[webui.warning] window={d} {s}\n", .{ state.id, warning });
@@ -490,8 +497,30 @@ pub const WindowState = struct {
         }
     }
 
-    pub fn isNativeWindowActive(self: *const WindowState) bool {
+    fn nativeTransportSelected(self: *const WindowState) bool {
         return self.runtime_render_state.active_transport == .native_webview and self.backend.isNative();
+    }
+
+    pub fn isNativeWindowActive(self: *const WindowState) bool {
+        return self.nativeTransportSelected();
+    }
+
+    fn approveCloseRequest(self: *WindowState) bool {
+        self.emit(.close_requested, "close-requested", "");
+
+        if (self.close_callback.handler) |handler| {
+            if (!handler(self.close_callback.context, self.id)) {
+                self.emit(.close_requested, "close-denied", "");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    fn markCloseAccepted(self: *WindowState) void {
+        self.close_requested.store(true, .release);
+        self.emit(.close_requested, "close-accepted", "");
     }
 
     pub fn capabilities(self: *const WindowState) []const WindowCapability {
@@ -517,17 +546,8 @@ pub const WindowState = struct {
     }
 
     pub fn requestClose(self: *WindowState) bool {
-        self.emit(.close_requested, "close-requested", "");
-
-        if (self.close_callback.handler) |handler| {
-            if (!handler(self.close_callback.context, self.id)) {
-                self.emit(.close_requested, "close-denied", "");
-                return false;
-            }
-        }
-
-        self.close_requested.store(true, .release);
-        self.emit(.close_requested, "close-accepted", "");
+        if (!self.approveCloseRequest()) return false;
+        self.markCloseAccepted();
         return true;
     }
 
@@ -553,6 +573,13 @@ pub const WindowState = struct {
         try self.setStyleOwned(allocator, style);
         self.clearWarning();
         if (self.isNativeWindowActive()) {
+            if (!self.backend.isReady()) {
+                if (self.window_fallback_emulation) {
+                    self.emit(.window_state, "style-emulated", "applied");
+                    return;
+                }
+                return error.UnsupportedWindowStyle;
+            }
             self.backend.applyStyle(self.current_style) catch |err| {
                 if (!(self.window_fallback_emulation and self.setWarningFromBackendError(err))) {
                     return err;
@@ -576,11 +603,9 @@ pub const WindowState = struct {
         self.emit(.window_state, "control", @tagName(cmd));
         self.clearWarning();
 
-        if (cmd == .close and !self.requestClose()) {
+        const wants_close = cmd == .close;
+        if (wants_close and !self.approveCloseRequest()) {
             return error.CloseDenied;
-        }
-        if (cmd == .close) {
-            self.notifyFrontendCloseLocked("window-control-close", 250);
         }
 
         if (self.isNativeWindowActive()) {
@@ -594,6 +619,10 @@ pub const WindowState = struct {
                 break :blk true;
             };
             if (native_ok) {
+                if (wants_close) {
+                    self.notifyFrontendCloseLocked("window-control-close", 250);
+                    self.markCloseAccepted();
+                }
                 return .{
                     .success = true,
                     .emulation = null,
@@ -603,7 +632,9 @@ pub const WindowState = struct {
             }
         }
 
-        if (cmd == .close) {
+        if (wants_close) {
+            self.notifyFrontendCloseLocked("window-control-close", 250);
+            self.markCloseAccepted();
             return .{
                 .success = true,
                 .emulation = null,
@@ -917,6 +948,36 @@ pub const WindowState = struct {
         return true;
     }
 
+    pub fn advanceAfterBrowserLaunchFailureLocked(
+        self: *WindowState,
+        failed_surface: LaunchSurface,
+    ) !bool {
+        var last_failed = failed_surface;
+        while (self.resolveAfterBrowserLaunchFailure(last_failed)) {
+            if (!self.nativeTransportSelected()) {
+                self.native_capabilities = self.backend.capabilities();
+                return true;
+            }
+
+            self.backend.createWindow(self.id, self.title, self.current_style) catch |err| {
+                if (err == error.NativeBackendUnavailable) {
+                    last_failed = .native_webview;
+                    continue;
+                }
+                return err;
+            };
+            self.native_capabilities = self.backend.capabilities();
+            self.backend.applyStyle(self.current_style) catch |err| {
+                if (!(self.window_fallback_emulation and self.setWarningFromBackendError(err))) {
+                    return err;
+                }
+            };
+            return true;
+        }
+        self.native_capabilities = self.backend.capabilities();
+        return false;
+    }
+
     pub fn ensureBrowserRenderState(self: *WindowState, allocator: std.mem.Allocator, app_options: AppOptions) !void {
         if (!self.shouldServeBrowser()) return;
         try self.ensureServerStarted();
@@ -935,7 +996,7 @@ pub const WindowState = struct {
             if (core_runtime.openInBrowser(allocator, url, self.current_style, launch_options)) |launch| {
                 self.setLaunchedBrowserLaunch(allocator, launch);
             } else |err| {
-                _ = self.resolveAfterBrowserLaunchFailure(self.runtime_render_state.active_surface);
+                _ = try self.advanceAfterBrowserLaunchFailureLocked(self.runtime_render_state.active_surface);
                 self.rpc_state.logf(.warn, "[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 if (self.runtime_render_state.active_surface != .browser_window) return;
                 if (self.launch_policy.app_mode_required) return err;
@@ -1018,7 +1079,7 @@ pub const WindowState = struct {
         try net_io.writeWsFrameAny(transport, .text, payload);
     }
 
-    pub fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, transport_value: anytype) !void {
+    pub fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, transport_value: anytype) !u64 {
         // Reconnect during unload/refresh grace period means the page is back.
         // Cancel any pending lifecycle close request.
         self.cancelPendingLifecycleCloseLocked("websocket-connected");
@@ -1028,28 +1089,36 @@ pub const WindowState = struct {
             else => @compileError("unsupported websocket transport type"),
         };
 
+        const generation = self.next_ws_generation;
+        self.next_ws_generation += 1;
+
         for (self.ws_connections.items) |*entry| {
             if (entry.connection_id != connection_id) continue;
             entry.transport.shutdown();
+            entry.generation = generation;
             entry.transport = transport;
             try self.dispatchPendingScriptTasksLocked();
             try self.dispatchPendingFrontendRpcTasksLocked();
-            return;
+            return generation;
         }
         try self.ws_connections.append(.{
             .connection_id = connection_id,
+            .generation = generation,
             .transport = transport,
         });
         try self.dispatchPendingScriptTasksLocked();
         try self.dispatchPendingFrontendRpcTasksLocked();
+        return generation;
     }
 
-    pub fn unregisterWsConnectionLocked(self: *WindowState, connection_id: usize) void {
+    pub fn unregisterWsConnectionLocked(self: *WindowState, connection_id: usize, generation: u64) bool {
         for (self.ws_connections.items, 0..) |entry, idx| {
             if (entry.connection_id != connection_id) continue;
+            if (entry.generation != generation) return false;
             _ = self.ws_connections.orderedRemove(idx);
-            return;
+            return true;
         }
+        return false;
     }
 
     pub fn noteWsDisconnectLocked(self: *WindowState, reason: []const u8) void {
@@ -1664,7 +1733,7 @@ pub const WindowState = struct {
         }
 
         self.connection_mutex.lock();
-        while (self.active_connection_workers > 0) {
+        while (self.active_connection_workers > 0 or self.active_ws_workers > 0) {
             self.connection_cond.timedWait(&self.connection_mutex, 10 * std.time.ns_per_ms) catch {};
         }
         self.connection_mutex.unlock();

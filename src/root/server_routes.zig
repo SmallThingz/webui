@@ -38,22 +38,29 @@ pub fn handleConnection(
     return false;
 }
 
-fn closeOwnedTransport(state: anytype, transport: anytype) void {
+fn closeOwnedTransport(_: anytype, transport: anytype) void {
     switch (@TypeOf(transport)) {
         std.net.Stream => transport.close(),
         else => {
             transport.close();
-            state.allocator.destroy(transport);
+            std.heap.page_allocator.destroy(transport);
         },
     }
 }
 
-fn wsConnectionThreadMain(state: anytype, transport: anytype, connection_id: usize) void {
+fn wsConnectionThreadMain(state: anytype, transport: anytype, connection_id: usize, generation: u64) void {
     defer {
         state.state_mutex.lock();
-        state.unregisterWsConnectionLocked(connection_id);
-        state.noteWsDisconnectLocked("websocket-disconnected");
+        if (state.unregisterWsConnectionLocked(connection_id, generation)) {
+            state.noteWsDisconnectLocked("websocket-disconnected");
+        }
         state.state_mutex.unlock();
+
+        state.connection_mutex.lock();
+        if (state.active_ws_workers > 0) state.active_ws_workers -= 1;
+        state.connection_cond.broadcast();
+        state.connection_mutex.unlock();
+
         closeOwnedTransport(state, transport);
         state.emitDiagnostic("websocket.disconnected", .websocket, .info, "WebSocket client disconnected");
 
@@ -136,22 +143,33 @@ fn handleWebSocketUpgradeRoute(
 
     const token = net_io.wsClientTokenFromUrl(request.path, default_client_token);
     var connection_id: usize = 0;
+    var generation: u64 = 0;
     state.state_mutex.lock();
     errdefer state.state_mutex.unlock();
     {
         const client_ref = try state.findOrCreateClientSessionLocked(token);
         connection_id = client_ref.connection_id;
-        try state.registerWsConnectionLocked(connection_id, conn);
+        generation = try state.registerWsConnectionLocked(connection_id, conn);
     }
     state.state_mutex.unlock();
 
     state.rpc_state.logf(.info, "[webui.ws] connected connection_id={d}\n", .{connection_id});
     state.emitDiagnostic("websocket.connected", .websocket, .info, "WebSocket client connected");
 
-    const thread = std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, conn, connection_id }) catch |err| {
+    state.connection_mutex.lock();
+    state.active_ws_workers += 1;
+    state.connection_mutex.unlock();
+
+    const thread = std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, conn, connection_id, generation }) catch |err| {
+        state.connection_mutex.lock();
+        if (state.active_ws_workers > 0) state.active_ws_workers -= 1;
+        state.connection_cond.broadcast();
+        state.connection_mutex.unlock();
+
         state.state_mutex.lock();
-        state.unregisterWsConnectionLocked(connection_id);
-        state.noteWsDisconnectLocked("websocket-spawn-failed");
+        if (state.unregisterWsConnectionLocked(connection_id, generation)) {
+            state.noteWsDisconnectLocked("websocket-spawn-failed");
+        }
         state.state_mutex.unlock();
         return err;
     };

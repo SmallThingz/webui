@@ -138,7 +138,7 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     options: AppOptions,
     tls_state: tls_runtime.Runtime,
-    windows: std.array_list.Managed(WindowState),
+    windows: std.array_list.Managed(*WindowState),
     shutdown_requested: bool,
     next_window_id: usize,
     diagnostic_callback: DiagnosticCallbackState,
@@ -160,7 +160,7 @@ pub const App = struct {
             .allocator = allocator,
             .options = resolved_options,
             .tls_state = tls_state,
-            .windows = std.array_list.Managed(WindowState).init(allocator),
+            .windows = std.array_list.Managed(*WindowState).init(allocator),
             .shutdown_requested = false,
             .next_window_id = 1,
             .diagnostic_callback = .{},
@@ -172,8 +172,9 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        for (self.windows.items) |*state| {
+        for (self.windows.items) |state| {
             state.deinit(self.allocator);
+            self.allocator.destroy(state);
         }
         self.windows.deinit();
         self.tls_state.deinit();
@@ -185,7 +186,7 @@ pub const App = struct {
         self.options.tls.enabled = true;
         self.options.tls.cert_pem = self.tls_state.cert_pem;
         self.options.tls.key_pem = self.tls_state.key_pem;
-        for (self.windows.items) |*state| {
+        for (self.windows.items) |state| {
             state.state_mutex.lock();
             state.server_tls_enabled = self.options.tls.enabled and self.options.tls.cert_pem != null and self.options.tls.key_pem != null;
             state.server_tls_cert_pem = self.options.tls.cert_pem;
@@ -203,7 +204,7 @@ pub const App = struct {
             .handler = handler,
             .context = context,
         };
-        for (self.windows.items) |*state| {
+        for (self.windows.items) |state| {
             state.state_mutex.lock();
             state.diagnostic_callback = &self.diagnostic_callback;
             state.state_mutex.unlock();
@@ -233,7 +234,7 @@ pub const App = struct {
 
     fn firstDiagnosticCallbackBindingMismatch(self: *const App) ?DiagnosticCallbackBindingMismatch {
         const expected = @intFromPtr(&self.diagnostic_callback);
-        for (self.windows.items) |*state| {
+        for (self.windows.items) |state| {
             const actual = @intFromPtr(state.diagnostic_callback);
             if (actual != expected) {
                 return .{
@@ -291,7 +292,13 @@ pub const App = struct {
             self.next_window_id += 1;
         }
 
-        var state = try WindowState.init(self.allocator, id, options, self.options, &self.diagnostic_callback);
+        for (self.windows.items) |state| {
+            if (state.id == id) return error.InvalidWindowId;
+        }
+
+        const state = try self.allocator.create(WindowState);
+        errdefer self.allocator.destroy(state);
+        state.* = try WindowState.init(self.allocator, id, options, self.options, &self.diagnostic_callback);
         errdefer state.deinit(self.allocator);
         try self.windows.append(state);
         const idx = self.windows.items.len - 1;
@@ -315,7 +322,7 @@ pub const App = struct {
         self.enforcePinnedMoveInvariant(.app);
         if (self.shutdown_requested) return;
 
-        for (self.windows.items) |*state| {
+        for (self.windows.items) |state| {
             if (!state.shown or state.connected_emitted) continue;
 
             if (state.last_html != null or state.last_file != null) {
@@ -347,7 +354,7 @@ pub const App = struct {
         self.enforcePinnedMoveInvariant(.app);
         self.shutdown_requested = true;
 
-        for (self.windows.items) |*state| {
+        for (self.windows.items) |state| {
             state.state_mutex.lock();
             state.close_requested.store(true, .release);
             state.notifyFrontendCloseLocked("app-shutdown", 250);
@@ -445,6 +452,14 @@ pub const Window = struct {
         defer win_state.state_mutex.unlock();
 
         try replaceOwned(self.app.allocator, &win_state.last_url, url);
+        if (win_state.last_html) |buf| {
+            self.app.allocator.free(buf);
+            win_state.last_html = null;
+        }
+        if (win_state.last_file) |buf| {
+            self.app.allocator.free(buf);
+            win_state.last_file = null;
+        }
         win_state.shown = true;
 
         if (win_state.isNativeWindowActive()) {
@@ -456,7 +471,7 @@ pub const Window = struct {
             if (core_runtime.openInBrowser(self.app.allocator, url, win_state.current_style, launch_options)) |launch| {
                 win_state.setLaunchedBrowserLaunch(self.app.allocator, launch);
             } else |err| {
-                _ = win_state.resolveAfterBrowserLaunchFailure(win_state.runtime_render_state.active_surface);
+                _ = try win_state.advanceAfterBrowserLaunchFailureLocked(win_state.runtime_render_state.active_surface);
                 win_state.rpc_state.logf(.warn, "[webui.browser] launch failed error={s}\n", .{@errorName(err)});
                 if (win_state.runtime_render_state.active_surface == .browser_window and win_state.launch_policy.app_mode_required) return err;
             }
@@ -968,7 +983,7 @@ pub const Window = struct {
     }
 
     pub fn state(self: *Window) *WindowState {
-        return &self.app.windows.items[self.index];
+        return self.app.windows.items[self.index];
     }
 
     fn emit(self: *Window, kind: EventKind, name: []const u8, payload: []const u8) void {
