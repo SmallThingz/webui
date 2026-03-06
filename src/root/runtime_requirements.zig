@@ -30,6 +30,7 @@ pub const ListOptions = struct {
     linux_webview_target: api_types.LinuxWebViewTarget = .webview,
 };
 
+/// Lists runtime requirements implied by the chosen launch policy and platform backend.
 pub fn list(allocator: std.mem.Allocator, options: ListOptions) ![]RuntimeRequirement {
     var out = std.array_list.Managed(RuntimeRequirement).init(allocator);
     errdefer out.deinit();

@@ -51,6 +51,7 @@ pub const WindowCapability = enum {
 
 pub const CloseHandler = *const fn (context: ?*anyopaque, window_id: usize) bool;
 
+/// Returns a style where every field from `patch` overwrites `base`.
 pub fn mergeStyle(base: WindowStyle, patch: WindowStyle) WindowStyle {
     var out = base;
     out.frameless = patch.frameless;
@@ -68,6 +69,7 @@ pub fn mergeStyle(base: WindowStyle, patch: WindowStyle) WindowStyle {
     return out;
 }
 
+/// Returns whether `needle` exists in `haystack`.
 pub fn hasCapability(needle: WindowCapability, haystack: []const WindowCapability) bool {
     for (haystack) |cap| {
         if (cap == needle) return true;

@@ -39,6 +39,7 @@ pub const LaunchPolicy = struct {
     app_mode_required: bool = true,
     allow_dual_surface: bool = false,
 
+    /// Returns the default native-webview-first launch policy.
     pub fn webviewFirst() LaunchPolicy {
         return .{
             .first = .native_webview,
@@ -47,6 +48,7 @@ pub const LaunchPolicy = struct {
         };
     }
 
+    /// Returns a browser-first launch policy suitable for external browser rendering.
     pub fn browserFirst() LaunchPolicy {
         return .{
             .first = .browser_window,
@@ -56,6 +58,7 @@ pub const LaunchPolicy = struct {
         };
     }
 
+    /// Returns a launch policy that serves only a regular browser URL.
     pub fn webUrlOnly() LaunchPolicy {
         return .{
             .first = .web_url,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("api_types.zig");
 
+/// Builds a TypeScript argument signature from a Zig function parameter list.
 pub fn buildTsArgSignature(allocator: std.mem.Allocator, comptime params: anytype) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
@@ -14,6 +15,7 @@ pub fn buildTsArgSignature(allocator: std.mem.Allocator, comptime params: anytyp
     return out.toOwnedSlice();
 }
 
+/// Returns the TypeScript type name for a Zig function return type.
 pub fn tsTypeNameForReturn(comptime return_type: type) []const u8 {
     if (@typeInfo(return_type) == .error_union) {
         const payload = @typeInfo(return_type).error_union.payload;
@@ -22,6 +24,7 @@ pub fn tsTypeNameForReturn(comptime return_type: type) []const u8 {
     return tsTypeNameForType(return_type);
 }
 
+/// Returns the TypeScript type name for a Zig type used by the RPC generator.
 pub fn tsTypeNameForType(comptime T: type) []const u8 {
     return switch (@typeInfo(T)) {
         .bool => "boolean",
@@ -37,6 +40,7 @@ pub fn tsTypeNameForType(comptime T: type) []const u8 {
     };
 }
 
+/// Builds a JSON-RPC invoker for a public function on `RpcStruct`.
 pub fn makeInvoker(comptime RpcStruct: type, comptime function_name: []const u8) types.RpcInvokeFn {
     return struct {
         fn invoke(allocator: std.mem.Allocator, args: []const std.json.Value) anyerror![]u8 {
@@ -74,6 +78,7 @@ pub fn makeInvoker(comptime RpcStruct: type, comptime function_name: []const u8)
     }.invoke;
 }
 
+/// Coerces a JSON value directly into the requested Zig parameter type.
 pub fn coerceJsonArg(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value) !T {
     return std.json.parseFromValueLeaky(T, allocator, value, .{}) catch |err| {
         if (err == error.OutOfMemory) return err;
@@ -81,6 +86,7 @@ pub fn coerceJsonArg(comptime T: type, allocator: std.mem.Allocator, value: std.
     };
 }
 
+/// Encodes a Zig value as a flat JSON payload for the RPC transport.
 pub fn encodeJsonValue(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.json.Stringify.valueAlloc(allocator, value, .{});
 }
