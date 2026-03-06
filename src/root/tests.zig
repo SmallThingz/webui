@@ -290,6 +290,36 @@ test "websocket upgrade uses same http server port" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
 }
 
+test "invalid websocket upgrade returns single 400 response" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "WsInvalidUpgrade" });
+    try win.showHtml("<html><body>ws-invalid-upgrade</body></html>");
+    try app.run();
+
+    const response = try httpRoundTripWithHeaders(
+        gpa.allocator(),
+        win.state().server_port,
+        "GET",
+        "/webui/ws",
+        null,
+        &.{
+            "Connection: Upgrade",
+        },
+    );
+    defer gpa.allocator().free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 400 Bad Request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "missing Upgrade header") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 404 Not Found") == null);
+}
+
 test "http server remains responsive after partial request disconnect bursts" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

@@ -118,12 +118,17 @@ pub const State = struct {
     ) !void {
         for (self.handlers.items) |*existing| {
             if (std.mem.eql(u8, existing.name, function_name)) {
+                const new_arg_signature = try allocator.dupe(u8, ts_arg_signature);
+                errdefer allocator.free(new_arg_signature);
+                const new_return_type = try allocator.dupe(u8, ts_return_type);
+                errdefer allocator.free(new_return_type);
+
                 existing.arity = arity;
                 existing.invoker = invoker;
                 allocator.free(existing.ts_arg_signature);
                 allocator.free(existing.ts_return_type);
-                existing.ts_arg_signature = try allocator.dupe(u8, ts_arg_signature);
-                existing.ts_return_type = try allocator.dupe(u8, ts_return_type);
+                existing.ts_arg_signature = new_arg_signature;
+                existing.ts_return_type = new_return_type;
                 return;
             }
         }
@@ -190,10 +195,13 @@ pub const State = struct {
         try self.ensureWorkerStarted();
 
         const task = try Task.init(allocator, payload_json);
-        errdefer task.deinit();
 
         self.queue_mutex.lock();
-        try self.queue.append(task);
+        self.queue.append(task) catch |err| {
+            self.queue_mutex.unlock();
+            task.deinit();
+            return err;
+        };
         self.queue_cond.signal();
         self.queue_mutex.unlock();
 
@@ -205,6 +213,7 @@ pub const State = struct {
 
         if (task.err) |err| {
             task.mutex.unlock();
+            task.deinit();
             return err;
         }
 
@@ -281,3 +290,20 @@ pub const State = struct {
         }
     }
 };
+
+test "threaded rpc invalid payload does not leak task state" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.testing.expect(status == .ok) catch unreachable;
+    }
+
+    var state = State.init(gpa.allocator(), .{});
+    defer state.deinit(gpa.allocator());
+    state.dispatcher_mode = .threaded;
+
+    try std.testing.expectError(
+        error.InvalidRpcPayload,
+        state.invokeFromJsonPayload(gpa.allocator(), "{not-json"),
+    );
+}

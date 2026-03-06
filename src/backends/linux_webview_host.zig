@@ -89,18 +89,28 @@ pub const Host = struct {
         }
         self.pump();
 
+        var force_destroy_window: ?*common.GtkWidget = null;
+
         self.mutex.lock();
         if (!self.closed.load(.acquire)) {
-            if (self.symbols) |symbols| {
-                if (self.window_widget) |window_widget| {
-                    symbols.destroyWindow(window_widget);
-                }
+            if (self.window_widget) |window_widget| {
+                force_destroy_window = window_widget;
             }
             self.closed.store(true, .release);
             self.ui_ready = false;
             self.shutdown_requested = true;
         }
+        self.mutex.unlock();
 
+        // GTK can synchronously emit "destroy", which re-enters onDestroy().
+        // Never hold the host mutex across native destroy calls.
+        if (force_destroy_window) |window_widget| {
+            if (self.symbols) |symbols| {
+                symbols.destroyWindow(window_widget);
+            }
+        }
+
+        self.mutex.lock();
         for (self.queue.items) |*cmd| cmd.deinit(self.allocator);
         self.queue.clearRetainingCapacity();
 
@@ -446,7 +456,9 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
             symbols.gtk_widget_show(window_widget);
         },
         .close => {
+            host.mutex.lock();
             host.shutdown_requested = true;
+            host.mutex.unlock();
             symbols.destroyWindow(window_widget);
         },
         .hide => symbols.gtk_widget_hide(window_widget),
