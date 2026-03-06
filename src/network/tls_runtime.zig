@@ -24,6 +24,7 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     auto_generate_if_missing: bool,
 
+    /// Initializes this value.
     pub fn init(allocator: std.mem.Allocator, options: TlsOptions) !Runtime {
         var runtime: Runtime = .{
             .enabled = options.enabled,
@@ -45,6 +46,7 @@ pub const Runtime = struct {
         return runtime;
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *Runtime) void {
         if (self.cert_pem) |cert| {
             self.allocator.free(cert);
@@ -60,6 +62,7 @@ pub const Runtime = struct {
         }
     }
 
+    /// \Uset certificate.
     pub fn setCertificate(self: *Runtime, cert_pem: []const u8, key_pem: []const u8) !void {
         try validatePemPair(cert_pem, key_pem);
 
@@ -81,6 +84,7 @@ pub const Runtime = struct {
         self.generated = false;
     }
 
+    /// Returns ensure certificate.
     pub fn ensureCertificate(self: *Runtime) !void {
         if (!self.enabled) return;
         if (self.cert_pem != null and self.key_pem != null) return;
@@ -88,6 +92,7 @@ pub const Runtime = struct {
         try self.generateDefaultCertificate();
     }
 
+    /// Returns info.
     pub fn info(self: *const Runtime) TlsInfo {
         const has_material = self.enabled and self.cert_pem != null and self.key_pem != null;
         return .{
@@ -99,6 +104,7 @@ pub const Runtime = struct {
         };
     }
 
+    /// Returns whether the material.
     pub fn hasMaterial(self: *const Runtime) bool {
         return self.enabled and self.cert_pem != null and self.key_pem != null;
     }

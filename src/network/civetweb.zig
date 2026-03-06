@@ -17,6 +17,7 @@ pub const types = struct {
         body: []const u8,
         headers: std.StringHashMap([]const u8),
 
+        /// Initializes this value.
         pub fn init(allocator: std.mem.Allocator) Request {
             return .{
                 .method = .get,
@@ -26,6 +27,7 @@ pub const types = struct {
             };
         }
 
+        /// Releases resources owned by this value.
         pub fn deinit(self: *Request) void {
             self.headers.deinit();
         }
@@ -39,6 +41,7 @@ pub const types = struct {
 };
 
 pub const handle_form = struct {
+    /// \Uparse form URL encoded.
     pub fn parseFormUrlEncoded(
         allocator: std.mem.Allocator,
         payload: []const u8,
@@ -60,6 +63,7 @@ pub const handle_form = struct {
 };
 
 pub const matcher = struct {
+    /// \Ustarts with ignore case.
     pub fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len > haystack.len) return false;
         return std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
@@ -67,6 +71,7 @@ pub const matcher = struct {
 };
 
 pub const md5 = struct {
+    /// Returns digest hex.
     pub fn digestHex(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         var hash: [16]u8 = undefined;
         std.crypto.hash.Md5.hash(input, &hash, .{});
@@ -75,6 +80,7 @@ pub const md5 = struct {
 };
 
 pub const response = struct {
+    /// Returns text.
     pub fn text(status: u16, body: []const u8) types.Response {
         return .{
             .status = status,
@@ -83,6 +89,7 @@ pub const response = struct {
         };
     }
 
+    /// Returns JSON.
     pub fn json(status: u16, body: []const u8) types.Response {
         return .{
             .status = status,
@@ -93,6 +100,7 @@ pub const response = struct {
 };
 
 pub const sha1 = struct {
+    /// Returns digest hex.
     pub fn digestHex(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         var hash: [20]u8 = undefined;
         std.crypto.hash.Sha1.hash(input, &hash, .{});
@@ -101,6 +109,7 @@ pub const sha1 = struct {
 };
 
 pub const sort = struct {
+    /// \Usort strings.
     pub fn sortStrings(items: [][]const u8) void {
         std.mem.sort([]const u8, items, {}, lessThan);
     }
@@ -114,14 +123,17 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     port: u16,
 
+    /// Initializes this value.
     pub fn init(allocator: std.mem.Allocator, port: u16) Server {
         return .{ .allocator = allocator, .port = port };
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *Server) void {
         _ = self;
     }
 
+    /// \Ustart.
     pub fn start(self: *Server) !void {
         if (self.port == 0) return error.InvalidPort;
     }

@@ -22,13 +22,6 @@ pub const RpcRegistry = struct {
 
     /// Registers every public function in `RpcStruct` and refreshes the generated bridge artifacts.
     pub fn register(self: RpcRegistry, comptime RpcStruct: type, options: RpcOptions) !void {
-        if (!std.mem.eql(u8, options.bridge_options.namespace, "webuiRpc") or
-            !std.mem.eql(u8, options.bridge_options.script_route, "/webui_bridge.js") or
-            !std.mem.eql(u8, options.bridge_options.rpc_route, "/webui/rpc"))
-        {
-            return error.BridgeOptionsMustUseDefaultsForComptimeGeneration;
-        }
-
         self.state.bridge_options = options.bridge_options;
         self.state.dispatcher_mode = options.dispatcher_mode;
         self.state.custom_dispatcher = options.custom_dispatcher;
@@ -66,8 +59,7 @@ pub const RpcRegistry = struct {
         }
 
         if (registered_count == 0) return error.NoRpcFunctions;
-        self.state.generated_script = RpcRegistry.generatedClientScriptComptime(RpcStruct, .{});
-        self.state.generated_typescript = RpcRegistry.generatedTypeScriptDeclarationsComptime(RpcStruct, .{});
+        try self.refreshGeneratedArtifacts();
     }
 
     /// Returns the generated JavaScript client bridge for the currently registered RPC surface.
@@ -114,5 +106,37 @@ pub const RpcRegistry = struct {
         const file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(self.generatedTypeScriptDeclarations());
+    }
+
+    /// Rebuilds the generated JavaScript and TypeScript bridge artifacts from the registered RPC handlers.
+    fn refreshGeneratedArtifacts(self: RpcRegistry) !void {
+        const functions = try self.functionMetas();
+        defer self.allocator.free(functions);
+
+        const render_options: bridge_template.RenderOptions = .{
+            .namespace = self.state.bridge_options.namespace,
+            .rpc_route = self.state.bridge_options.rpc_route,
+        };
+
+        const generated_script = try bridge_template.render(self.allocator, render_options, functions);
+        errdefer self.allocator.free(generated_script);
+        const generated_typescript = try bridge_template.renderTypeScriptDeclarations(self.allocator, render_options, functions);
+        errdefer self.allocator.free(generated_typescript);
+
+        self.state.replaceGeneratedArtifacts(self.allocator, generated_script, generated_typescript);
+    }
+
+    /// Builds the bridge template metadata for the currently registered RPC handlers.
+    fn functionMetas(self: RpcRegistry) ![]bridge_template.RpcFunctionMeta {
+        const functions = try self.allocator.alloc(bridge_template.RpcFunctionMeta, self.state.handlers.items.len);
+        for (self.state.handlers.items, 0..) |handler, idx| {
+            functions[idx] = .{
+                .name = handler.name,
+                .arity = handler.arity,
+                .ts_arg_signature = handler.ts_arg_signature,
+                .ts_return_type = handler.ts_return_type,
+            };
+        }
+        return functions;
     }
 };

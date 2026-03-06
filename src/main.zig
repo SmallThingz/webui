@@ -2,15 +2,18 @@ const std = @import("std");
 const webui = @import("webui");
 
 pub const rpc_methods = struct {
+    /// Returns add.
     pub fn add(a: i64, b: i64) i64 {
         return a + b;
     }
 
+    /// Returns version.
     pub fn version() []const u8 {
         return "webui-zig-manual-port";
     }
 };
 
+/// Returns main.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

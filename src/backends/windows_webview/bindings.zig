@@ -248,6 +248,7 @@ pub const Symbols = struct {
     loader: std.DynLib,
     create_environment: CreateCoreWebView2EnvironmentWithOptionsFn,
 
+    /// \Uload.
     pub fn load() !Symbols {
         var loader = try std.DynLib.open("WebView2Loader.dll");
         errdefer loader.close();
@@ -261,6 +262,7 @@ pub const Symbols = struct {
         };
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *Symbols) void {
         self.loader.close();
     }
@@ -273,10 +275,12 @@ pub const IID_ICoreWebView2Controller2 = win.GUID{
     .Data4 = [8]u8{ 0x92, 0xeb, 0x47, 0xee, 0x3f, 0xa9, 0x6e, 0xab },
 };
 
+/// Returns succeeded.
 pub inline fn succeeded(hr: HRESULT) bool {
     return hr >= 0;
 }
 
+/// \Urelease unknown.
 pub inline fn releaseUnknown(ptr: anytype) void {
     const value = ptr orelse return;
     _ = value.lpVtbl.Release(value);

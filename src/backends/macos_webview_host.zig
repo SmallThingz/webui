@@ -79,6 +79,7 @@ pub const Host = struct {
 
     explicit_hidden: bool = false,
 
+    /// \Ustart.
     pub fn start(allocator: std.mem.Allocator, title: []const u8, style: WindowStyle) !*Host {
         if (!runtimeAvailable()) return error.NativeBackendUnavailable;
 
@@ -116,6 +117,7 @@ pub const Host = struct {
         return host;
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *Host) void {
         self.enqueue(.shutdown) catch {};
 
@@ -134,26 +136,31 @@ pub const Host = struct {
         self.allocator.destroy(self);
     }
 
+    /// Returns whether the ready.
     pub fn isReady(self: *Host) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.ui_ready and !self.closed.load(.acquire);
     }
 
+    /// Returns whether the closed.
     pub fn isClosed(self: *Host) bool {
         return self.closed.load(.acquire);
     }
 
+    /// \Unavigate.
     pub fn navigate(self: *Host, url: []const u8) !void {
         const duped = try self.allocator.dupe(u8, url);
         errdefer self.allocator.free(duped);
         try self.enqueue(.{ .navigate = duped });
     }
 
+    /// \Uapply style.
     pub fn applyStyle(self: *Host, style: WindowStyle) !void {
         try self.enqueue(.{ .apply_style = style });
     }
 
+    /// \Ucontrol.
     pub fn control(self: *Host, cmd: WindowControl) !void {
         try self.enqueue(.{ .control = cmd });
     }
@@ -173,6 +180,7 @@ pub const Host = struct {
     }
 };
 
+/// Returns runtime available.
 pub fn runtimeAvailable() bool {
     if (builtin.os.tag != .macos) return false;
     var symbols = objc.Symbols.load() catch return false;

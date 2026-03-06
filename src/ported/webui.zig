@@ -90,11 +90,13 @@ pub const profile_base_prefix_hint: []const u8 = switch (builtin.os.tag) {
     else => "$XDG_CONFIG_HOME/",
 };
 
+/// Returns initialize runtime.
 pub fn initializeRuntime(enable_tls: bool, enable_log: bool) void {
     _ = enable_tls;
     _ = enable_log;
 }
 
+/// \Uopen in browser.
 pub fn openInBrowser(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -179,6 +181,7 @@ pub fn openInBrowser(
     return error.BrowserLaunchFailed;
 }
 
+/// \Uterminate browser process.
 pub fn terminateBrowserProcess(allocator: std.mem.Allocator, pid: i64) void {
     if (pid <= 0) return;
 
@@ -189,6 +192,7 @@ pub fn terminateBrowserProcess(allocator: std.mem.Allocator, pid: i64) void {
     }
 }
 
+/// \Ucleanup browser profile dir.
 pub fn cleanupBrowserProfileDir(
     allocator: std.mem.Allocator,
     profile_dir: []const u8,
@@ -200,6 +204,7 @@ pub fn cleanupBrowserProfileDir(
     allocator.free(profile_dir);
 }
 
+/// Returns whether the process alive.
 pub fn isProcessAlive(pid: i64) bool {
     if (pid <= 0) return false;
     return switch (builtin.os.tag) {
@@ -209,6 +214,7 @@ pub fn isProcessAlive(pid: i64) bool {
     };
 }
 
+/// Returns linked child exited.
 pub fn linkedChildExited(pid: i64) bool {
     if (pid <= 0) return true;
     return switch (builtin.os.tag) {
@@ -217,6 +223,7 @@ pub fn linkedChildExited(pid: i64) bool {
     };
 }
 
+/// \Ucontrol browser window.
 pub fn controlBrowserWindow(allocator: std.mem.Allocator, pid: i64, cmd: window_style_types.WindowControl) bool {
     if (pid <= 0) return false;
 
@@ -226,6 +233,7 @@ pub fn controlBrowserWindow(allocator: std.mem.Allocator, pid: i64, cmd: window_
     };
 }
 
+/// \Uopen URL in existing browser kind.
 pub fn openUrlInExistingBrowserKind(
     allocator: std.mem.Allocator,
     kind: browser_discovery.BrowserKind,
@@ -442,6 +450,7 @@ fn needsNativeStyleAwareBrowser(style: window_style_types.WindowStyle) bool {
         style.kiosk;
 }
 
+/// Returns whether the requested style in browser.
 pub fn supportsRequestedStyleInBrowser(kind: browser_discovery.BrowserKind, style: window_style_types.WindowStyle) bool {
     const is_chromium = supportsChromiumAppMode(kind);
     if ((style.transparent or style.frameless or style.corner_radius != null or style.position != null or style.size != null) and !is_chromium) {
@@ -540,6 +549,7 @@ const ResolvedProfile = struct {
     ownership: BrowserLaunchProfileOwnership = .none,
 };
 
+/// \Uresolve profile base prefix.
 pub fn resolveProfileBasePrefix(allocator: std.mem.Allocator) ![]u8 {
     const base = switch (builtin.os.tag) {
         .windows => std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch
@@ -560,6 +570,7 @@ pub fn resolveProfileBasePrefix(allocator: std.mem.Allocator) ![]u8 {
     return ensureTrailingSeparatorOwned(allocator, base);
 }
 
+/// Returns default webview profile path.
 pub fn defaultWebviewProfilePath(allocator: std.mem.Allocator) ![]u8 {
     const prefix = try resolveProfileBasePrefix(allocator);
     defer allocator.free(prefix);

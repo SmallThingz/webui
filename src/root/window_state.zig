@@ -110,6 +110,7 @@ pub const ScriptTask = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
 
+    /// Initializes this value.
     pub fn init(
         allocator: std.mem.Allocator,
         id: u64,
@@ -128,6 +129,7 @@ pub const ScriptTask = struct {
         return task;
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *ScriptTask) void {
         self.allocator.free(self.script);
         if (self.value_json) |value| self.allocator.free(value);
@@ -151,6 +153,7 @@ pub const FrontendRpcTask = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
 
+    /// Initializes this value.
     pub fn init(
         allocator: std.mem.Allocator,
         id: u64,
@@ -171,6 +174,7 @@ pub const FrontendRpcTask = struct {
         return task;
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *FrontendRpcTask) void {
         self.allocator.free(self.function_name);
         self.allocator.free(self.args_json);
@@ -186,6 +190,7 @@ pub const WsTransport = union(enum) {
     plain: std.net.Stream,
     tls: *https_server.Connection,
 
+    /// Reads bytes from this transport.
     pub fn read(self: *WsTransport, buffer: []u8) !usize {
         return switch (self.*) {
             .plain => |stream| if (builtin.os.tag == .windows)
@@ -196,6 +201,7 @@ pub const WsTransport = union(enum) {
         };
     }
 
+    /// Writes all bytes to this transport.
     pub fn writeAll(self: *WsTransport, bytes: []const u8) !void {
         return switch (self.*) {
             .plain => |stream| if (builtin.os.tag == .windows) blk: {
@@ -217,6 +223,7 @@ pub const WsTransport = union(enum) {
         };
     }
 
+    /// Shuts down this transport.
     pub fn shutdown(self: *WsTransport) void {
         switch (self.*) {
             .plain => |stream| stream.close(),
@@ -226,6 +233,7 @@ pub const WsTransport = union(enum) {
         }
     }
 
+    /// Releases any transport-side heap allocations.
     pub fn destroy(self: *WsTransport, allocator: std.mem.Allocator) void {
         _ = allocator;
         switch (self.*) {
@@ -317,6 +325,7 @@ pub const WindowState = struct {
     // a short grace window so refresh/reload reconnects do not kill the backend.
     const lifecycle_close_grace_ms: i64 = 2500;
 
+    /// Initializes this value.
     pub fn init(
         allocator: std.mem.Allocator,
         id: usize,
@@ -435,6 +444,7 @@ pub const WindowState = struct {
         return state;
     }
 
+    /// Resolves the active transport and fallback state while holding the window-state mutex.
     pub fn resolveActiveTransportLocked(self: *WindowState) void {
         self.runtime_render_state.launch_policy = self.launch_policy;
         self.runtime_render_state.using_system_fallback_launcher = false;
@@ -474,6 +484,7 @@ pub const WindowState = struct {
         self.runtime_render_state.fallback_reason = if (self.runtime_render_state.fallback_applied) last_fallback_reason else null;
     }
 
+    /// Copies style data into window-owned storage.
     pub fn setStyleOwned(self: *WindowState, allocator: std.mem.Allocator, style: WindowStyle) !void {
         if (self.style_icon_bytes) |buf| {
             allocator.free(buf);
@@ -501,6 +512,7 @@ pub const WindowState = struct {
         return self.runtime_render_state.active_transport == .native_webview and self.backend.isNative();
     }
 
+    /// Returns whether the native backend is currently active.
     pub fn isNativeWindowActive(self: *const WindowState) bool {
         return self.nativeTransportSelected();
     }
@@ -527,6 +539,7 @@ pub const WindowState = struct {
         self.emit(.close_requested, "close-accepted", "");
     }
 
+    /// Returns the currently effective native capability slice.
     pub fn capabilities(self: *const WindowState) []const WindowCapability {
         if (self.isNativeWindowActive()) {
             if (self.native_capabilities.len > 0) return self.native_capabilities;
@@ -537,6 +550,7 @@ pub const WindowState = struct {
         return &.{};
     }
 
+    /// Emits a window event through the registered callback.
     pub fn emit(self: *WindowState, kind: EventKind, name: []const u8, payload: []const u8) void {
         if (self.event_callback.handler) |handler| {
             const event = Event{
@@ -549,22 +563,26 @@ pub const WindowState = struct {
         }
     }
 
+    /// Requests that the window close and returns whether the close was accepted.
     pub fn requestClose(self: *WindowState) bool {
         if (!self.approveCloseRequestLocked()) return false;
         self.markCloseAccepted();
         return true;
     }
 
+    /// Clears the last warning message.
     pub fn clearWarning(self: *WindowState) void {
         self.last_warning = null;
     }
 
+    /// Stores the last warning message.
     pub fn setWarning(self: *WindowState, message: []const u8) void {
         self.last_warning = message;
         self.rpc_state.logf(.warn, "[webui.warning] window={d} {s}\n", .{ self.id, message });
         self.emit(.window_state, "warning", message);
     }
 
+    /// Maps a backend error into a warning message when appropriate.
     pub fn setWarningFromBackendError(self: *WindowState, err: anyerror) bool {
         if (backendWarningForError(err, self.window_fallback_emulation)) |message| {
             self.setWarning(message);
@@ -573,6 +591,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Applies style changes to the active backend or fallback surface.
     pub fn applyStyle(self: *WindowState, allocator: std.mem.Allocator, style: WindowStyle) !void {
         try self.setStyleOwned(allocator, style);
         self.clearWarning();
@@ -603,6 +622,7 @@ pub const WindowState = struct {
         return error.UnsupportedWindowStyle;
     }
 
+    /// Applies a native window control command.
     pub fn control(self: *WindowState, cmd: WindowControl) !WindowControlResult {
         self.emit(.window_state, "control", @tagName(cmd));
         self.clearWarning();
@@ -665,6 +685,7 @@ pub const WindowState = struct {
         };
     }
 
+    /// Emits a diagnostic event for this window.
     pub fn emitDiagnostic(
         self: *WindowState,
         code: []const u8,
@@ -686,6 +707,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Returns whether the current surface should expose the local HTTP server to a browser.
     pub fn shouldServeBrowser(self: *const WindowState) bool {
         if (self.runtime_render_state.active_surface != .native_webview) return true;
         // Native-webview mode still needs the local HTTP/WebSocket runtime so the
@@ -693,6 +715,7 @@ pub const WindowState = struct {
         return true;
     }
 
+    /// Records metadata for the currently launched browser process.
     pub fn setLaunchedBrowserLaunch(self: *WindowState, allocator: std.mem.Allocator, launch: core_runtime.BrowserLaunch) void {
         self.cleanupBrowserProfileDir(allocator);
         const requested_surface = self.runtime_render_state.active_surface;
@@ -772,6 +795,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Deletes the tracked browser profile directory when owned by the window.
     pub fn cleanupBrowserProfileDir(self: *WindowState, allocator: std.mem.Allocator) void {
         if (self.launched_browser_profile_dir) |dir| {
             core_runtime.cleanupBrowserProfileDir(allocator, dir, self.launched_browser_profile_ownership);
@@ -780,6 +804,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Drops ownership of the tracked browser profile directory without deleting it.
     pub fn releaseBrowserProfileDirWithoutDelete(self: *WindowState, allocator: std.mem.Allocator) void {
         if (self.launched_browser_profile_dir) |dir| {
             allocator.free(dir);
@@ -788,6 +813,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Clears tracked browser-process state and deletes owned profile data.
     pub fn clearTrackedBrowserState(self: *WindowState, allocator: std.mem.Allocator) void {
         self.launched_browser_pid = null;
         self.launched_browser_kind = null;
@@ -800,6 +826,7 @@ pub const WindowState = struct {
         self.runtime_render_state.using_system_fallback_launcher = false;
     }
 
+    /// Clears tracked browser-process state without deleting profile data.
     pub fn clearTrackedBrowserStateWithoutDelete(self: *WindowState, allocator: std.mem.Allocator) void {
         self.launched_browser_pid = null;
         self.launched_browser_kind = null;
@@ -812,12 +839,14 @@ pub const WindowState = struct {
         self.runtime_render_state.using_system_fallback_launcher = false;
     }
 
+    /// Returns whether the tracked browser process should be terminated during shutdown.
     pub fn shouldTerminateTrackedBrowserProcess(self: *const WindowState) bool {
         // Browser/web-first runs should close the browser tab via lifecycle signal,
         // not force-kill the whole browser process.
         return self.launch_policy.first == .native_webview;
     }
 
+    /// Marks the window closed after the tracked browser process exits.
     pub fn markClosedFromTrackedBrowserExit(self: *WindowState, allocator: std.mem.Allocator, event_name: []const u8) void {
         self.clearTrackedBrowserState(allocator);
         if (!self.close_requested.load(.acquire)) {
@@ -826,6 +855,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Reconciles tracked browser-process exit with window lifecycle state.
     pub fn reconcileChildExit(self: *WindowState, allocator: std.mem.Allocator) void {
         self.reconcilePendingLifecycleCloseLocked();
 
@@ -858,6 +888,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Starts the browser lifecycle close grace period after a frontend unload signal.
     pub fn requestLifecycleCloseFromFrontend(self: *WindowState) void {
         // Frontend lifecycle close is only used for browser-window mode.
         // For browser refresh, this should *not* terminate backend immediately.
@@ -872,6 +903,7 @@ pub const WindowState = struct {
         self.scheduleLifecycleCloseLocked();
     }
 
+    /// Terminates the tracked browser process if policy allows it.
     pub fn terminateLaunchedBrowser(self: *WindowState, allocator: std.mem.Allocator) void {
         const should_terminate = self.shouldTerminateTrackedBrowserProcess();
         if (self.launched_browser_pid) |pid| {
@@ -893,11 +925,13 @@ pub const WindowState = struct {
         }
     }
 
+    /// Builds the local render URL for the current window.
     pub fn localRenderUrl(self: *const WindowState, allocator: std.mem.Allocator) ![]u8 {
         const scheme = if (self.server_tls_enabled) "https" else "http";
         return std.fmt.allocPrint(allocator, "{s}://127.0.0.1:{d}/", .{ scheme, self.server_port });
     }
 
+    /// Returns browser launch options with window-specific overrides applied.
     pub fn effectiveBrowserLaunchOptions(self: *const WindowState, base: BrowserLaunchOptions) BrowserLaunchOptions {
         var out = base;
         if (self.runtime_render_state.active_surface == .native_webview) {
@@ -913,6 +947,7 @@ pub const WindowState = struct {
         return out;
     }
 
+    /// Returns whether the current launch policy wants a browser surface.
     pub fn shouldOpenBrowser(self: *const WindowState) bool {
         if (self.runtime_render_state.active_surface == .browser_window) return true;
         if (self.runtime_render_state.active_surface == .native_webview) {
@@ -924,6 +959,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Returns whether browser spawning should be attempted while holding the window-state mutex.
     pub fn shouldAttemptBrowserSpawnLocked(
         self: *WindowState,
         allocator: std.mem.Allocator,
@@ -940,6 +976,7 @@ pub const WindowState = struct {
         return true;
     }
 
+    /// Applies launch-policy fallback after a browser launch failure.
     pub fn resolveAfterBrowserLaunchFailure(self: *WindowState, failed_surface: LaunchSurface) bool {
         const next_surface = launchPolicyNextAfter(self.launch_policy, failed_surface) orelse return false;
         self.runtime_render_state.fallback_applied = true;
@@ -952,6 +989,7 @@ pub const WindowState = struct {
         return true;
     }
 
+    /// Advances to the next launch surface after a browser launch failure while holding the window-state mutex.
     pub fn advanceAfterBrowserLaunchFailureLocked(
         self: *WindowState,
         failed_surface: LaunchSurface,
@@ -982,6 +1020,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Ensures browser-backed rendering state and local server readiness.
     pub fn ensureBrowserRenderState(self: *WindowState, allocator: std.mem.Allocator, app_options: AppOptions) !void {
         if (!self.shouldServeBrowser()) return;
         try self.ensureServerStarted();
@@ -1013,6 +1052,7 @@ pub const WindowState = struct {
         connection_id: usize,
     };
 
+    /// Finds or creates a client session while holding the window-state mutex.
     pub fn findOrCreateClientSessionLocked(self: *WindowState, token: []const u8) !ClientRef {
         const now_ms = std.time.milliTimestamp();
         for (self.client_sessions.items) |*session| {
@@ -1043,6 +1083,7 @@ pub const WindowState = struct {
         };
     }
 
+    /// Queues a script task while holding the window-state mutex.
     pub fn queueScriptLocked(
         self: *WindowState,
         allocator: std.mem.Allocator,
@@ -1057,6 +1098,7 @@ pub const WindowState = struct {
         return task;
     }
 
+    /// Queues a frontend RPC task while holding the window-state mutex.
     pub fn queueFrontendRpcLocked(
         self: *WindowState,
         allocator: std.mem.Allocator,
@@ -1079,10 +1121,12 @@ pub const WindowState = struct {
         return task;
     }
 
+    /// Sends a text websocket message.
     pub fn sendWsTextLocked(_: *WindowState, transport: *WsTransport, payload: []const u8) !void {
         try net_io.writeWsFrameAny(transport, .text, payload);
     }
 
+    /// Registers a websocket connection while holding the window-state mutex.
     pub fn registerWsConnectionLocked(self: *WindowState, connection_id: usize, transport_value: anytype) !u64 {
         // Reconnect during unload/refresh grace period means the page is back.
         // Cancel any pending lifecycle close request.
@@ -1115,6 +1159,7 @@ pub const WindowState = struct {
         return generation;
     }
 
+    /// Unregisters a websocket connection generation while holding the window-state mutex.
     pub fn unregisterWsConnectionLocked(self: *WindowState, connection_id: usize, generation: u64) bool {
         for (self.ws_connections.items, 0..) |entry, idx| {
             if (entry.connection_id != connection_id) continue;
@@ -1125,6 +1170,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Updates disconnect bookkeeping for websocket state.
     pub fn noteWsDisconnectLocked(self: *WindowState, reason: []const u8) void {
         // Browser-window lifecycle should terminate backend when the window is
         // gone, even when explicit lifecycle "window_closing" is not delivered
@@ -1137,6 +1183,7 @@ pub const WindowState = struct {
         self.scheduleLifecycleCloseLocked();
     }
 
+    /// Closes one websocket connection while holding the window-state mutex.
     pub fn closeWsConnectionLocked(self: *WindowState, connection_id: usize) void {
         for (self.ws_connections.items, 0..) |*entry, idx| {
             if (entry.connection_id != connection_id) continue;
@@ -1156,6 +1203,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Closes all websocket connections while holding the window-state mutex.
     pub fn closeAllWsConnectionsLocked(self: *WindowState) void {
         for (self.ws_connections.items) |*entry| {
             entry.transport.shutdown();
@@ -1163,6 +1211,7 @@ pub const WindowState = struct {
         self.ws_connections.clearRetainingCapacity();
     }
 
+    /// Finds a websocket connection by id while holding the window-state mutex.
     pub fn findWsConnectionByIdLocked(self: *WindowState, connection_id: usize) ?*WsConnectionState {
         for (self.ws_connections.items) |*entry| {
             if (entry.connection_id == connection_id) return entry;
@@ -1170,11 +1219,13 @@ pub const WindowState = struct {
         return null;
     }
 
+    /// Returns the first websocket connection while holding the window-state mutex.
     pub fn firstWsConnectionLocked(self: *WindowState) ?*WsConnectionState {
         if (self.ws_connections.items.len == 0) return null;
         return &self.ws_connections.items[0];
     }
 
+    /// Returns the client id associated with a websocket connection.
     pub fn clientIdForConnectionLocked(self: *const WindowState, connection_id: usize) ?usize {
         for (self.client_sessions.items) |session| {
             if (session.connection_id == connection_id) return session.client_id;
@@ -1182,6 +1233,7 @@ pub const WindowState = struct {
         return null;
     }
 
+    /// Dispatches pending script tasks to connected frontend clients.
     pub fn dispatchPendingScriptTasksLocked(self: *WindowState) !void {
         var idx: usize = 0;
         while (idx < self.script_pending.items.len) {
@@ -1263,6 +1315,7 @@ pub const WindowState = struct {
         return payload.toOwnedSlice();
     }
 
+    /// Dispatches pending frontend RPC tasks to connected frontend clients.
     pub fn dispatchPendingFrontendRpcTasksLocked(self: *WindowState) !void {
         var idx: usize = 0;
         while (idx < self.frontend_rpc_pending.items.len) {
@@ -1307,6 +1360,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Queues a backend close signal while holding the window-state mutex.
     pub fn pushBackendCloseSignalLocked(self: *WindowState, reason: []const u8) !u64 {
         if (self.ws_connections.items.len == 0) return 0;
 
@@ -1341,6 +1395,7 @@ pub const WindowState = struct {
         return signal_id;
     }
 
+    /// Waits for frontend close acknowledgement while holding the window-state mutex.
     pub fn waitForCloseAckLocked(self: *WindowState, signal_id: u64, timeout_ms: u32) bool {
         if (signal_id == 0) return false;
         const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
@@ -1395,6 +1450,7 @@ pub const WindowState = struct {
         _ = self.requestClose();
     }
 
+    /// Notifies connected frontends about an impending close.
     pub fn notifyFrontendCloseLocked(self: *WindowState, reason: []const u8, timeout_ms: u32) void {
         const signal_id = self.pushBackendCloseSignalLocked(reason) catch 0;
         if (signal_id == 0) return;
@@ -1407,6 +1463,7 @@ pub const WindowState = struct {
         );
     }
 
+    /// Removes a script task from the pending queue.
     pub fn removeScriptPendingLocked(self: *WindowState, task: *ScriptTask) bool {
         for (self.script_pending.items, 0..) |pending, idx| {
             if (pending != task) continue;
@@ -1416,6 +1473,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Removes a script task from the inflight queue.
     pub fn removeScriptInflightLocked(self: *WindowState, task: *ScriptTask) bool {
         for (self.script_inflight.items, 0..) |inflight, idx| {
             if (inflight != task) continue;
@@ -1425,6 +1483,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Completes a script task with its result while holding the window-state mutex.
     pub fn completeScriptTaskLocked(
         self: *WindowState,
         task_id: u64,
@@ -1463,6 +1522,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Marks a script task as timed out.
     pub fn markScriptTimedOutLocked(self: *WindowState, task: *ScriptTask) void {
         _ = self.removeScriptPendingLocked(task);
         _ = self.removeScriptInflightLocked(task);
@@ -1473,6 +1533,7 @@ pub const WindowState = struct {
         task.mutex.unlock();
     }
 
+    /// Removes a frontend RPC task from the pending queue.
     pub fn removeFrontendRpcPendingLocked(self: *WindowState, task: *FrontendRpcTask) bool {
         for (self.frontend_rpc_pending.items, 0..) |pending, idx| {
             if (pending != task) continue;
@@ -1482,6 +1543,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Removes a frontend RPC task from the inflight queue.
     pub fn removeFrontendRpcInflightLocked(self: *WindowState, task: *FrontendRpcTask) bool {
         for (self.frontend_rpc_inflight.items, 0..) |inflight, idx| {
             if (inflight != task) continue;
@@ -1491,6 +1553,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Completes a frontend RPC task with its result while holding the window-state mutex.
     pub fn completeFrontendRpcTaskLocked(
         self: *WindowState,
         task_id: u64,
@@ -1529,6 +1592,7 @@ pub const WindowState = struct {
         return false;
     }
 
+    /// Marks a frontend RPC task as timed out.
     pub fn markFrontendRpcTimedOutLocked(self: *WindowState, task: *FrontendRpcTask) void {
         _ = self.removeFrontendRpcPendingLocked(task);
         _ = self.removeFrontendRpcInflightLocked(task);
@@ -1539,6 +1603,7 @@ pub const WindowState = struct {
         task.mutex.unlock();
     }
 
+    /// Processes an inbound websocket client message.
     pub fn handleWebSocketClientMessage(self: *WindowState, _: usize, data: []const u8) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
         defer parsed.deinit();
@@ -1647,6 +1712,7 @@ pub const WindowState = struct {
         self.state_mutex.unlock();
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *WindowState, allocator: std.mem.Allocator) void {
         self.stopServer();
 
@@ -1694,6 +1760,7 @@ pub const WindowState = struct {
         self.rpc_state.deinit(allocator);
     }
 
+    /// Starts the per-window local HTTP server when needed.
     pub fn ensureServerStarted(self: *WindowState) !void {
         if (self.server_thread != null) return;
         if (self.server_tls_enabled and (self.server_tls_cert_pem == null or self.server_tls_key_pem == null)) {
@@ -1719,6 +1786,7 @@ pub const WindowState = struct {
         if (!self.server_listen_ok) return error.ServerStartFailed;
     }
 
+    /// Waits until the local HTTP server is accepting connections.
     pub fn ensureServerReachable(self: *WindowState) !void {
         const address = try std.net.Address.parseIp4("127.0.0.1", self.server_port);
 
@@ -1735,6 +1803,7 @@ pub const WindowState = struct {
         return error.ServerStartTimeout;
     }
 
+    /// Stops the per-window local HTTP server and waits for workers to drain.
     pub fn stopServer(self: *WindowState) void {
         self.server_stop.store(true, .release);
         self.server_ready_cond.broadcast();
@@ -1755,6 +1824,7 @@ pub const WindowState = struct {
         self.connection_mutex.unlock();
     }
 
+    /// Runs the per-window HTTP server accept loop.
     pub fn serverThreadMain(self: *WindowState) void {
         const bind_host = if (self.server_bind_public) "0.0.0.0" else "127.0.0.1";
         const address = std.net.Address.parseIp4(bind_host, self.server_port) catch {
@@ -1810,6 +1880,7 @@ pub const WindowState = struct {
         }
     }
 
+    /// Handles one accepted HTTP or TLS connection.
     pub fn connectionThreadMain(self: *WindowState, stream: std.net.Stream) void {
         defer {
             self.connection_mutex.lock();

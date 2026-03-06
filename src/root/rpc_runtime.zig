@@ -45,6 +45,8 @@ pub const State = struct {
     handlers: std.array_list.Managed(HandlerEntry),
     generated_script: []const u8,
     generated_typescript: []const u8,
+    generated_script_owned: ?[]u8,
+    generated_typescript_owned: ?[]u8,
     bridge_options: api_types.BridgeOptions,
     dispatcher_mode: api_types.DispatcherMode,
     custom_dispatcher: ?api_types.CustomDispatcher,
@@ -61,11 +63,14 @@ pub const State = struct {
     log_enabled: bool,
     log_sink: logging.Sink,
 
+    /// Initializes RPC runtime state with the requested logging configuration.
     pub fn init(allocator: std.mem.Allocator, log_config: LogConfig) State {
         return .{
             .handlers = std.array_list.Managed(HandlerEntry).init(allocator),
             .generated_script = bridge_template.default_script,
             .generated_typescript = "export interface WebuiRpcClient {}\n",
+            .generated_script_owned = null,
+            .generated_typescript_owned = null,
             .bridge_options = .{},
             .dispatcher_mode = .sync,
             .custom_dispatcher = null,
@@ -83,12 +88,15 @@ pub const State = struct {
         };
     }
 
+    /// Emits an RPC log line through the configured sink when logging is enabled.
     pub inline fn logf(self: *const State, level: logging.Level, comptime fmt: []const u8, args: anytype) void {
         logging.emitf(self.log_sink, self.log_enabled, level, fmt, args);
     }
 
+    /// Releases registered handlers, generated bridge artifacts, and worker resources.
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.stopWorker();
+        self.replaceGeneratedArtifacts(allocator, null, null);
 
         self.queue_mutex.lock();
         while (self.queue.items.len > 0) {
@@ -107,6 +115,7 @@ pub const State = struct {
         self.handlers.deinit();
     }
 
+    /// Registers or replaces a typed RPC handler entry.
     pub fn addFunction(
         self: *State,
         allocator: std.mem.Allocator,
@@ -142,6 +151,22 @@ pub const State = struct {
         });
     }
 
+    /// Replaces the generated bridge artifacts and frees the previously owned copies.
+    pub fn replaceGeneratedArtifacts(
+        self: *State,
+        allocator: std.mem.Allocator,
+        generated_script: ?[]u8,
+        generated_typescript: ?[]u8,
+    ) void {
+        if (self.generated_script_owned) |owned| allocator.free(owned);
+        if (self.generated_typescript_owned) |owned| allocator.free(owned);
+
+        self.generated_script_owned = generated_script;
+        self.generated_typescript_owned = generated_typescript;
+        self.generated_script = generated_script orelse bridge_template.default_script;
+        self.generated_typescript = generated_typescript orelse "export interface WebuiRpcClient {}\n";
+    }
+
     fn findHandler(self: *const State, function_name: []const u8) ?HandlerEntry {
         for (self.handlers.items) |handler| {
             if (std.mem.eql(u8, handler.name, function_name)) return handler;
@@ -164,6 +189,7 @@ pub const State = struct {
         return try handler.invoker(allocator, args);
     }
 
+    /// Starts the threaded RPC worker when threaded dispatch is enabled.
     pub fn ensureWorkerStarted(self: *State) !void {
         self.worker_lifecycle_mutex.lock();
         defer self.worker_lifecycle_mutex.unlock();
@@ -199,6 +225,7 @@ pub const State = struct {
         }
     }
 
+    /// Invokes an RPC request payload using the configured dispatcher mode.
     pub fn invokeFromJsonPayload(self: *State, allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
         if (self.dispatcher_mode != .threaded) {
             return try self.invokeFromJsonPayloadSync(allocator, payload_json);

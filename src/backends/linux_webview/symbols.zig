@@ -147,6 +147,7 @@ pub const Symbols = struct {
     cairo_fill: ?*const fn (*common.cairo_t) callconv(.c) void = null,
     cairo_region_destroy: ?*const fn (*common.cairo_region_t) callconv(.c) void = null,
 
+    /// \Uload for.
     pub fn loadFor(target: RuntimeTarget) !Symbols {
         var syms: Symbols = undefined;
         try syms.loadDynLibs(target);
@@ -155,6 +156,7 @@ pub const Symbols = struct {
         return syms;
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *Symbols) void {
         _ = self;
         // Intentionally do not dlclose GTK/WebKit/GLib stacks at runtime.
@@ -165,6 +167,7 @@ pub const Symbols = struct {
         // Process-exit cleanup is sufficient for this host runtime.
     }
 
+    /// Returns init toolkit.
     pub fn initToolkit(self: *const Symbols) void {
         if (self.gtk_api == .gtk4) {
             if (self.gtk_init_gtk4) |init| {
@@ -175,6 +178,7 @@ pub const Symbols = struct {
         if (self.gtk_init_gtk3) |init| init(null, null);
     }
 
+    /// Returns new top level window.
     pub fn newTopLevelWindow(self: *const Symbols) ?*common.GtkWidget {
         return switch (self.gtk_api) {
             .gtk3 => if (self.gtk_window_new_gtk3) |create| create(common.GTK_WINDOW_TOPLEVEL) else null,
@@ -182,6 +186,7 @@ pub const Symbols = struct {
         };
     }
 
+    /// Returns add window child.
     pub fn addWindowChild(self: *const Symbols, window_widget: *common.GtkWidget, child_widget: *common.GtkWidget) ?*common.GtkWidget {
         switch (self.gtk_api) {
             .gtk3 => {
@@ -212,15 +217,18 @@ pub const Symbols = struct {
         }
     }
 
+    /// \Ushow window.
     pub fn showWindow(self: *const Symbols, window_widget: *common.GtkWidget, child_widget: *common.GtkWidget) void {
         self.gtk_widget_show(child_widget);
         self.gtk_widget_show(window_widget);
     }
 
+    /// \Uqueue widget draw.
     pub fn queueWidgetDraw(self: *const Symbols, widget: *common.GtkWidget) void {
         if (self.gtk_widget_queue_draw) |queue_draw| queue_draw(widget);
     }
 
+    /// \Udestroy window.
     pub fn destroyWindow(self: *const Symbols, window_widget: *common.GtkWidget) void {
         switch (self.gtk_api) {
             .gtk3 => {
@@ -241,14 +249,17 @@ pub const Symbols = struct {
         }
     }
 
+    /// \Uset window position center.
     pub fn setWindowPositionCenter(self: *const Symbols, window: *common.GtkWindow) void {
         if (self.gtk_window_set_position) |set_pos| set_pos(window, common.GTK_WIN_POS_CENTER);
     }
 
+    /// \Uset window position.
     pub fn setWindowPosition(self: *const Symbols, window: *common.GtkWindow, x: c_int, y: c_int) void {
         if (self.gtk_window_move) |move| move(window, x, y);
     }
 
+    /// \Uapply transparent visual.
     pub fn applyTransparentVisual(self: *const Symbols, window_widget: *common.GtkWidget) void {
         switch (self.gtk_api) {
             .gtk3 => {
@@ -269,6 +280,7 @@ pub const Symbols = struct {
         }
     }
 
+    /// \Uapply gtk4 window style.
     pub fn applyGtk4WindowStyle(
         self: *const Symbols,
         window_widget: *common.GtkWidget,
@@ -318,6 +330,7 @@ pub const Symbols = struct {
         }
     }
 
+    /// \Uminimize window.
     pub fn minimizeWindow(self: *const Symbols, window: *common.GtkWindow) void {
         if (self.gtk_window_iconify) |iconify| {
             iconify(window);
@@ -326,6 +339,7 @@ pub const Symbols = struct {
         if (self.gtk_window_minimize) |minimize| minimize(window);
     }
 
+    /// \Uset window min size.
     pub fn setWindowMinSize(self: *const Symbols, window_widget: *common.GtkWidget, min_size: ?common.Size) void {
         const set_size = self.gtk_widget_set_size_request orelse return;
         if (min_size) |size| {
@@ -335,6 +349,7 @@ pub const Symbols = struct {
         }
     }
 
+    /// \Uset window kiosk.
     pub fn setWindowKiosk(self: *const Symbols, window: *common.GtkWindow, enabled: bool) void {
         if (enabled) {
             if (self.gtk_window_fullscreen) |fullscreen| fullscreen(window);
@@ -343,6 +358,7 @@ pub const Symbols = struct {
         }
     }
 
+    /// \Uset window high contrast.
     pub fn setWindowHighContrast(
         self: *const Symbols,
         window_widget: *common.GtkWidget,
@@ -380,6 +396,7 @@ pub const Symbols = struct {
         }
     }
 
+    /// \Uset window icon from path.
     pub fn setWindowIconFromPath(self: *const Symbols, window_widget: *common.GtkWidget, path_z: [*:0]const u8) void {
         const window: *common.GtkWindow = @ptrCast(window_widget);
 
@@ -421,6 +438,7 @@ pub const Symbols = struct {
         set_icon_list(@ptrCast(surface), list);
     }
 
+    /// \Uclear window icon.
     pub fn clearWindowIcon(self: *const Symbols, window_widget: *common.GtkWidget) void {
         const window: *common.GtkWindow = @ptrCast(window_widget);
 
@@ -440,6 +458,7 @@ pub const Symbols = struct {
         set_icon_list(@ptrCast(surface), null);
     }
 
+    /// Returns whether the rounded shape.
     pub fn supportsRoundedShape(self: *const Symbols) bool {
         return self.gtk_widget_shape_combine_region != null and
             self.gtk_widget_input_shape_combine_region != null and
@@ -458,6 +477,7 @@ pub const Symbols = struct {
             self.cairo_region_destroy != null;
     }
 
+    /// \Uset rounded region.
     pub fn setRoundedRegion(self: *const Symbols, window_widget: *common.GtkWidget, region: ?*common.cairo_region_t) void {
         if (self.gtk_widget_shape_combine_region) |shape| shape(window_widget, region);
         if (self.gtk_widget_input_shape_combine_region) |input_shape| input_shape(window_widget, region);

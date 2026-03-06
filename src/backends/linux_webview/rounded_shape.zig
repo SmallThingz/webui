@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const symbols_mod = @import("symbols.zig");
 
+/// Applies a rounded clip region to a GTK toplevel window when the runtime supports it.
 pub fn applyRoundedWindowShape(
     symbols: *const symbols_mod.Symbols,
     corner_radius: ?u16,

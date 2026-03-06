@@ -18,6 +18,7 @@ pub const Symbols = struct {
     autorelease_pool_push: ObjcAutoreleasePoolPushFn,
     autorelease_pool_pop: ObjcAutoreleasePoolPopFn,
 
+    /// \Uload.
     pub fn load() !Symbols {
         var objc = try std.DynLib.open("/usr/lib/libobjc.A.dylib");
         errdefer objc.close();
@@ -46,6 +47,7 @@ pub const Symbols = struct {
         };
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *Symbols) void {
         self.webkit.close();
         self.appkit.close();

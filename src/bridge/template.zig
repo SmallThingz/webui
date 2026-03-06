@@ -13,6 +13,7 @@ pub const RenderOptions = struct {
     rpc_route: []const u8 = "/webui/rpc",
 };
 
+/// Renders the runtime JavaScript bridge using the embedded helper implementation.
 pub fn render(
     allocator: std.mem.Allocator,
     options: RenderOptions,
@@ -21,6 +22,7 @@ pub fn render(
     return renderWithRuntimeHelpers(allocator, options, functions, helpers.embedded_runtime_helpers_js);
 }
 
+/// Renders the runtime JavaScript bridge using the file-written helper implementation.
 pub fn renderForWrittenOutput(
     allocator: std.mem.Allocator,
     options: RenderOptions,
@@ -92,6 +94,7 @@ fn writeJsonLiteral(
     try writer.writeAll(encoded);
 }
 
+/// Renders the JavaScript bridge for `RpcStruct` at comptime.
 pub fn renderComptime(comptime RpcStruct: type, comptime options: RenderOptions) []const u8 {
     const info = @typeInfo(RpcStruct);
     if (info != .@"struct") @compileError("RpcStruct must be a struct");
@@ -132,6 +135,7 @@ pub fn renderComptime(comptime RpcStruct: type, comptime options: RenderOptions)
     return out;
 }
 
+/// Renders TypeScript declarations for the provided RPC function metadata.
 pub fn renderTypeScriptDeclarations(
     allocator: std.mem.Allocator,
     options: RenderOptions,
@@ -176,6 +180,7 @@ pub fn renderTypeScriptDeclarations(
     return out.toOwnedSlice();
 }
 
+/// Renders TypeScript declarations for `RpcStruct` at comptime.
 pub fn renderTypeScriptDeclarationsComptime(comptime RpcStruct: type, comptime options: RenderOptions) []const u8 {
     const info = @typeInfo(RpcStruct);
     if (info != .@"struct") @compileError("RpcStruct must be a struct");

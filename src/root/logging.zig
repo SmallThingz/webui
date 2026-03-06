@@ -14,6 +14,7 @@ pub const Sink = struct {
     context: ?*anyopaque = null,
 };
 
+/// Emits a formatted log message through the configured sink or stdout fallback.
 pub fn emitf(sink: Sink, enabled: bool, level: Level, comptime fmt: []const u8, args: anytype) void {
     if (!enabled) return;
     if (sink.handler) |handler| {

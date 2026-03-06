@@ -9,6 +9,7 @@ pub const Connection = struct {
     writer: std.net.Stream.Writer = undefined,
     tls_conn: tls.Connection = undefined,
 
+    /// Returns init server.
     pub fn initServer(
         allocator: std.mem.Allocator,
         stream: std.net.Stream,
@@ -38,20 +39,24 @@ pub const Connection = struct {
         return conn;
     }
 
+    /// \Uread.
     pub fn read(self: *Connection, buffer: []u8) !usize {
         return self.tls_conn.read(buffer);
     }
 
+    /// \Uwrite all.
     pub fn writeAll(self: *Connection, bytes: []const u8) !void {
         try self.tls_conn.writeAll(bytes);
     }
 
+    /// Returns close.
     pub fn close(self: *Connection) void {
         self.tls_conn.close() catch {};
         self.stream.close();
     }
 };
 
+/// \Upeek first byte.
 pub fn peekFirstByte(stream: std.net.Stream) !?u8 {
     var byte: [1]u8 = undefined;
     const n = std.posix.recv(stream.handle, &byte, std.posix.MSG.PEEK) catch |err| switch (err) {
@@ -66,6 +71,7 @@ pub fn peekFirstByte(stream: std.net.Stream) !?u8 {
     return byte[0];
 }
 
+/// Returns whether the TLS client hello.
 pub fn looksLikeTlsClientHello(first_byte: u8) bool {
     // TLS record content-type handshake.
     return first_byte == 0x16;

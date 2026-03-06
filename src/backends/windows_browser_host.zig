@@ -6,6 +6,7 @@ pub const LaunchResult = struct {
     is_child_process: bool = true,
 };
 
+/// Launches a browser process and returns tracked process metadata when successful.
 pub fn launchTracked(
     allocator: std.mem.Allocator,
     browser_path: []const u8,
@@ -18,6 +19,7 @@ pub fn launchTracked(
     return try launchWindowsPowershell(allocator, "pwsh", script);
 }
 
+/// Opens a URL using an existing browser installation path.
 pub fn openUrlInExistingInstall(
     allocator: std.mem.Allocator,
     browser_path: []const u8,
@@ -27,6 +29,7 @@ pub fn openUrlInExistingInstall(
     return launched != null;
 }
 
+/// Terminates a tracked browser process on Windows.
 pub fn terminateProcess(allocator: std.mem.Allocator, pid_value: i64) void {
     if (pid_value <= 0) return;
 
@@ -36,6 +39,7 @@ pub fn terminateProcess(allocator: std.mem.Allocator, pid_value: i64) void {
     _ = runCommandNoCapture(allocator, &.{ "taskkill", "/PID", pid_text, "/T", "/F" }) catch {};
 }
 
+/// Returns whether the tracked browser process is still alive.
 pub fn isProcessAlive(allocator: std.mem.Allocator, pid_value: i64) bool {
     if (pid_value <= 0) return false;
 
@@ -51,6 +55,7 @@ pub fn isProcessAlive(allocator: std.mem.Allocator, pid_value: i64) bool {
     return std.mem.indexOf(u8, out, pid_text) != null;
 }
 
+/// Applies a coarse native window control action to the launched browser process.
 pub fn controlWindow(allocator: std.mem.Allocator, pid: i64, cmd: window_style_types.WindowControl) bool {
     if (pid <= 0) return false;
 

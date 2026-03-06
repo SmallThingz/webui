@@ -76,6 +76,7 @@ const env_browser_keys = [_][]const u8{
     "BROWSER",
 };
 
+/// \Udiscover installed browsers.
 pub fn discoverInstalledBrowsers(allocator: std.mem.Allocator) ![]BrowserInstall {
     var installs = std.array_list.Managed(BrowserInstall).init(allocator);
     var dedup = std.StringHashMap(usize).init(allocator);
@@ -107,6 +108,7 @@ pub fn discoverInstalledBrowsers(allocator: std.mem.Allocator) ![]BrowserInstall
     return out;
 }
 
+/// \Ufree installs.
 pub fn freeInstalls(allocator: std.mem.Allocator, installs: []const BrowserInstall) void {
     for (installs) |install| allocator.free(install.path);
     allocator.free(installs);

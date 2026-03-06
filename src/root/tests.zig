@@ -1622,8 +1622,8 @@ test "typed rpc registration, invocation, and bridge generation" {
     try std.testing.expect(std.mem.indexOf(u8, written_script, "async function webuiInvoke(endpoint, name, args)") != null);
 
     const dts = win.rpcTypeDeclarations();
-    try std.testing.expect(std.mem.indexOf(u8, dts, "sum(...args: unknown[]): Promise<unknown>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dts, "ping(...args: unknown[]): Promise<unknown>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dts, "sum(arg0: number, arg1: number): Promise<number>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dts, "ping(): Promise<string>;") != null);
 
     const payload = "{\"name\":\"sum\",\"args\":[2,3]}";
     const result = try win.state().rpc_state.invokeFromJsonPayload(gpa.allocator(), payload);

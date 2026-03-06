@@ -124,11 +124,13 @@ fn decodeWsOpcode(byte: u8) !WsInboundType {
     };
 }
 
+/// Reads a single inbound websocket frame from any supported transport.
 pub fn readWsInboundFrameAllocAny(allocator: std.mem.Allocator, conn: anytype, max_payload_size: usize) !WsInboundFrame {
     var prebuffer: []const u8 = "";
     return readWsInboundFrameAllocBufferedAny(allocator, conn, &prebuffer, max_payload_size);
 }
 
+/// Reads a websocket frame while first consuming any bytes already buffered after an HTTP upgrade.
 pub fn readWsInboundFrameAllocBufferedAny(
     allocator: std.mem.Allocator,
     conn: anytype,
@@ -186,10 +188,12 @@ pub fn readWsInboundFrameAllocBufferedAny(
     };
 }
 
+/// Reads a single inbound websocket frame from a plain TCP stream.
 pub fn readWsInboundFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream, max_payload_size: usize) !WsInboundFrame {
     return readWsInboundFrameAllocAny(allocator, stream, max_payload_size);
 }
 
+/// Returns whether a comma-separated header value contains `token`, case-insensitively.
 pub fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |part| {
@@ -199,6 +203,7 @@ pub fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
     return false;
 }
 
+/// Writes the websocket upgrade response for `sec_key` to any supported transport.
 pub fn writeWebSocketHandshakeResponseAny(conn: anytype, sec_key: []const u8) !void {
     var sha1_digest: [20]u8 = undefined;
     var hasher = std.crypto.hash.Sha1.init(.{});
@@ -222,14 +227,17 @@ pub fn writeWebSocketHandshakeResponseAny(conn: anytype, sec_key: []const u8) !v
     try writeConnAll(conn, response);
 }
 
+/// Writes the websocket upgrade response to a plain TCP stream.
 pub fn writeWebSocketHandshakeResponse(stream: std.net.Stream, sec_key: []const u8) !void {
     try writeWebSocketHandshakeResponseAny(stream, sec_key);
 }
 
+/// Returns the request path without any query string.
 pub fn pathWithoutQuery(path: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, path, '?')) |q| path[0..q] else path;
 }
 
+/// Extracts the websocket `client_id` query parameter or returns `default_client_token`.
 pub fn wsClientTokenFromUrl(url: []const u8, default_client_token: []const u8) []const u8 {
     const query_start = std.mem.indexOfScalar(u8, url, '?') orelse return default_client_token;
     var pair_it = std.mem.splitScalar(u8, url[query_start + 1 ..], '&');
@@ -245,6 +253,7 @@ pub fn wsClientTokenFromUrl(url: []const u8, default_client_token: []const u8) [
     return default_client_token;
 }
 
+/// Looks up an HTTP header value by name from a raw header block.
 pub fn httpHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, headers, "\r\n");
     while (it.next()) |line| {
@@ -257,6 +266,7 @@ pub fn httpHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Reads and parses a complete HTTP request from any supported transport.
 pub fn readHttpRequestAny(allocator: std.mem.Allocator, conn: anytype) !HttpRequest {
     var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
@@ -324,6 +334,7 @@ pub fn readHttpRequestAny(allocator: std.mem.Allocator, conn: anytype) !HttpRequ
     };
 }
 
+/// Reads and parses a complete HTTP request from a plain TCP stream.
 pub fn readHttpRequest(allocator: std.mem.Allocator, stream: std.net.Stream) !HttpRequest {
     return readHttpRequestAny(allocator, stream);
 }
@@ -341,6 +352,7 @@ fn parseContentLength(headers: []const u8) ?usize {
     return null;
 }
 
+/// Writes a complete HTTP response to any supported transport.
 pub fn writeHttpResponseAny(conn: anytype, status: u16, content_type: []const u8, body: []const u8) !void {
     var header_buf: [512]u8 = undefined;
     const status_text = switch (status) {
@@ -364,10 +376,12 @@ pub fn writeHttpResponseAny(conn: anytype, status: u16, content_type: []const u8
     try writeConnAll(conn, body);
 }
 
+/// Writes a complete HTTP response to a plain TCP stream.
 pub fn writeHttpResponse(stream: std.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
     return writeHttpResponseAny(stream, status, content_type, body);
 }
 
+/// Writes a `308 Permanent Redirect` response to any supported transport.
 pub fn writeHttpRedirectAny(conn: anytype, location: []const u8) !void {
     var header_buf: [1024]u8 = undefined;
     const header = try std.fmt.bufPrint(
@@ -378,6 +392,7 @@ pub fn writeHttpRedirectAny(conn: anytype, location: []const u8) !void {
     try writeConnAll(conn, header);
 }
 
+/// Writes a websocket frame to any supported transport.
 pub fn writeWsFrameAny(conn: anytype, opcode: websocket.OpCode, payload: []const u8) !void {
     var header_buf: [10]u8 = undefined;
     const header = websocket.proto.writeFrameHeader(&header_buf, opcode, payload.len, false);
@@ -387,6 +402,7 @@ pub fn writeWsFrameAny(conn: anytype, opcode: websocket.OpCode, payload: []const
     }
 }
 
+/// Returns a basic content type guess derived from `path`'s extension.
 pub fn contentTypeForPath(path: []const u8) []const u8 {
     const ext = std.fs.path.extension(path);
     if (std.mem.eql(u8, ext, ".html") or std.mem.eql(u8, ext, ".htm")) return "text/html; charset=utf-8";
@@ -399,6 +415,7 @@ pub fn contentTypeForPath(path: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
+/// Reads the entire stream into memory up to `max_bytes`.
 pub fn readAllFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
@@ -437,6 +454,7 @@ pub fn readAllFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, m
     return out.toOwnedSlice();
 }
 
+/// Performs a simple localhost HTTP request without extra headers.
 pub fn httpRoundTrip(
     allocator: std.mem.Allocator,
     port: u16,
@@ -447,6 +465,7 @@ pub fn httpRoundTrip(
     return httpRoundTripWithHeaders(allocator, port, method, path, body, &.{});
 }
 
+/// Performs a simple localhost HTTP request with additional raw headers.
 pub fn httpRoundTripWithHeaders(
     allocator: std.mem.Allocator,
     port: u16,
@@ -484,6 +503,7 @@ pub fn httpRoundTripWithHeaders(
     return readAllFromStream(allocator, stream, 1024 * 1024);
 }
 
+/// Reads just the HTTP header section from a stream.
 pub fn readHttpHeadersFromStream(allocator: std.mem.Allocator, stream: std.net.Stream, max_bytes: usize) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
@@ -510,6 +530,7 @@ pub fn readHttpHeadersFromStream(allocator: std.mem.Allocator, stream: std.net.S
     return out.toOwnedSlice();
 }
 
+/// Returns the body slice from a raw HTTP response buffer.
 pub fn httpResponseBody(response: []const u8) []const u8 {
     const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
     return response[header_end + 4 ..];

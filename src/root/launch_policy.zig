@@ -1,5 +1,6 @@
 const types = @import("api_types.zig");
 
+/// Returns the launch surfaces in effective priority order with duplicates removed.
 pub fn order(policy: types.LaunchPolicy) [3]?types.LaunchSurface {
     var out: [3]?types.LaunchSurface = .{ null, null, null };
     var write_idx: usize = 0;
@@ -24,6 +25,7 @@ pub fn order(policy: types.LaunchPolicy) [3]?types.LaunchSurface {
     return out;
 }
 
+/// Returns whether `policy` contains the requested launch surface.
 pub fn contains(policy: types.LaunchPolicy, surface: types.LaunchSurface) bool {
     const ordered = order(policy);
     for (ordered) |candidate| {
@@ -33,6 +35,7 @@ pub fn contains(policy: types.LaunchPolicy, surface: types.LaunchSurface) bool {
     return false;
 }
 
+/// Returns the next distinct launch surface after `current`, if any.
 pub fn nextAfter(policy: types.LaunchPolicy, current: types.LaunchSurface) ?types.LaunchSurface {
     const ordered = order(policy);
     var found = false;

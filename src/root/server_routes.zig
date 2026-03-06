@@ -10,6 +10,7 @@ const WebSocketUpgradeResult = enum {
     upgraded,
 };
 
+/// Handles one HTTP connection and returns whether websocket ownership transferred to a worker thread.
 pub fn handleConnection(
     state: anytype,
     allocator: std.mem.Allocator,

@@ -46,6 +46,7 @@ fn onWindowsCtrl(ctrl_type: std.os.windows.DWORD) callconv(.winapi) std.os.windo
     return std.os.windows.TRUE;
 }
 
+/// Installs process signal handlers once for the current platform.
 pub fn install() void {
     if (installed.swap(true, .acq_rel)) return;
 
@@ -56,24 +57,29 @@ pub fn install() void {
     }
 }
 
+/// Returns whether a termination signal has been observed.
 pub fn stopRequested() bool {
     return caught_signal.load(.acquire) != 0;
 }
 
+/// Returns the first caught signal number, or `0` when none has been observed.
 pub fn caughtSignal() i32 {
     return caught_signal.load(.acquire);
 }
 
+/// Clears the recorded signal state.
 pub fn reset() void {
     caught_signal.store(0, .release);
 }
 
+/// Maps the recorded signal to a conventional shell exit code.
 pub fn exitCode() u8 {
     const sig = caughtSignal();
     if (sig <= 0 or sig > 127) return 1;
     return @as(u8, @intCast(128 + sig));
 }
 
+/// Terminates the current process using the recorded signal-derived exit code.
 pub fn terminateProcess() noreturn {
     const code = exitCode();
     if (builtin.os.tag == .windows) {

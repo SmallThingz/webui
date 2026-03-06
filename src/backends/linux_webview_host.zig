@@ -53,6 +53,7 @@ pub const Host = struct {
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: bool = false,
 
+    /// \Ustart.
     pub fn start(
         allocator: std.mem.Allocator,
         title: []const u8,
@@ -79,6 +80,7 @@ pub const Host = struct {
         return host;
     }
 
+    /// Releases resources owned by this value.
     pub fn deinit(self: *Host) void {
         _ = self.enqueue(.shutdown) catch {};
 
@@ -129,30 +131,36 @@ pub const Host = struct {
         self.allocator.destroy(self);
     }
 
+    /// Returns whether the ready.
     pub fn isReady(self: *Host) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.ui_ready and !self.closed.load(.acquire);
     }
 
+    /// Returns whether the closed.
     pub fn isClosed(self: *Host) bool {
         return self.closed.load(.acquire);
     }
 
+    /// \Unavigate.
     pub fn navigate(self: *Host, url: []const u8) !void {
         const duped = try self.allocator.dupe(u8, url);
         errdefer self.allocator.free(duped);
         try self.enqueue(.{ .navigate = duped });
     }
 
+    /// \Uapply style.
     pub fn applyStyle(self: *Host, style: WindowStyle) !void {
         try self.enqueue(.{ .apply_style = style });
     }
 
+    /// \Ucontrol.
     pub fn control(self: *Host, cmd: WindowControl) !void {
         try self.enqueue(.{ .control = cmd });
     }
 
+    /// Returns pump.
     pub fn pump(self: *Host) void {
         drainCommandsUiThread(self);
 
@@ -237,6 +245,7 @@ fn initOnCurrentThread(host: *Host) !void {
     should_destroy_window = false;
 }
 
+/// Returns runtime available for.
 pub fn runtimeAvailableFor(target: RuntimeTarget) bool {
     const cache_ptr = switch (target) {
         .webview => &probe_cache_webview,

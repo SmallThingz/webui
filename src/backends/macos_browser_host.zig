@@ -6,6 +6,7 @@ pub const LaunchResult = struct {
     is_child_process: bool = true,
 };
 
+/// Launches a browser process and returns tracked process metadata when successful.
 pub fn launchTracked(
     allocator: std.mem.Allocator,
     browser_path: []const u8,
@@ -27,6 +28,7 @@ pub fn launchTracked(
     return .{ .pid = @as(i64, @intCast(child.id)), .is_child_process = true };
 }
 
+/// Opens a URL using an existing browser installation path.
 pub fn openUrlInExistingInstall(
     allocator: std.mem.Allocator,
     browser_path: []const u8,
@@ -36,6 +38,7 @@ pub fn openUrlInExistingInstall(
     return launched != null;
 }
 
+/// Terminates a tracked browser process on macOS.
 pub fn terminateProcess(_: std.mem.Allocator, pid_value: i64) void {
     if (pid_value <= 0) return;
     const pid: std.posix.pid_t = @intCast(pid_value);
@@ -43,6 +46,7 @@ pub fn terminateProcess(_: std.mem.Allocator, pid_value: i64) void {
     std.posix.kill(pid, std.posix.SIG.KILL) catch {};
 }
 
+/// Returns whether the tracked browser process is still alive.
 pub fn isProcessAlive(_: std.mem.Allocator, pid_value: i64) bool {
     if (pid_value <= 0) return false;
 
@@ -56,6 +60,7 @@ pub fn isProcessAlive(_: std.mem.Allocator, pid_value: i64) bool {
     return true;
 }
 
+/// Applies a coarse native window control action to the launched browser process.
 pub fn controlWindow(allocator: std.mem.Allocator, pid: i64, cmd: window_style_types.WindowControl) bool {
     if (pid <= 0) return false;
 

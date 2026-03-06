@@ -11,6 +11,7 @@ const oid_prime256v1 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
 const oid_ecdsa_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
 const oid_subject_alt_name = [_]u8{ 0x55, 0x1D, 0x11 };
 
+/// \Ugenerate localhost pem pair.
 pub fn generateLocalhostPemPair(allocator: std.mem.Allocator) !PemPair {
     const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
     const key_pair = Scheme.KeyPair.generate();
