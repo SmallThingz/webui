@@ -48,8 +48,17 @@ fn closeOwnedTransport(_: anytype, transport: anytype) void {
     }
 }
 
-fn wsConnectionThreadMain(state: anytype, transport: anytype, connection_id: usize, generation: u64) void {
+fn wsConnectionThreadMain(
+    state: anytype,
+    transport: anytype,
+    connection_id: usize,
+    generation: u64,
+    initial_remainder: []u8,
+) void {
+    var prebuffer: []const u8 = initial_remainder;
     defer {
+        if (initial_remainder.len != 0) state.allocator.free(initial_remainder);
+
         state.state_mutex.lock();
         if (state.unregisterWsConnectionLocked(connection_id, generation)) {
             state.noteWsDisconnectLocked("websocket-disconnected");
@@ -68,7 +77,7 @@ fn wsConnectionThreadMain(state: anytype, transport: anytype, connection_id: usi
     }
 
     while (!state.server_stop.load(.acquire)) {
-        const frame = net_io.readWsInboundFrameAllocAny(state.allocator, transport, 8 * 1024 * 1024) catch |err| {
+        const frame = net_io.readWsInboundFrameAllocBufferedAny(state.allocator, transport, &prebuffer, 8 * 1024 * 1024) catch |err| {
             if (err != error.Closed) {
                 state.rpc_state.logf(.warn, "[webui.ws] read failed connection_id={d} err={s}\n", .{ connection_id, @errorName(err) });
             }
@@ -142,6 +151,8 @@ fn handleWebSocketUpgradeRoute(
     try net_io.writeWebSocketHandshakeResponseAny(conn, sec_key);
 
     const token = net_io.wsClientTokenFromUrl(request.path, default_client_token);
+    const initial_remainder = try state.allocator.dupe(u8, request.remainder);
+    errdefer state.allocator.free(initial_remainder);
     var connection_id: usize = 0;
     var generation: u64 = 0;
     state.state_mutex.lock();
@@ -160,7 +171,7 @@ fn handleWebSocketUpgradeRoute(
     state.active_ws_workers += 1;
     state.connection_mutex.unlock();
 
-    const thread = std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, conn, connection_id, generation }) catch |err| {
+    const thread = std.Thread.spawn(.{}, wsConnectionThreadMain, .{ state, conn, connection_id, generation, initial_remainder }) catch |err| {
         state.connection_mutex.lock();
         if (state.active_ws_workers > 0) state.active_ws_workers -= 1;
         state.connection_cond.broadcast();
@@ -171,6 +182,7 @@ fn handleWebSocketUpgradeRoute(
             state.noteWsDisconnectLocked("websocket-spawn-failed");
         }
         state.state_mutex.unlock();
+        state.allocator.free(initial_remainder);
         return err;
     };
     thread.detach();

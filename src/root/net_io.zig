@@ -8,6 +8,7 @@ pub const HttpRequest = struct {
     path: []const u8,
     headers: []const u8,
     body: []const u8,
+    remainder: []const u8,
 };
 
 const WsInboundType = enum {
@@ -99,6 +100,19 @@ fn readConnExact(conn: anytype, out: []u8) !void {
     }
 }
 
+fn readConnExactBuffered(conn: anytype, prebuffer: *[]const u8, out: []u8) !void {
+    var offset: usize = 0;
+    while (offset < out.len and prebuffer.*.len > 0) {
+        const take = @min(out.len - offset, prebuffer.*.len);
+        @memcpy(out[offset .. offset + take], prebuffer.*[0..take]);
+        prebuffer.* = prebuffer.*[take..];
+        offset += take;
+    }
+    if (offset < out.len) {
+        try readConnExact(conn, out[offset..]);
+    }
+}
+
 fn decodeWsOpcode(byte: u8) !WsInboundType {
     return switch (byte & 0x0F) {
         0x1 => .text,
@@ -111,8 +125,18 @@ fn decodeWsOpcode(byte: u8) !WsInboundType {
 }
 
 pub fn readWsInboundFrameAllocAny(allocator: std.mem.Allocator, conn: anytype, max_payload_size: usize) !WsInboundFrame {
+    var prebuffer: []const u8 = "";
+    return readWsInboundFrameAllocBufferedAny(allocator, conn, &prebuffer, max_payload_size);
+}
+
+pub fn readWsInboundFrameAllocBufferedAny(
+    allocator: std.mem.Allocator,
+    conn: anytype,
+    prebuffer: *[]const u8,
+    max_payload_size: usize,
+) !WsInboundFrame {
     var header: [2]u8 = undefined;
-    try readConnExact(conn, &header);
+    try readConnExactBuffered(conn, prebuffer, &header);
 
     const fin = (header[0] & 0x80) != 0;
     if (!fin) return error.UnsupportedWebSocketFragmentation;
@@ -124,11 +148,11 @@ pub fn readWsInboundFrameAllocAny(allocator: std.mem.Allocator, conn: anytype, m
     var payload_len_u64: u64 = header[1] & 0x7F;
     if (payload_len_u64 == 126) {
         var ext: [2]u8 = undefined;
-        try readConnExact(conn, &ext);
+        try readConnExactBuffered(conn, prebuffer, &ext);
         payload_len_u64 = (@as(u64, ext[0]) << 8) | @as(u64, ext[1]);
     } else if (payload_len_u64 == 127) {
         var ext: [8]u8 = undefined;
-        try readConnExact(conn, &ext);
+        try readConnExactBuffered(conn, prebuffer, &ext);
         payload_len_u64 =
             (@as(u64, ext[0]) << 56) |
             (@as(u64, ext[1]) << 48) |
@@ -144,13 +168,13 @@ pub fn readWsInboundFrameAllocAny(allocator: std.mem.Allocator, conn: anytype, m
     const payload_len: usize = @intCast(payload_len_u64);
 
     var masking_key: [4]u8 = undefined;
-    try readConnExact(conn, &masking_key);
+    try readConnExactBuffered(conn, prebuffer, &masking_key);
 
     const payload = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(payload);
 
     if (payload_len > 0) {
-        try readConnExact(conn, payload);
+        try readConnExactBuffered(conn, prebuffer, payload);
         for (payload, 0..) |byte, i| {
             payload[i] = byte ^ masking_key[i & 3];
         }
@@ -296,6 +320,7 @@ pub fn readHttpRequestAny(allocator: std.mem.Allocator, conn: anytype) !HttpRequ
         .path = path,
         .headers = headers,
         .body = raw[end_idx..body_end],
+        .remainder = raw[body_end..],
     };
 }
 

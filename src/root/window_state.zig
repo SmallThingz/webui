@@ -505,11 +505,15 @@ pub const WindowState = struct {
         return self.nativeTransportSelected();
     }
 
-    fn approveCloseRequest(self: *WindowState) bool {
+    fn approveCloseRequestLocked(self: *WindowState) bool {
         self.emit(.close_requested, "close-requested", "");
 
-        if (self.close_callback.handler) |handler| {
-            if (!handler(self.close_callback.context, self.id)) {
+        const callback = self.close_callback;
+        if (callback.handler) |handler| {
+            self.state_mutex.unlock();
+            defer self.state_mutex.lock();
+
+            if (!handler(callback.context, self.id)) {
                 self.emit(.close_requested, "close-denied", "");
                 return false;
             }
@@ -546,7 +550,7 @@ pub const WindowState = struct {
     }
 
     pub fn requestClose(self: *WindowState) bool {
-        if (!self.approveCloseRequest()) return false;
+        if (!self.approveCloseRequestLocked()) return false;
         self.markCloseAccepted();
         return true;
     }
@@ -604,7 +608,7 @@ pub const WindowState = struct {
         self.clearWarning();
 
         const wants_close = cmd == .close;
-        if (wants_close and !self.approveCloseRequest()) {
+        if (wants_close and !self.approveCloseRequestLocked()) {
             return error.CloseDenied;
         }
 
@@ -1142,6 +1146,16 @@ pub const WindowState = struct {
         }
     }
 
+    fn closeWsConnectionAndNoteLocked(self: *WindowState, connection_id: usize, reason: []const u8) void {
+        for (self.ws_connections.items, 0..) |*entry, idx| {
+            if (entry.connection_id != connection_id) continue;
+            entry.transport.shutdown();
+            _ = self.ws_connections.orderedRemove(idx);
+            self.noteWsDisconnectLocked(reason);
+            return;
+        }
+    }
+
     pub fn closeAllWsConnectionsLocked(self: *WindowState) void {
         for (self.ws_connections.items) |*entry| {
             entry.transport.shutdown();
@@ -1201,8 +1215,7 @@ pub const WindowState = struct {
                     "[webui.ws] send failed connection_id={d} err={s}\n",
                     .{ entry.connection_id, @errorName(err) },
                 );
-                self.closeWsConnectionLocked(entry.connection_id);
-                idx += 1;
+                self.closeWsConnectionAndNoteLocked(entry.connection_id, "websocket-send-failed");
                 continue;
             };
 
@@ -1276,8 +1289,7 @@ pub const WindowState = struct {
                     "[webui.ws] frontend rpc send failed connection_id={d} err={s}\n",
                     .{ entry.connection_id, @errorName(err) },
                 );
-                self.closeWsConnectionLocked(entry.connection_id);
-                idx += 1;
+                self.closeWsConnectionAndNoteLocked(entry.connection_id, "websocket-send-failed");
                 continue;
             };
 
@@ -1732,15 +1744,15 @@ pub const WindowState = struct {
             self.server_thread = null;
         }
 
+        self.state_mutex.lock();
+        self.closeAllWsConnectionsLocked();
+        self.state_mutex.unlock();
+
         self.connection_mutex.lock();
         while (self.active_connection_workers > 0 or self.active_ws_workers > 0) {
             self.connection_cond.timedWait(&self.connection_mutex, 10 * std.time.ns_per_ms) catch {};
         }
         self.connection_mutex.unlock();
-
-        self.state_mutex.lock();
-        self.closeAllWsConnectionsLocked();
-        self.state_mutex.unlock();
     }
 
     pub fn serverThreadMain(self: *WindowState) void {

@@ -193,11 +193,13 @@ pub const Host = struct {
     ui_ready: bool = false,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: bool = false,
+    pending_async_callbacks: usize = 0,
 
     instance: ?win.HINSTANCE = null,
     class_registered: bool = false,
     hwnd: ?win.HWND = null,
     window_icon: ?win.HICON = null,
+    window_destroy_started: bool = false,
 
     symbols: ?wv2.Symbols = null,
     com_initialized: bool = false,
@@ -357,18 +359,17 @@ fn threadMain(host: *Host) void {
         return;
     };
 
+    host.mutex.lock();
+    host.hwnd = hwnd;
+    host.window_destroy_started = false;
+    host.mutex.unlock();
+    applyStyleUiThread(host, host.style);
+
     if (!createWebViewEnvironment(host)) {
-        _ = DestroyWindow(hwnd);
+        destroyWindowUiThread(host);
         failStartup(host, error.NativeBackendUnavailable);
         return;
     }
-
-    host.mutex.lock();
-    host.hwnd = hwnd;
-    host.ui_ready = true;
-    host.startup_done = true;
-    host.cond.broadcast();
-    host.mutex.unlock();
 
     if (host.style.hidden) {
         _ = ShowWindow(hwnd, SW_HIDE);
@@ -398,8 +399,9 @@ fn threadMain(host: *Host) void {
 
         host.mutex.lock();
         const stop = host.shutdown_requested;
+        const pending_async_callbacks = host.pending_async_callbacks;
         host.mutex.unlock();
-        if (stop) break;
+        if (stop and pending_async_callbacks == 0) break;
 
         if (!had_activity) std.Thread.sleep(8 * std.time.ns_per_ms);
     }
@@ -414,6 +416,7 @@ fn failStartup(host: *Host, err: anyerror) void {
     host.startup_error = err;
     host.startup_done = true;
     host.ui_ready = false;
+    host.shutdown_requested = true;
     host.closed.store(true, .release);
     host.cond.broadcast();
 }
@@ -482,14 +485,54 @@ fn createNativeWindow(host: *Host) ?win.HWND {
     return hwnd;
 }
 
-fn cleanupUiThread(host: *Host) void {
-    const hwnd = host.hwnd;
-    host.hwnd = null;
+fn retainAsyncCallback(host: *Host) void {
+    host.mutex.lock();
+    host.pending_async_callbacks += 1;
+    host.mutex.unlock();
+}
+
+fn releaseAsyncCallback(host: *Host) void {
+    host.mutex.lock();
+    if (host.pending_async_callbacks > 0) host.pending_async_callbacks -= 1;
+    host.cond.broadcast();
+    host.mutex.unlock();
+}
+
+fn finishStartupReady(host: *Host) void {
+    host.mutex.lock();
+    defer host.mutex.unlock();
+
+    if (host.startup_done) return;
+    if (host.shutdown_requested or host.closed.load(.acquire) or host.webview == null) {
+        host.startup_error = error.NativeBackendUnavailable;
+        host.ui_ready = false;
+    } else {
+        host.ui_ready = true;
+    }
+    host.startup_done = true;
+    host.cond.broadcast();
+}
+
+fn destroyWindowUiThread(host: *Host) void {
+    const hwnd = blk: {
+        host.mutex.lock();
+        defer host.mutex.unlock();
+
+        if (host.window_destroy_started) break :blk null;
+        const handle = host.hwnd orelse break :blk null;
+        host.window_destroy_started = true;
+        host.hwnd = null;
+        break :blk handle;
+    };
 
     if (hwnd) |handle| {
         _ = SetWindowLongPtrW(handle, GWLP_USERDATA, 0);
         _ = DestroyWindow(handle);
     }
+}
+
+fn cleanupUiThread(host: *Host) void {
+    destroyWindowUiThread(host);
 
     detachTitleHandlerUiThread(host);
 
@@ -554,9 +597,7 @@ fn executeCommandUiThread(host: *Host, command: *Command) void {
             host.shutdown_requested = true;
             host.closed.store(true, .release);
             host.mutex.unlock();
-            if (host.hwnd) |hwnd| {
-                _ = DestroyWindow(hwnd);
-            }
+            destroyWindowUiThread(host);
             PostQuitMessage(0);
         },
     }
@@ -640,7 +681,7 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
             host.shutdown_requested = true;
             host.closed.store(true, .release);
             host.mutex.unlock();
-            _ = DestroyWindow(hwnd);
+            destroyWindowUiThread(host);
             PostQuitMessage(0);
         },
         .hide => {
@@ -681,10 +722,15 @@ fn createWebViewEnvironment(host: *Host) bool {
         _ = std.os.windows.kernel32.SetEnvironmentVariableW(webview2_bg_env_name, null);
     }
 
-    var env_handler = host.allocator.create(EnvironmentCompletedHandler) catch return false;
+    retainAsyncCallback(host);
+    var env_handler = host.allocator.create(EnvironmentCompletedHandler) catch {
+        releaseAsyncCallback(host);
+        return false;
+    };
     env_handler.* = .{
         .iface = .{ .lpVtbl = &environment_completed_handler_vtbl },
         .refs = std.atomic.Value(u32).init(1),
+        .allocator = host.allocator,
         .host = host,
     };
 
@@ -783,21 +829,24 @@ fn applyControllerBackgroundColor(host: *Host) void {
     _ = controller2.lpVtbl.put_DefaultBackgroundColor(controller2, color);
 }
 
-const EnvironmentCompletedHandler = extern struct {
+const EnvironmentCompletedHandler = struct {
     iface: wv2.ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
     refs: std.atomic.Value(u32),
+    allocator: std.mem.Allocator,
     host: *Host,
 };
 
-const ControllerCompletedHandler = extern struct {
+const ControllerCompletedHandler = struct {
     iface: wv2.ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
     refs: std.atomic.Value(u32),
+    allocator: std.mem.Allocator,
     host: *Host,
 };
 
-const TitleChangedHandler = extern struct {
+const TitleChangedHandler = struct {
     iface: wv2.ICoreWebView2DocumentTitleChangedEventHandler,
     refs: std.atomic.Value(u32),
+    allocator: std.mem.Allocator,
     host: *Host,
 };
 
@@ -841,7 +890,8 @@ fn environmentHandlerRelease(self: *wv2.ICoreWebView2CreateCoreWebView2Environme
     const handler: *EnvironmentCompletedHandler = @fieldParentPtr("iface", self);
     const refs = handler.refs.fetchSub(1, .acq_rel) - 1;
     if (refs == 0) {
-        handler.host.allocator.destroy(handler);
+        releaseAsyncCallback(handler.host);
+        handler.allocator.destroy(handler);
     }
     return refs;
 }
@@ -855,12 +905,7 @@ fn environmentHandlerInvoke(
     const host = handler.host;
 
     if (!wv2.succeeded(error_code) or created_environment == null) {
-        host.mutex.lock();
-        host.startup_error = error.NativeBackendUnavailable;
-        host.shutdown_requested = true;
-        host.closed.store(true, .release);
-        host.cond.broadcast();
-        host.mutex.unlock();
+        failStartup(host, error.NativeBackendUnavailable);
         return win.S_OK;
     }
 
@@ -868,21 +913,29 @@ fn environmentHandlerInvoke(
     _ = environment.lpVtbl.AddRef(environment);
     host.environment = environment;
 
-    var controller_handler = host.allocator.create(ControllerCompletedHandler) catch return win.S_OK;
+    retainAsyncCallback(host);
+    var controller_handler = host.allocator.create(ControllerCompletedHandler) catch {
+        releaseAsyncCallback(host);
+        failStartup(host, error.NativeBackendUnavailable);
+        return win.S_OK;
+    };
     controller_handler.* = .{
         .iface = .{ .lpVtbl = &controller_completed_handler_vtbl },
         .refs = std.atomic.Value(u32).init(1),
+        .allocator = host.allocator,
         .host = host,
     };
 
     const hwnd = host.hwnd orelse {
         _ = controllerHandlerRelease(&controller_handler.iface);
+        failStartup(host, error.NativeBackendUnavailable);
         return win.S_OK;
     };
 
     const hr = environment.lpVtbl.CreateCoreWebView2Controller(environment, hwnd, &controller_handler.iface);
     if (!wv2.succeeded(hr)) {
         _ = controllerHandlerRelease(&controller_handler.iface);
+        failStartup(host, error.NativeBackendUnavailable);
     }
 
     _ = controllerHandlerRelease(&controller_handler.iface);
@@ -908,7 +961,8 @@ fn controllerHandlerRelease(self: *wv2.ICoreWebView2CreateCoreWebView2Controller
     const handler: *ControllerCompletedHandler = @fieldParentPtr("iface", self);
     const refs = handler.refs.fetchSub(1, .acq_rel) - 1;
     if (refs == 0) {
-        handler.host.allocator.destroy(handler);
+        releaseAsyncCallback(handler.host);
+        handler.allocator.destroy(handler);
     }
     return refs;
 }
@@ -922,12 +976,7 @@ fn controllerHandlerInvoke(
     const host = handler.host;
 
     if (!wv2.succeeded(error_code) or created_controller == null) {
-        host.mutex.lock();
-        host.startup_error = error.NativeBackendUnavailable;
-        host.shutdown_requested = true;
-        host.closed.store(true, .release);
-        host.cond.broadcast();
-        host.mutex.unlock();
+        failStartup(host, error.NativeBackendUnavailable);
         return win.S_OK;
     }
 
@@ -936,14 +985,15 @@ fn controllerHandlerInvoke(
     host.controller = controller;
 
     var webview: ?*wv2.ICoreWebView2 = null;
-    if (wv2.succeeded(controller.lpVtbl.get_CoreWebView2(controller, &webview))) {
-        if (webview) |core| {
-            _ = core.lpVtbl.AddRef(core);
-            host.webview = core;
-            configureWebViewSettings(core);
-            attachTitleHandler(host, core);
-        }
+    if (!wv2.succeeded(controller.lpVtbl.get_CoreWebView2(controller, &webview)) or webview == null) {
+        failStartup(host, error.NativeBackendUnavailable);
+        return win.S_OK;
     }
+    const core = webview.?;
+    _ = core.lpVtbl.AddRef(core);
+    host.webview = core;
+    configureWebViewSettings(core);
+    attachTitleHandler(host, core);
 
     applyControllerBackgroundColor(host);
     updateControllerBounds(host);
@@ -953,6 +1003,8 @@ fn controllerHandlerInvoke(
         host.allocator.free(pending);
         host.pending_url = null;
     }
+
+    finishStartupReady(host);
 
     return win.S_OK;
 }
@@ -974,6 +1026,7 @@ fn attachTitleHandler(host: *Host, webview: *wv2.ICoreWebView2) void {
     handler.* = .{
         .iface = .{ .lpVtbl = &title_changed_handler_vtbl },
         .refs = std.atomic.Value(u32).init(1),
+        .allocator = host.allocator,
         .host = host,
     };
 
@@ -1023,7 +1076,7 @@ fn titleHandlerRelease(self: *wv2.ICoreWebView2DocumentTitleChangedEventHandler)
     const handler: *TitleChangedHandler = @fieldParentPtr("iface", self);
     const refs = handler.refs.fetchSub(1, .acq_rel) - 1;
     if (refs == 0) {
-        handler.host.allocator.destroy(handler);
+        handler.allocator.destroy(handler);
     }
     return refs;
 }
@@ -1091,8 +1144,10 @@ fn wndProc(hwnd: win.HWND, msg: u32, wparam: win.WPARAM, lparam: win.LPARAM) cal
                 h.closed.store(true, .release);
                 h.cond.broadcast();
                 h.mutex.unlock();
+                destroyWindowUiThread(h);
+            } else {
+                _ = DestroyWindow(hwnd);
             }
-            _ = DestroyWindow(hwnd);
             return 0;
         },
         WM_DESTROY => {

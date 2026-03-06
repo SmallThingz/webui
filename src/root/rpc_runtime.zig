@@ -181,7 +181,8 @@ pub const State = struct {
 
         self.worker_stop.store(true, .release);
         self.queue_mutex.lock();
-        for (self.queue.items) |task| {
+        while (self.queue.items.len > 0) {
+            const task = self.queue.orderedRemove(0);
             task.mutex.lock();
             if (!task.done) {
                 task.err = error.RpcDispatcherStopped;
@@ -230,10 +231,14 @@ pub const State = struct {
 
         const out = task.result_json orelse {
             task.mutex.unlock();
+            task.deinit();
             return error.InvalidRpcResult;
         };
-        const result = try allocator.dupe(u8, out);
         task.mutex.unlock();
+        const result = allocator.dupe(u8, out) catch |err| {
+            task.deinit();
+            return err;
+        };
         task.deinit();
         return result;
     }

@@ -283,7 +283,14 @@ fn initializeApp(host: *Host) bool {
 }
 
 fn createWindowAndWebView(host: *Host) bool {
+    var success = false;
+    defer if (!success) rollbackWindowAndWebView(host);
+
     const frame = styleRect(host.style);
+    const content_frame = NSRect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = frame.size,
+    };
     const style_mask = computeWindowStyleMask(host.style);
 
     const window_class = objcClass(host, "NSWindow") orelse return false;
@@ -311,7 +318,7 @@ fn createWindowAndWebView(host: *Host) bool {
 
     const webview_class = objcClass(host, "WKWebView") orelse return false;
     const webview_alloc = msgSendId(host, webview_class, sel(host, "alloc")) orelse return false;
-    const webview = msgSendIdRect(host, webview_alloc, sel(host, "initWithFrame:"), frame) orelse return false;
+    const webview = msgSendIdRect(host, webview_alloc, sel(host, "initWithFrame:"), content_frame) orelse return false;
 
     host.wk_webview = webview;
 
@@ -330,7 +337,22 @@ fn createWindowAndWebView(host: *Host) bool {
         msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
     }
 
+    success = true;
     return true;
+}
+
+fn rollbackWindowAndWebView(host: *Host) void {
+    if (host.wk_webview) |webview| {
+        msgSendVoid(host, webview, sel(host, "release"));
+        host.wk_webview = null;
+    }
+
+    if (host.ns_window) |window| {
+        msgSendVoidId(host, window, sel(host, "orderOut:"), null);
+        msgSendVoid(host, window, sel(host, "close"));
+        msgSendVoid(host, window, sel(host, "release"));
+        host.ns_window = null;
+    }
 }
 
 fn cleanupUiThread(host: *Host) void {
@@ -412,6 +434,7 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
     const window = host.ns_window orelse return;
 
     msgSendVoidU64(host, window, sel(host, "setStyleMask:"), computeWindowStyleMask(style));
+    msgSendVoidBool(host, window, sel(host, "setMovableByWindowBackground:"), style.frameless);
 
     if (style.size) |size| {
         const ns_size = NSSize{ .width = @floatFromInt(size.width), .height = @floatFromInt(size.height) };
@@ -481,8 +504,9 @@ fn applyStyleUiThread(host: *Host, style: WindowStyle) void {
         host.explicit_hidden = true;
         msgSendVoidId(host, window, sel(host, "orderOut:"), null);
     } else {
-        host.explicit_hidden = false;
-        msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
+        if (!host.explicit_hidden) {
+            msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
+        }
     }
 }
 
@@ -569,11 +593,16 @@ fn applyControlUiThread(host: *Host, cmd: WindowControl) void {
         },
         .maximize => {
             host.explicit_hidden = false;
-            msgSendVoidId(host, window, sel(host, "zoom:"), null);
+            if (!msgSendBool(host, window, sel(host, "isZoomed"))) {
+                msgSendVoidId(host, window, sel(host, "zoom:"), null);
+            }
         },
         .restore => {
             host.explicit_hidden = false;
             msgSendVoidId(host, window, sel(host, "deminiaturize:"), null);
+            if (msgSendBool(host, window, sel(host, "isZoomed"))) {
+                msgSendVoidId(host, window, sel(host, "zoom:"), null);
+            }
             msgSendVoidId(host, window, sel(host, "makeKeyAndOrderFront:"), null);
         },
         .close => {
@@ -633,10 +662,8 @@ fn pumpEvents(host: *Host) bool {
 fn styleRect(style: WindowStyle) NSRect {
     const width: f64 = if (style.size) |s| @floatFromInt(s.width) else default_width;
     const height: f64 = if (style.size) |s| @floatFromInt(s.height) else default_height;
-    const x: f64 = if (style.position) |p| @floatFromInt(p.x) else 160;
-    const y: f64 = if (style.position) |p| @floatFromInt(p.y) else 120;
     return .{
-        .origin = .{ .x = x, .y = y },
+        .origin = .{ .x = 160, .y = 120 },
         .size = .{ .width = width, .height = height },
     };
 }

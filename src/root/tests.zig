@@ -124,6 +124,94 @@ fn writeAllStream(stream: std.net.Stream, bytes: []const u8) !void {
     try stream.writeAll(bytes);
 }
 
+fn readStreamCompat(stream: std.net.Stream, buffer: []u8) !usize {
+    if (builtin.os.tag == .windows) {
+        return std.posix.recv(stream.handle, buffer, 0);
+    }
+    return stream.read(buffer);
+}
+
+fn readStreamExactBuffered(stream: std.net.Stream, prebuffer: *[]const u8, out: []u8) !void {
+    var offset: usize = 0;
+    while (offset < out.len and prebuffer.*.len > 0) {
+        const take = @min(out.len - offset, prebuffer.*.len);
+        @memcpy(out[offset .. offset + take], prebuffer.*[0..take]);
+        prebuffer.* = prebuffer.*[take..];
+        offset += take;
+    }
+
+    while (offset < out.len) {
+        const n = try readStreamCompat(stream, out[offset..]);
+        if (n == 0) return error.Closed;
+        offset += n;
+    }
+}
+
+const ServerWsFrame = struct {
+    opcode: u8,
+    payload: []u8,
+
+    fn deinit(self: *const ServerWsFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+    }
+};
+
+fn readServerWsFrame(allocator: std.mem.Allocator, stream: std.net.Stream, prebuffer: *[]const u8) !ServerWsFrame {
+    var header: [2]u8 = undefined;
+    try readStreamExactBuffered(stream, prebuffer, &header);
+
+    const masked = (header[1] & 0x80) != 0;
+    if (masked) return error.InvalidWebSocketMasking;
+
+    var payload_len_u64: u64 = header[1] & 0x7F;
+    if (payload_len_u64 == 126) {
+        var ext: [2]u8 = undefined;
+        try readStreamExactBuffered(stream, prebuffer, &ext);
+        payload_len_u64 = (@as(u64, ext[0]) << 8) | @as(u64, ext[1]);
+    } else if (payload_len_u64 == 127) {
+        var ext: [8]u8 = undefined;
+        try readStreamExactBuffered(stream, prebuffer, &ext);
+        payload_len_u64 =
+            (@as(u64, ext[0]) << 56) |
+            (@as(u64, ext[1]) << 48) |
+            (@as(u64, ext[2]) << 40) |
+            (@as(u64, ext[3]) << 32) |
+            (@as(u64, ext[4]) << 24) |
+            (@as(u64, ext[5]) << 16) |
+            (@as(u64, ext[6]) << 8) |
+            (@as(u64, ext[7]));
+    }
+
+    const payload = try allocator.alloc(u8, @intCast(payload_len_u64));
+    errdefer allocator.free(payload);
+    if (payload.len != 0) {
+        try readStreamExactBuffered(stream, prebuffer, payload);
+    }
+
+    return .{
+        .opcode = header[0] & 0x0F,
+        .payload = payload,
+    };
+}
+
+fn appendMaskedClientWsFrame(out: *std.array_list.Managed(u8), opcode: u8, payload: []const u8) !void {
+    const mask = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
+    try out.append(0x80 | opcode);
+    if (payload.len < 126) {
+        try out.append(0x80 | @as(u8, @intCast(payload.len)));
+    } else if (payload.len <= std.math.maxInt(u16)) {
+        try out.append(0x80 | 126);
+        try out.append(@intCast((payload.len >> 8) & 0xFF));
+        try out.append(@intCast(payload.len & 0xFF));
+    } else {
+        return error.PayloadTooLarge;
+    }
+    try out.appendSlice(&mask);
+    for (payload, 0..) |byte, idx| {
+        try out.append(byte ^ mask[idx & 3]);
+    }
+}
+
 test "window lifecycle" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -288,6 +376,50 @@ test "websocket upgrade uses same http server port" {
     try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 101 Switching Protocols") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Upgrade: websocket") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+}
+
+test "websocket upgrade preserves same-packet first frame" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{
+        .launch_policy = .{ .first = .web_url, .second = null, .third = null },
+    });
+    defer app.deinit();
+
+    var win = try app.newWindow(.{ .title = "WsUpgradePrefetch" });
+    try win.showHtml("<html><body>ws-prefetch-ok</body></html>");
+    try app.run();
+
+    const address = try std.net.Address.parseIp4("127.0.0.1", win.state().server_port);
+    const stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+
+    var request = std.array_list.Managed(u8).init(gpa.allocator());
+    defer request.deinit();
+    try request.appendSlice(
+        "GET /webui/ws?client_id=prebuffer HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+    );
+    try appendMaskedClientWsFrame(&request, 0x9, "hi");
+    try writeAllStream(stream, request.items);
+
+    const response = try readHttpHeadersFromStream(gpa.allocator(), stream, 64 * 1024);
+    defer gpa.allocator().free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 101 Switching Protocols") != null);
+
+    var prebuffer = httpResponseBody(response);
+    const frame = try readServerWsFrame(gpa.allocator(), stream, &prebuffer);
+    defer frame.deinit(gpa.allocator());
+
+    try std.testing.expectEqual(@as(u8, 0xA), frame.opcode);
+    try std.testing.expectEqualStrings("hi", frame.payload);
 }
 
 test "invalid websocket upgrade returns single 400 response" {
@@ -1324,6 +1456,30 @@ test "window control close handler veto and allow" {
     const close_result = try win.control(.close);
     try std.testing.expect(close_result.closed);
     try std.testing.expect(close_result.emulation == null);
+    try std.testing.expect(win.state().close_requested.load(.acquire));
+}
+
+test "close handler may call window api reentrantly" {
+    const Hook = struct {
+        fn onClose(context: ?*anyopaque, _: usize) bool {
+            const win = @as(*webui.Window, @ptrCast(@alignCast(context.?)));
+            _ = win.runtimeRenderState();
+            win.clearWarning();
+            return true;
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var app = try App.init(gpa.allocator(), .{});
+    defer app.deinit();
+
+    var win = try app.newWindow(.{});
+    win.setCloseHandler(Hook.onClose, &win);
+
+    const close_result = try win.control(.close);
+    try std.testing.expect(close_result.closed);
     try std.testing.expect(win.state().close_requested.load(.acquire));
 }
 
